@@ -52,8 +52,10 @@ non-trivial.
 - **TLS:** wired via the protocol library's `Server.TLSConfig` field.
   The cert source is the hot-reloading loader from ADR-0009.
 - **SASL:** PLAIN over TLS only. No CRAM-MD5, no APOP, no anonymous.
-  Username form: `user@reduit-instance` or just `user`; auth lookups
-  per-user IMAP/SMTP passwords from the SQLite store.
+  Username form: **`user@host`** (e.g., `joe@reduit.family.tld`),
+  matching standard email-client expectations. Auth lookups validate
+  the per-user IMAP/SMTP password (envelope-encrypted in SQLite per
+  ADR-0003) against the local user identified by the address.
 
 ### Consequences
 
