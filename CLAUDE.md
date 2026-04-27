@@ -54,6 +54,25 @@ release yet.
 - **OIDC IdP:** Pocket ID. OIDC clients are provisioned via the `joestump.pocket_id` Ansible collection — never via the Pocket ID UI.
 - **Service DNS:** likely `reduit.ops01.stump.rocks` per the ops01 DNS convention.
 
+## Visual Identity
+
+Used by the `gemini-mockup` skill and any future UI work.
+
+- **Mode:** Dark mode is the canonical surface. Light mode MAY be supported later via DaisyUI's theme system, but every mockup and design artifact starts dark.
+- **Palette:**
+  - **Primary:** deep indigo. Anchor around `#4F46E5` (Tailwind `indigo-600`); buttons and active states sit here.
+  - **Surfaces:** slate greys. Page background is near-black slate (`#0F172A` / `slate-900`); cards sit on `#1E293B` (`slate-800`); borders / dividers `#334155` (`slate-700`).
+  - **Foreground:** soft off-white (`#E2E8F0` / `slate-200`) for primary text; dim (`#94A3B8` / `slate-400`) for secondary; subtle (`#64748B` / `slate-500`) for tertiary metadata.
+  - **Accent:** single warm tone — a desaturated amber/copper (`#F59E0B` / `amber-500` or a slightly toned-down variant). Reserved for important state callouts (live sync, alerts, the singular call-to-action). Not a second primary.
+  - **Status colors:** muted, dark-mode-friendly: green `#10B981` (success), rose `#F43F5E` (error), sky `#0EA5E9` (info). Never neon.
+- **Typography:** [Inter](https://rsms.me/inter/) at multiple weights (400 regular for body, 500 medium for labels, 600 semibold for headings). Tabular figures for numerics. Fall back to system geometric sans if Inter is unavailable.
+- **Component framework:** DaisyUI 5 on Tailwind 4. Use DaisyUI components (`btn`, `card`, `modal`, `alert`, `table`, `badge`, `tabs`) as the base; project-specific overrides via Tailwind utilities only when DaisyUI's variants don't cover the case.
+- **Iconography:** [Heroicons](https://heroicons.com/) outlined variants at 24×24, 1.5px stroke. Solid variants only for active/selected states. Inlined as SVG via Go template helpers — never icon fonts, never CDN.
+- **Motif:** subtle alpine / Swiss-fortress. The login screen and empty states MAY use a faint mountain-silhouette band at the bottom or as a soft background gradient. Restraint over decoration — no skeumorphic textures, no grain overlays, no animated gradients. The metaphor is fortified clarity, not visual noise.
+- **Whitespace:** generous. Cards have ≥24px internal padding. Sections separated by ≥32px. The default density is "comfortable", not "compact" — Reduit is family-grade software, not a Bloomberg terminal.
+- **Browser-chrome URL pattern (for mockups):** `https://reduit.<host>/<route>` where `<host>` is the operator's chosen domain (e.g., `reduit.family.tld`, `reduit.stump.rocks`). Default in mockups: `reduit.family.tld` so the multi-user-family use case is visible at a glance.
+- **Sample data conventions in mockups:** family-style names (Joe, Hannah, Maya, Sage), realistic email subjects (school logistics, receipts, sports schedules), recent timestamps, mixed read/unread states. Not corporate-feeling sample data.
+
 ## Architecture Context
 
 This project uses the [design plugin](https://github.com/joestump/claude-plugin-design) for architecture governance.

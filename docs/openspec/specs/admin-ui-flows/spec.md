@@ -246,3 +246,27 @@ initial admin, regardless of `OIDC_ADMIN_SUBS` configuration.
 - Audit log UI beyond simple action logging in stderr (deferred to
   v0.5).
 - Mobile-app-specific UI beyond responsive Tailwind design.
+
+## Mockups
+
+High-fidelity reference renders generated via the `gemini-mockup`
+skill against the project's visual identity (see Reduit's
+`CLAUDE.md` § Visual Identity). These are reference targets, not
+pixel-perfect specifications — implementation may diverge so long as
+the spec requirements above are met.
+
+| File | Screen |
+|---|---|
+| [`mockups/01-login.png`](mockups/01-login.png) | OIDC login page |
+| [`mockups/02-account-dashboard.png`](mockups/02-account-dashboard.png) | Single-user dashboard with live sync card |
+| [`mockups/03-wizard-step-1-credentials.png`](mockups/03-wizard-step-1-credentials.png) | Add-Proton-account wizard — step 1 (email + password) |
+| [`mockups/04-wizard-step-2-totp.png`](mockups/04-wizard-step-2-totp.png) | Wizard — step 2 (TOTP) |
+| [`mockups/05-wizard-step-3-passphrase.png`](mockups/05-wizard-step-3-passphrase.png) | Wizard — step 3 (mailbox passphrase) |
+| [`mockups/06-credentials-rotation-modal.png`](mockups/06-credentials-rotation-modal.png) | IMAP/SMTP credentials view + rotation modal |
+| [`mockups/07-mcp-tokens.png`](mockups/07-mcp-tokens.png) | MCP token issuance and revocation |
+| [`mockups/08-admin-all-accounts.png`](mockups/08-admin-all-accounts.png) | Admin all-accounts table with summary stats |
+
+Regenerate any of these by invoking the `gemini-mockup` skill with
+the same filename (it overwrites cleanly). Run a scan-in-arrears
+when the visual identity changes — see the skill's SKILL.md for the
+workflow.
