@@ -1,0 +1,49 @@
+# Reduit — example configuration.
+#
+# Copy this file to /etc/reduit/reduit.yaml or pass --config /path
+# at startup. Secrets (oidc.client_secret) should come from env
+# (REDUIT_OIDC_CLIENT_SECRET) rather than living in the file.
+
+server:
+  http_addr: ":443"     # Admin UI + MCP (HTTPS)
+  imap_addr: ":993"     # IMAPS — wired in v0.3
+  smtp_addr: ":465"     # SMTPS submission — wired in v0.4
+  metrics_addr: ""      # e.g. "127.0.0.1:9090" to expose Prometheus
+
+tls:
+  # Read by the hot-reloading loader (ADR-0009). Provision via
+  # certbot, Caddy, Traefik, etc. Reduit doesn't do ACME.
+  cert_path: /etc/reduit/tls/fullchain.pem
+  key_path:  /etc/reduit/tls/privkey.pem
+
+master_key:
+  # Service master key (ADR-0003). Generated once with:
+  #   reduit master-key generate
+  # Back this file up out of band — loss = total data loss.
+  path: /var/lib/reduit/master.key
+
+store:
+  path: /var/lib/reduit/reduit.db
+  # migrations_dir: /opt/reduit/migrations  # uncomment to override embedded migrations
+
+oidc:
+  # Pocket ID is the reference IdP for stumpcloud-style deployments,
+  # but any compliant OIDC provider works (Authelia, Keycloak, Okta).
+  issuer_url:    https://pocketid.example.tld
+  client_id:     reduit
+  # client_secret: keep in env REDUIT_OIDC_CLIENT_SECRET, not here.
+  redirect_url:  https://reduit.example.tld/auth/callback
+  scopes:
+    - openid
+    - profile
+    - email
+  # The first OIDC sub to log in becomes admin automatically (per
+  # SPEC-0005). After that, list additional admin subs here:
+  admin_subjects: []
+  # If false, an OIDC sub without an existing account is rejected.
+  # If true (default), first login auto-creates the account.
+  auto_create: true
+
+logger:
+  level:  info     # debug | info | warn | error
+  format: text     # text | json

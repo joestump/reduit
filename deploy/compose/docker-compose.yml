@@ -1,0 +1,48 @@
+# Reference docker-compose for a self-hosted Reduit deployment.
+#
+# Assumes:
+#   - certbot or Caddy is producing certs into a host-side path that
+#     gets mounted at /etc/reduit/tls.
+#   - /var/lib/reduit on the host holds the sqlite DB and master.key.
+#   - Pocket ID (or another OIDC IdP) is reachable from the container.
+#
+# First-run sequence on a fresh host:
+#
+#   docker compose run --rm reduit master-key generate
+#   docker compose run --rm reduit migrate
+#   docker compose up -d
+#
+# See the project README for the full self-host guide.
+
+services:
+  reduit:
+    image: ghcr.io/joestump/reduit:latest
+    restart: unless-stopped
+
+    # Map host ports. Adjust for your deployment.
+    ports:
+      - "443:443"   # HTTPS — admin UI + MCP
+      - "993:993"   # IMAPS
+      - "465:465"   # SMTPS submission
+
+    volumes:
+      # Persistent data.
+      - ./data:/var/lib/reduit
+      # Config + TLS certs (often a bind-mount from certbot's output).
+      - ./reduit.yaml:/etc/reduit/reduit.yaml:ro
+      - /etc/letsencrypt/live/reduit.example.tld/fullchain.pem:/etc/reduit/tls/fullchain.pem:ro
+      - /etc/letsencrypt/live/reduit.example.tld/privkey.pem:/etc/reduit/tls/privkey.pem:ro
+
+    environment:
+      # Secrets are best supplied via env, not the YAML file.
+      REDUIT_OIDC_CLIENT_SECRET: "${REDUIT_OIDC_CLIENT_SECRET}"
+      # Optional structured logging:
+      # REDUIT_LOGGER_FORMAT: json
+      # REDUIT_LOGGER_LEVEL: info
+
+    healthcheck:
+      test: ["CMD", "wget", "--no-check-certificate", "--quiet", "--spider", "https://localhost/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

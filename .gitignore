@@ -1,0 +1,21 @@
+# Build artifacts
+bin/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Local development
+reduit.yaml
+master.key
+*.db
+*.db-shm
+*.db-wal
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Worktrees
+.claude/worktrees/
