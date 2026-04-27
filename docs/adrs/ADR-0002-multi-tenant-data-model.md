@@ -97,6 +97,37 @@ the right account's state.
 - **Bad:** No clear win over option 2 for the target scale (≤50
   accounts).
 
+## Architecture Diagram
+
+```mermaid
+flowchart TB
+    subgraph Process["One Reduit process (single binary, single container)"]
+        direction TB
+        HTTPL[HTTPS<br/>:443]
+        IMAPL[IMAPS<br/>:993]
+        SMTPL[SMTPS<br/>:465]
+
+        HTTPL -- "OIDC sub" --> Router{Account<br/>Router}
+        IMAPL -- "SASL user@host" --> Router
+        SMTPL -- "SASL user@host" --> Router
+
+        Router --> A[Account A<br/>worker · keyring · creds]
+        Router --> B[Account B<br/>worker · keyring · creds]
+        Router --> C[Account C<br/>worker · keyring · creds]
+
+        A -. row-level isolation .- DB[(SQLite<br/>WHERE account_id = ?)]
+        B -. row-level isolation .- DB
+        C -. row-level isolation .- DB
+    end
+
+    style Router fill:#4F46E5,color:#fff
+```
+
+Every protocol entry point resolves an authenticated identity into an
+account ID, then dispatches to the per-account context. Isolation is
+enforced at the data layer: every per-account table requires
+`WHERE account_id = ?`.
+
 ## References
 
 - ADR-0006 (SQLite store) — every table schema carries `account_id`.

@@ -127,6 +127,44 @@ Implementation:
 - **Bad:** Requires DBus / libsecret session; doesn't work cleanly
   in containers or headless servers.
 
+## Architecture Diagram
+
+```mermaid
+flowchart TB
+    Master["Service master key<br/>32 bytes · /var/lib/reduit/master.key · mode 0600"]
+
+    subgraph A1["Account 1"]
+        E1["key_envelope<br/>(sealed under master)"]
+        DK1["data key 1<br/>(in-memory only)"]
+        RT1["refresh_token_ciphertext"]
+        MP1["mailbox_passphrase_ciphertext"]
+        IP1["imap_password_ciphertext"]
+    end
+
+    subgraph A2["Account 2"]
+        E2["key_envelope"]
+        DK2["data key 2"]
+        DOT2[" · · · "]
+    end
+
+    Master -- "XChaCha20-Poly1305" --> E1
+    Master -- "XChaCha20-Poly1305" --> E2
+    E1 -. "unseal at request time" .-> DK1
+    DK1 -- "XChaCha20-Poly1305" --> RT1
+    DK1 -- "XChaCha20-Poly1305" --> MP1
+    DK1 -- "XChaCha20-Poly1305" --> IP1
+
+    style Master fill:#F59E0B,color:#000
+    style DK1 fill:#4F46E5,color:#fff
+    style DK2 fill:#4F46E5,color:#fff
+```
+
+Two-layer envelope: one master key seals the per-account data keys;
+each data key seals the account's secrets. Compromise of one
+account's data key (extremely unlikely without also compromising
+master) does not affect siblings. Loss of the master key is
+catastrophic — operators MUST back it up out of band.
+
 ## References
 
 - ADR-0001 (go-proton-api) — refresh tokens come from the auth flow.

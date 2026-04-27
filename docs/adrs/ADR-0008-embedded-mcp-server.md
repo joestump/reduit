@@ -120,6 +120,40 @@ a private API?
 - **Bad:** Doesn't match the server-deployment model. We can add
   stdio later as a separate binary that talks to the embedded HTTP MCP.
 
+## Architecture Diagram
+
+```mermaid
+flowchart TB
+    subgraph Chosen["Chosen: embedded MCP"]
+        direction TB
+        ReduitProc["Reduit process"]
+        subgraph ReduitProc
+            HTTPS["HTTPS :443"]
+            HTTPS --> Admin["Admin UI<br/>(/auth, /accounts, /admin)"]
+            HTTPS --> MCP["MCP Server<br/>(/mcp)"]
+            Admin --> Shared["Shared services<br/>account svc · go-proton-api · store"]
+            MCP --> Shared
+        end
+    end
+
+    subgraph Rejected["Rejected: separate process"]
+        direction TB
+        ReduitProc2["Reduit process"]
+        MCPProc["reduit-mcp process"]
+        ReduitProc2 -. "private API to design + version" .-> MCPProc
+        style ReduitProc2 fill:#475569,color:#cbd5e1,stroke-dasharray: 5 5
+        style MCPProc fill:#475569,color:#cbd5e1,stroke-dasharray: 5 5
+    end
+
+    style HTTPS fill:#4F46E5,color:#fff
+    style Shared fill:#1E293B,color:#cbd5e1
+```
+
+The MCP server shares the same HTTPS listener, account state, and
+Proton client wrapper as the admin UI. One binary, one auth model
+(OIDC bearer or per-user MCP token), one fault domain. The dashed
+alternative is rejected for the operational complexity it would add.
+
 ## References
 
 - ADR-0001 (go-proton-api) — MCP tools call the same client.

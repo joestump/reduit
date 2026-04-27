@@ -120,6 +120,41 @@ effort spent on sync workers, IMAP UID stability, etc.
 - **Bad:** Adds a second JS library for marginal benefit. HTMX alone
   is sufficient.
 
+## Architecture Diagram
+
+```mermaid
+flowchart TB
+    Browser["Browser<br/>(any modern, dark-mode aware)"]
+
+    subgraph Reduit["Reduit HTTP server"]
+        direction TB
+        Routes["Route handlers (Go)"]
+        Templ["html/template + templ partials"]
+        Static["static/<br/>· tailwind.css (pre-built)<br/>· heroicons inlined as SVG<br/>· htmx · htmx-sse extension"]
+    end
+
+    Browser -- "GET (full page)" --> Routes
+    Routes -- "render whole page" --> Templ
+    Templ --> Browser
+
+    Browser -- "hx-get / hx-post (HTMX)" --> Routes
+    Routes -- "render fragment" --> Templ
+    Templ -. partial HTML .-> Browser
+
+    Browser -- "EventSource('/sse/...')" --> Routes
+    Routes -- "text/event-stream" --> Browser
+
+    Browser -- "GET /static/*" --> Static
+
+    style Routes fill:#4F46E5,color:#fff
+```
+
+No JavaScript bundler. No SPA. The server returns either a full
+HTML page (first load), a partial fragment (HTMX swap), or a stream
+of events (SSE). Tailwind CSS is built once and committed/served
+statically; DaisyUI provides component primitives; Heroicons inline
+as SVG.
+
 ## References
 
 - [HTMX](https://htmx.org/)

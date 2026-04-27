@@ -110,6 +110,40 @@ Pocket ID.**
   Acceptable as a wrapper for an internal-only tool, not for the
   multi-user case.
 
+## Architecture Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant B as Browser
+    participant R as Reduit
+    participant I as Pocket ID (OIDC IdP)
+
+    U->>B: visit /accounts
+    B->>R: GET /accounts (no session)
+    R-->>B: 302 → /auth/login
+    B->>R: GET /auth/login
+    R->>R: generate state · nonce · PKCE verifier
+    R->>R: persist pre-session
+    R-->>B: 302 → IdP /authorize?...code_challenge=...
+    B->>I: GET /authorize
+    U->>I: authenticate (password / passkey / etc)
+    I-->>B: 302 → /auth/callback?code=...&state=...
+    B->>R: GET /auth/callback
+    R->>I: POST /token (code + code_verifier)
+    I-->>R: id_token + access_token
+    R->>R: validate signature · iss · aud · nonce
+    R->>R: find account by sub (or auto-create)
+    R->>R: create session in scs store
+    R-->>B: Set-Cookie reduit_session; 302 → /accounts
+```
+
+OIDC authorization-code with PKCE. Reduit never sees the user's
+password. Pocket ID handles password reset, MFA, WebAuthn, and audit;
+Reduit just consumes the resulting `sub` claim and binds it to a
+local account row.
+
 ## References
 
 - ADR-0002 (multi-tenant) — per-user identity required.

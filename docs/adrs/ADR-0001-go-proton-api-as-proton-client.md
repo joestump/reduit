@@ -103,6 +103,32 @@ than as breakage we have to chase.
   `protonmail-go` from then on. No benefit for a relay project where
   the API client is not the value-add.
 
+## Architecture Diagram
+
+```mermaid
+flowchart LR
+    Reduit[Reduit daemon]
+    GP[go-proton-api]
+    Proton[(Proton Mail API)]
+
+    Reduit -- imports --> GP
+    GP -- HTTPS --> Proton
+
+    subgraph Rejected["Rejected alternatives"]
+      direction LR
+      PMG[protonmail-go<br/>archived v0.1.0]
+      Scratch[Reimplement<br/>from scratch]
+    end
+
+    style GP fill:#4F46E5,color:#fff
+    style PMG fill:#475569,color:#cbd5e1,stroke-dasharray: 5 5
+    style Scratch fill:#475569,color:#cbd5e1,stroke-dasharray: 5 5
+```
+
+The chosen path inherits Proton's API drift maintenance through
+`go-proton-api`. The dashed boxes are evaluated alternatives that
+were rejected for the reasons in the body above.
+
 ## References
 
 - [`github.com/ProtonMail/go-proton-api`](https://github.com/ProtonMail/go-proton-api)

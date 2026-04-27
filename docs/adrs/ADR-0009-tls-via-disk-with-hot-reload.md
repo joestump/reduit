@@ -125,6 +125,41 @@ gain.
 - **Bad:** Still imports an entire ACME stack; configuration is
   per-DNS-provider; complicated.
 
+## Architecture Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Tool as certbot / Caddy
+    participant FS as Filesystem
+    participant Watch as fsnotify watcher
+    participant Loader as Cert Loader<br/>atomic.Pointer[*tls.Certificate]
+    participant Listeners as TLS listeners<br/>HTTPS · IMAPS · SMTPS
+    participant Conn as Active TLS sessions
+
+    Note over Loader: Startup
+    Listeners->>Loader: GetCertificate(ClientHello)
+    Loader-->>Listeners: cert v1
+
+    Note over Tool,FS: Renewal
+    Tool->>FS: write fullchain.pem (atomic rename)
+    Tool->>FS: write privkey.pem
+    FS-->>Watch: WRITE event(s)
+    Watch->>Loader: parse + validate (cert v2)
+    Loader->>Loader: atomic swap pointer
+    Note over Conn: Existing sessions keep<br/>negotiated cert v1
+
+    Note over Listeners: Next ClientHello
+    Listeners->>Loader: GetCertificate(ClientHello)
+    Loader-->>Listeners: cert v2
+```
+
+Reduit reads cert + key from disk, watches both files (and their
+parent directory, since certbot atomically renames the file), and
+hot-swaps the in-memory pointer when they change. Active IDLE / SMTP
+sessions keep the cert they negotiated; only new handshakes pick up
+the rotated cert.
+
 ## References
 
 - ADR-0007 (IMAP/SMTP libraries) — `Server.TLSConfig` is wired into

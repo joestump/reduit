@@ -116,6 +116,44 @@ non-trivial.
   CGO / IPC overhead. The use case (≤50 family/team accounts) does not
   need this scale.
 
+## Architecture Diagram
+
+```mermaid
+flowchart TB
+    Client["Email client<br/>(Apple Mail · Thunderbird · K-9 · mutt · ...)"]
+
+    subgraph Reduit["Reduit"]
+        direction TB
+        IMAPSrv["emersion/go-imap v2 Server"]
+        SMTPSrv["emersion/go-smtp Server"]
+        IMAPBack["Reduit IMAP Backend<br/>(implements go-imap Backend interface)"]
+        SMTPBack["Reduit SMTP Backend<br/>(implements go-smtp Backend interface)"]
+        AcctSvc["Account Service"]
+        Outbox["Per-account Outbox Worker"]
+        ProtonClient["go-proton-api wrapper"]
+        Store[(SQLite)]
+        SyncWorker["Per-account Sync Worker"]
+    end
+
+    Proton[(Proton Mail API)]
+
+    Client -- IMAPS:993 --> IMAPSrv --> IMAPBack
+    Client -- SMTPS:465 --> SMTPSrv --> SMTPBack
+    IMAPBack --> AcctSvc
+    SMTPBack --> AcctSvc
+    SMTPBack --> Outbox
+    AcctSvc --> Store
+    Outbox --> ProtonClient
+    SyncWorker --> ProtonClient
+    SyncWorker --> Store
+    ProtonClient <-.HTTPS.-> Proton
+```
+
+The emersion libraries handle the wire protocols (IMAP framing, SASL,
+SMTP submission). Reduit implements their Backend interfaces and
+delegates per-account state to the shared Account Service, which
+talks to SQLite and the Proton client.
+
 ## References
 
 - [`emersion/go-imap`](https://github.com/emersion/go-imap)

@@ -120,6 +120,50 @@ small team (≤50 accounts).
   schema for IMAP UID maps and message flags is too rich for flat
   files.
 
+## Architecture Diagram
+
+```mermaid
+erDiagram
+    accounts ||--|{ mailboxes : "owns"
+    accounts ||--|{ sync_state : "has"
+    accounts ||--o{ sessions : "has"
+    accounts ||--o{ mcp_tokens : "issues"
+    mailboxes ||--|{ messages : "contains"
+    mailboxes ||--|{ uid_assignments : "stable UIDs"
+
+    accounts {
+        text id PK
+        text oidc_subject UK
+        text state
+        bool is_admin
+        blob key_envelope
+        blob refresh_token_ct
+        blob mailbox_pass_ct
+        blob imap_password_ct
+        text imap_password_hash
+    }
+    mailboxes {
+        text id PK
+        text account_id FK
+        text name
+        int uidvalidity
+        int uidnext
+    }
+    messages {
+        text id PK
+        text mailbox_id FK
+        text proton_id
+        int uid
+        int flags
+        timestamp internal_date
+    }
+```
+
+One SQLite file. WAL mode for concurrent readers. `goose` drives
+migrations. Every per-account table carries `account_id` so isolation
+is a `WHERE` clause away. Sensitive columns are envelope-encrypted
+per ADR-0003 before insert.
+
 ## References
 
 - ADR-0002 (multi-tenant) — every table carries `account_id`.
