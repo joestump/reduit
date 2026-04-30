@@ -8,6 +8,7 @@ require (
 	github.com/pressly/goose/v3 v3.27.1
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
+	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.50.0
 	modernc.org/sqlite v1.50.0
 )
