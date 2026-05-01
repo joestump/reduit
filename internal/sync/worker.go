@@ -37,6 +37,15 @@ type worker struct {
 	// stopOnce guards signalStop so multiple stop signals collapse
 	// into a single cancel.
 	stopOnce sync.Once
+
+	// panicker is an optional test-only hook invoked at the top of
+	// each tick body. Production never sets it (nil → no-op). Tests
+	// install a `func(){ panic("boom") }` here to exercise the real
+	// production deferred-recover paths in tick() and run() without
+	// the test having to supply its own recover. Story #17 replaces
+	// this with a real injection-based panic test once the Proton
+	// call plumbing lands.
+	panicker func()
 }
 
 // newWorker constructs an unstarted worker bound to the supervisor's
@@ -137,6 +146,19 @@ func (w *worker) run() {
 // call is what enforces the global cap. Wiring it now (even around a
 // no-op) means story #16 inherits the constraint without having to
 // remember to add it.
+//
+// Defer ordering matters: the recover() defer is registered AFTER the
+// release() defer so that, on panic, defers unwind LIFO and the
+// recover-and-log runs FIRST, with the slot release happening only
+// after the panic has been logged and re-raised. Without this
+// ordering, a panicking tick would release its slot back into the
+// semaphore and a sibling worker could grab it before the operator
+// ever sees the panic in the logs. The recover here re-panics so the
+// outer worker.run() recover still observes the panic and performs
+// the worker map cleanup.
+//
+// Governing: SPEC-0002 REQ "Panic Isolation" (panic surfaced in logs
+// before resources recycle).
 func (w *worker) tick() {
 	release, err := w.sup.AcquireProtonSlot(w.ctx)
 	if err != nil {
@@ -145,7 +167,20 @@ func (w *worker) tick() {
 		return
 	}
 	defer release()
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.LogAttrs(context.Background(), slog.LevelError,
+				"sync: worker tick panic; logged before slot release",
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
+			panic(r) // propagate to worker.run()'s recover for cleanup
+		}
+	}()
 
+	if w.panicker != nil {
+		w.panicker()
+	}
 	w.logger.LogAttrs(w.ctx, slog.LevelDebug, "sync: worker tick (stub)")
 	// TODO(#16): client.GetEvent + cursor persistence goes here.
 }

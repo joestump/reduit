@@ -226,14 +226,20 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	}
 	s.started = true
 	s.rootCtx, s.rootCancel = context.WithCancel(ctx)
-	s.startMu.Unlock()
-
-	// Subscribe BEFORE the seed query so any transition that races
-	// with startup is captured (and de-duplicated by the existing-
-	// worker check inside OnAccountStateChange).
+	// Subscribe BEFORE releasing startMu so Stop's read of
+	// s.unsubscribe (also under startMu) cannot observe a nil pointer
+	// while Start is still mid-flight. SPEC-0002 REQ "Graceful
+	// Shutdown" requires Stop to release the subscription deterministically.
+	//
+	// The OnTransition callback fires synchronously from the account
+	// service's Transition path; it is safe to install while startMu
+	// is held because the callback only reaches back into the
+	// supervisor via OnAccountStateChange (which takes startMu itself
+	// AFTER any caller-side mutation completes).
 	s.unsubscribe = s.svc.OnTransition(func(cbCtx context.Context, prev, next account.State, a *account.Account) {
 		s.OnAccountStateChange(prev, next, a)
 	})
+	s.startMu.Unlock()
 
 	// Seed: every account already in StateActive needs a worker.
 	// Failure to list is logged but does not abort Start — operators
@@ -331,12 +337,29 @@ func (s *Supervisor) startWorker(ctx context.Context, a *account.Account) {
 }
 
 // stopWorker halts the worker for the given account ID, if any. The
-// stop is asynchronous: stopWorker returns as soon as it has
-// signaled cancellation; the worker drains in the background and
-// removes itself from the live map under workersMu. Stop() blocks
-// until every drain completes (or HardShutdown elapses).
+// stop is SYNCHRONOUS: stopWorker signals cancellation and then waits
+// for the worker goroutine to fully exit (which runs the deferred
+// removeWorker that clears the map slot) before returning.
 //
-// Governing: SPEC-0002 REQ "Worker stops on suspension or deletion"
+// Trade-off: callers of stopWorker that fire from the OnTransition
+// callback dispatch will block for the worker's drain window. For the
+// stub tick body in this PR that is microseconds; once story #16
+// lands real Proton calls under AcquireProtonSlot, drain time grows
+// to whatever a single GetEvent round-trip takes (sub-second under
+// normal conditions, capped by the HTTP client's own deadline).
+//
+// We accept this latency because the alternative — returning while a
+// dying worker still holds the map slot — corrupts the
+// "One Worker Per Active Account" invariant on a rapid
+// active→suspended→active flap: the re-activation's startWorker sees
+// the dying worker, DEBUG-no-ops, and the account ends up with no
+// running goroutine. The hostile reviewer for PR #38 reproduced this
+// 100% of the time. Synchronous stop guarantees that after stopWorker
+// returns the map slot is empty, so any subsequent startWorker call
+// will spawn a fresh worker.
+//
+// Governing: SPEC-0002 REQ "One Worker Per Active Account",
+// SPEC-0002 REQ "Worker stops on suspension or deletion"
 // (within 5s graceful, 30s hard).
 func (s *Supervisor) stopWorker(id string) {
 	s.workersMu.Lock()
@@ -346,6 +369,7 @@ func (s *Supervisor) stopWorker(id string) {
 		return
 	}
 	w.signalStop()
+	w.waitDone()
 }
 
 // removeWorker takes a worker out of the live map. Called by the
@@ -380,12 +404,14 @@ func (s *Supervisor) Stop() error {
 	}
 	s.stopped = true
 	rootCancel := s.rootCancel
+	unsubscribe := s.unsubscribe
 	s.startMu.Unlock()
 
 	// Release the account-service subscription so transitions that
-	// land mid-shutdown don't spawn new workers.
-	if s.unsubscribe != nil {
-		s.unsubscribe()
+	// land mid-shutdown don't spawn new workers. Read under startMu
+	// above so we cannot race a partially-initialized Start.
+	if unsubscribe != nil {
+		unsubscribe()
 	}
 
 	// Phase 1: signal cooperative stop on every worker, snapshot the
@@ -426,6 +452,13 @@ func (s *Supervisor) Stop() error {
 
 // waitAll returns true if every worker exited within d, false on
 // timeout. A non-positive d is treated as zero.
+//
+// On timeout the helper goroutine is unblocked via the abort channel
+// so it does not leak past Stop. The helper races each worker's
+// waitDone against abort; when abort closes the helper returns even
+// if some worker is still mid-drain. This matters in production
+// because a wedged worker would otherwise leak a supervisor goroutine
+// on every Stop call.
 func waitAll(workers []*worker, d time.Duration) bool {
 	if len(workers) == 0 {
 		return true
@@ -438,16 +471,23 @@ func waitAll(workers []*worker, d time.Duration) bool {
 	defer deadline.Stop()
 
 	done := make(chan struct{})
+	abort := make(chan struct{})
 	go func() {
+		defer close(done)
 		for _, w := range workers {
-			w.waitDone()
+			select {
+			case <-w.done:
+				// worker exited
+			case <-abort:
+				return
+			}
 		}
-		close(done)
 	}()
 	select {
 	case <-done:
 		return true
 	case <-deadline.C:
+		close(abort)
 		return false
 	}
 }

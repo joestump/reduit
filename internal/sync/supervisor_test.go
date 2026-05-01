@@ -390,6 +390,9 @@ func TestServiceOnTransitionFiresCallback(t *testing.T) {
 		mu.Unlock()
 		atomic.AddInt32(&fires, 1)
 	})
+	// t.Cleanup right after registration so an early t.Fatalf below
+	// cannot leak the subscription past the test.
+	t.Cleanup(unsub)
 
 	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-cb"})
 	if err != nil {
@@ -428,6 +431,158 @@ func TestServiceOnTransitionFiresCallback(t *testing.T) {
 
 	// Idempotent unsubscribe.
 	unsub()
+}
+
+// TestRapidFlapKeepsWorkerRunning is the regression test for the
+// PR-#38 hostile-review blocker: rapid active→suspended→active
+// transitions, dispatched directly to OnAccountStateChange, MUST
+// leave the account with a running worker. Pre-fix the dying-worker
+// slot in s.workers caused the re-activation's startWorker to
+// DEBUG-no-op, leaving the account with no goroutine. Post-fix
+// stopWorker waits synchronously for the worker's removeWorker
+// defer to clear the slot before returning, so any subsequent
+// startWorker call observes an empty slot and spawns a fresh worker.
+//
+// We fire the flap inside a single goroutine to mirror the hostile
+// reviewer's exact reproducer, then add an additional racing
+// variation (suspended/active from a sibling goroutine) so the test
+// also exercises concurrent dispatch through OnAccountStateChange.
+// Run with `-race -count=20` to confirm stability under scheduler
+// jitter.
+//
+// Governing: SPEC-0002 REQ "One Worker Per Active Account".
+func TestRapidFlapKeepsWorkerRunning(t *testing.T) {
+	t.Parallel()
+	svc := newTestAccountService(t)
+	ctx := context.Background()
+
+	sup := New(svc, fastConfig())
+	if err := sup.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Stop() })
+
+	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-flap"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Step 1: get a baseline worker running.
+	sup.OnAccountStateChange(account.StatePendingProtonSetup, account.StateActive, a)
+	if !waitFor(t, time.Second, func() bool { return sup.activeWorkerCount() == 1 }) {
+		t.Fatalf("baseline worker did not start; count=%d", sup.activeWorkerCount())
+	}
+
+	// Step 2: the exact hostile-reviewer repro — suspend then active
+	// back-to-back from a single goroutine. Pre-fix this leaves the
+	// account with NO worker because stopWorker returned before the
+	// dying worker cleared the map slot, and the re-activation saw
+	// the still-present entry and DEBUG-no-op'd. Post-fix stopWorker
+	// is synchronous, so the slot is empty when startWorker runs.
+	sup.OnAccountStateChange(account.StateActive, account.StateSuspended, a)
+	sup.OnAccountStateChange(account.StateSuspended, account.StateActive, a)
+
+	if !waitFor(t, 2*time.Second, func() bool { return sup.activeWorkerCount() == 1 }) {
+		t.Fatalf("after sequential flap: workers=%d, want 1", sup.activeWorkerCount())
+	}
+
+	// Step 3: same flap, but each suspend/active pair fires from its
+	// own goroutine. Using a goroutine for each call introduces extra
+	// scheduling pressure and proves the per-pair invariant survives
+	// arbitrary interleavings. We sequence pair-internal calls with a
+	// channel so the LAST call across all goroutines is always
+	// "active" — concurrent dispatch with no terminal-state ordering
+	// is permitted to end in any state, so without sequencing the
+	// final state would be racy by design (see the comment block in
+	// stopWorker for why "after stopWorker returns the slot is empty"
+	// is a per-call invariant, not a multi-call one).
+	for i := 0; i < 10; i++ {
+		var wg sync.WaitGroup
+		gate := make(chan struct{})
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			sup.OnAccountStateChange(account.StateActive, account.StateSuspended, a)
+			close(gate)
+		}()
+		go func() {
+			defer wg.Done()
+			<-gate
+			sup.OnAccountStateChange(account.StateSuspended, account.StateActive, a)
+		}()
+		wg.Wait()
+
+		if !waitFor(t, 2*time.Second, func() bool { return sup.activeWorkerCount() == 1 }) {
+			t.Fatalf("after concurrent flap iter %d: workers=%d, want 1", i, sup.activeWorkerCount())
+		}
+	}
+}
+
+// TestSupervisorRecoversInjectedPanic exercises the production
+// deferred-recover paths in worker.tick() and worker.run() via the
+// test-only `panicker` hook. Unlike TestSupervisorPanicIsolation
+// (which supplies its own recover and only proves Go's recover
+// works), this test installs a panicking tick body and asserts that
+// the WORKER's harness recover catches it, removes the worker from
+// the live map, and leaves the supervisor + sibling untouched.
+//
+// Spec reviewer requested this on PR #38 as the "production recover
+// is unverified" caveat; story #17 will replace the panicker hook
+// with real client.GetEvent injection.
+//
+// Governing: SPEC-0002 REQ "Panic Isolation".
+func TestSupervisorRecoversInjectedPanic(t *testing.T) {
+	t.Parallel()
+	svc := newTestAccountService(t)
+	sup := New(svc, fastConfig())
+	if err := sup.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Stop() })
+
+	// Sibling worker via the normal path.
+	siblingAcc, err := svc.Create(context.Background(), account.CreateParams{OIDCSubject: "sub-sibling-real"})
+	if err != nil {
+		t.Fatalf("Create sibling: %v", err)
+	}
+	if _, err := svc.Transition(context.Background(), siblingAcc.ID, account.StateActive); err != nil {
+		t.Fatalf("Transition sibling: %v", err)
+	}
+	if !waitFor(t, time.Second, func() bool { return sup.activeWorkerCount() == 1 }) {
+		t.Fatalf("sibling worker did not start")
+	}
+
+	// Hand-inject a panicking worker. We construct it directly so we
+	// can install the panicker hook before start(); production code
+	// paths never set this field.
+	w := newWorker(sup.rootCtx, "panicker-real", sup)
+	w.panicker = func() { panic("injected boom") }
+	sup.workersMu.Lock()
+	sup.workers[w.id] = w
+	sup.workersMu.Unlock()
+	w.start()
+
+	// The production recover in worker.run() must:
+	//   1. catch the panic re-raised from tick()'s recover
+	//   2. log it (we don't introspect logs, but the recover path
+	//      runs removeWorker via its defer chain)
+	//   3. remove the worker from the live map
+	// Net observable effect: only the sibling remains.
+	if !waitFor(t, time.Second, func() bool { return sup.activeWorkerCount() == 1 }) {
+		t.Fatalf("after injected panic: count=%d, want 1 (sibling only)", sup.activeWorkerCount())
+	}
+
+	// Sibling MUST still be running after the panic settles.
+	sup.workersMu.Lock()
+	_, siblingAlive := sup.workers[siblingAcc.ID]
+	_, panickerStillThere := sup.workers["panicker-real"]
+	sup.workersMu.Unlock()
+	if !siblingAlive {
+		t.Error("sibling worker was removed; panic isolation failed")
+	}
+	if panickerStillThere {
+		t.Error("panicker still in map after recover; removeWorker did not fire")
+	}
 }
 
 // waitFor polls cond every 10ms up to deadline. Returns true if cond
