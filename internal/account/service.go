@@ -128,6 +128,27 @@ type Service interface {
 	//
 	// Governing: SPEC-0003 REQ "SASL PLAIN With user@host Identity".
 	SetPrimaryAlias(ctx context.Context, accountID, alias string) error
+
+	// GetSyncState returns the persisted Proton event cursor for the
+	// account, or ErrNoSyncState if no successful sync has ever
+	// committed. The sync worker calls this on startup to decide
+	// whether to resume from a persisted cursor or to bootstrap from
+	// proton.Client.GetLatestEventID.
+	//
+	// Governing: SPEC-0002 REQ "Event Cursor Persistence" — "Resume on
+	// startup uses persisted cursor".
+	GetSyncState(ctx context.Context, accountID string) (*SyncState, error)
+
+	// SetSyncState commits a cursor advance atomically with any
+	// caller-supplied derived-state writes. The optional
+	// SyncStateTxWork callback is invoked with the open *sqlx.Tx;
+	// returning a non-nil error rolls back the entire transaction
+	// (cursor + derived state). At most one SyncStateTxWork may be
+	// passed; supplying more is a programmer error and panics.
+	//
+	// Governing: SPEC-0002 REQ "Event Cursor Persistence" — atomic
+	// commit of cursor and state changes derived from the same batch.
+	SetSyncState(ctx context.Context, accountID, cursor string, txWork ...SyncStateTxWork) error
 }
 
 // CreateParams collects the inputs to Service.Create. ProtonUserID
