@@ -56,10 +56,23 @@ func validateSASLIdentity(identity string) error {
 	// value cannot inject an IMAP response line if a downstream caller
 	// ever forgets to encode it. We also reject DEL and any byte > 0x7E
 	// because aliases are ASCII-only by operator configuration.
+	//
+	// Governing: SPEC-0003 REQ "SASL PLAIN With user@host Identity" —
+	// Reduit commits to ASCII-only identities. RFC 6531 (UTF-8 mailbox
+	// names) is uncommon in real-world IMAP traffic; admitting non-ASCII
+	// would require Unicode-aware case-folding (e.g.
+	// `golang.org/x/text/cases.Fold`) and NFC normalisation to compare
+	// safely (the dotted-I / dotless-i family of footguns). Rejecting
+	// >0x7E here keeps the contract uniform with the operator-controlled
+	// alias namespace and lets `strings.ToLower` in the account service
+	// remain correct.
 	for i := 0; i < len(identity); i++ {
 		b := identity[i]
 		if b < 0x20 || b == 0x7F {
 			return wrapInvalid("control-character")
+		}
+		if b >= 0x80 {
+			return wrapInvalid("non-ascii")
 		}
 	}
 	// Exactly one '@' separator. Zero means "not local@host". Two or

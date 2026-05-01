@@ -135,7 +135,7 @@ func (b *Backend) disableRateLimitForTest() {
 // us into a plain listener by mistake.
 func (b *Backend) NewSession(c *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
 	netConn := c.NetConn()
-	if _, ok := netConn.(*tls.Conn); !ok {
+	if !isTLSConn(netConn) {
 		// Defence in depth: the listener must already be tls.Listen.
 		// If it isn't, refuse the session rather than allow cleartext
 		// authentication on a path that would never be tested.
@@ -169,6 +169,24 @@ func remoteHost(c net.Conn) string {
 		return a.String()
 	}
 	return ""
+}
+
+// isTLSConn returns true when c is (or wraps, via an `Unwrap() net.Conn`
+// chain) a *tls.Conn. The capFilter layer between tls.Listen and the
+// emersion server exposes Unwrap so the type assertion drills through
+// it.
+func isTLSConn(c net.Conn) bool {
+	for c != nil {
+		if _, ok := c.(*tls.Conn); ok {
+			return true
+		}
+		u, ok := c.(interface{ Unwrap() net.Conn })
+		if !ok {
+			return false
+		}
+		c = u.Unwrap()
+	}
+	return false
 }
 
 func remoteIP(c net.Conn) string {

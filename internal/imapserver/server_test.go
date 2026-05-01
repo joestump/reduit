@@ -230,6 +230,11 @@ func TestSASLPlainIdentityMalformation(t *testing.T) {
 	t.Parallel()
 	stub := newStubAccounts()
 	srv := startTestServer(t, stub, NewSessions())
+	// Many sequential failures from 127.0.0.1 would otherwise trigger
+	// the per-IP exponential back-off and make the test wall-time
+	// dominated by sleep. The test is asserting validation behaviour,
+	// not rate-limit timing.
+	srv.disableRateLimit()
 
 	// Baseline: a syntactically valid alias that simply does not
 	// resolve to an account.
@@ -255,12 +260,25 @@ func TestSASLPlainIdentityMalformation(t *testing.T) {
 		// notices the control character and rejects it.
 		{"control-char-cr", "joe\r@example.com"},
 		{"control-char-lf", "joe\n@example.com"},
+		// Non-ASCII bytes — the validator now commits to ASCII-only
+		// (RFC 6531 international mailbox names are out of scope for
+		// v0.2; the operator-controlled alias namespace is ASCII by
+		// construction). Each of these used to slip past the
+		// `b < 0x20 || b == 0x7F` check and reach `strings.ToLower`
+		// which is Unicode-naive (Turkish dotted-I family of footguns).
+		{"non-ascii-utf8-2byte", "jo\xc3\xa9@example.com"},      // é
+		{"non-ascii-utf8-3byte", "joe\xe2\x98\x83@example.com"}, // snowman
+		{"non-ascii-high-byte", "joe\x80@example.com"},          // bare 0x80
+		{"non-ascii-0xff", "joe\xff@example.com"},               // bare 0xFF
 	}
 
+	// Subtests run serially. Each one burns a real bcrypt comparison
+	// (uniform-time auth — see TestAuthFailureIsConstantTime), so
+	// running them in parallel saturates the CPU and stretches per-
+	// conn deadlines. Serial keeps the suite predictable.
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
 			resp := authenticatePlain(t, srv.addr, tc.username, "any-password")
 			if !strings.Contains(resp, "AUTHENTICATIONFAILED") {
 				t.Errorf("%s: missing AUTHENTICATIONFAILED: %q", tc.name, resp)
