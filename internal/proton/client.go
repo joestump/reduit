@@ -49,6 +49,34 @@ type (
 	Address = gpa.Address
 	// KeyRing aliases the gopenpgp KeyRing returned by Unlock.
 	KeyRing = crypto.KeyRing
+	// PublicKey is one entry from /core/v4/keys (used by the outbox
+	// encryption-mode selector).
+	PublicKey = gpa.PublicKey
+	// PublicKeys is the slice form returned by GetPublicKeys.
+	PublicKeys = gpa.PublicKeys
+	// RecipientType discriminates Proton-internal vs external recipients
+	// in /core/v4/keys responses.
+	RecipientType = gpa.RecipientType
+	// APIError is the typed error go-proton-api returns for non-2xx
+	// HTTP responses. The outbox uses errors.As to map upstream HTTP
+	// status codes onto SMTP reply codes.
+	APIError = gpa.APIError
+)
+
+// RecipientType constants re-exported so callers do not need to import
+// go-proton-api directly. The outbox encryption-mode selector branches
+// on these values.
+const (
+	RecipientTypeInternal = gpa.RecipientTypeInternal
+	RecipientTypeExternal = gpa.RecipientTypeExternal
+)
+
+// Key-state flag re-exports. PublicKey.Flags is a bitfield; the outbox
+// checks `Flags & KeyStateActive != 0` to decide whether a key is
+// usable for encryption.
+const (
+	KeyStateTrusted = gpa.KeyStateTrusted
+	KeyStateActive  = gpa.KeyStateActive
 )
 
 // ErrNotAuthenticated is returned by methods that require a session
@@ -109,6 +137,20 @@ type Client interface {
 
 	// SendDraft submits a draft for delivery via /mail/v4/messages/{id}.
 	SendDraft(ctx context.Context, draftID string, req SendDraftReq) (Message, error)
+
+	// GetPublicKeys queries /core/v4/keys?Email=<address> and returns
+	// the public keys plus the recipient type (internal vs external).
+	// The outbox encryption-mode selector consumes both pieces of data
+	// to choose between PGP-encrypted (internal/WKD) and cleartext-relay
+	// submission for each recipient on a message.
+	//
+	// Network or server-side errors MUST be surfaced verbatim — the
+	// outbox treats them as fail-closed (rejects the send) so a
+	// transient lookup failure cannot accidentally downgrade a Proton-
+	// internal recipient from PGP-encrypted to cleartext.
+	//
+	// Governing: SPEC-0004 REQ "Encryption Pipeline".
+	GetPublicKeys(ctx context.Context, address string) (PublicKeys, RecipientType, error)
 
 	// GetAttachment downloads the decrypted bytes of one attachment.
 	GetAttachment(ctx context.Context, attachmentID string) ([]byte, error)
@@ -284,6 +326,18 @@ func (c *clientImpl) SendDraft(ctx context.Context, draftID string, req SendDraf
 	}
 	defer release()
 	return up.SendDraft(ctx, draftID, req)
+}
+
+// GetPublicKeys forwards to the upstream client. The outbox uses the
+// returned RecipientType to discriminate between PGP-encrypted internal
+// recipients and external recipients (with or without a published key).
+func (c *clientImpl) GetPublicKeys(ctx context.Context, address string) (PublicKeys, RecipientType, error) {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return nil, RecipientTypeExternal, err
+	}
+	defer release()
+	return up.GetPublicKeys(ctx, address)
 }
 
 // GetAttachment downloads the decrypted bytes of an attachment.
