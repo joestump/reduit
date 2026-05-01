@@ -41,6 +41,7 @@ type accountRow struct {
 	MailboxPassphraseCiphertext []byte         `db:"mailbox_passphrase_ciphertext"`
 	IMAPPasswordCiphertext      []byte         `db:"imap_password_ciphertext"`
 	IMAPPasswordHash            sql.NullString `db:"imap_password_hash"`
+	PrimaryAlias                sql.NullString `db:"primary_alias"`
 	LastEventID                 sql.NullString `db:"last_event_id"`
 	Crashed                     int64          `db:"crashed"`
 	CreatedAt                   time.Time      `db:"created_at"`
@@ -61,6 +62,7 @@ func (r accountRow) toAccount() *Account {
 		HasMailboxPassphrase: len(r.MailboxPassphraseCiphertext) > 0,
 		HasIMAPPassword:      len(r.IMAPPasswordCiphertext) > 0,
 		IMAPPasswordHash:     r.IMAPPasswordHash.String,
+		PrimaryAlias:         r.PrimaryAlias.String,
 		LastEventID:          r.LastEventID.String,
 		Crashed:              r.Crashed != 0,
 		CreatedAt:            r.CreatedAt,
@@ -76,8 +78,8 @@ func (r accountRow) toAccount() *Account {
 const accountColumns = `
     id, oidc_subject, proton_user_id, email, state, is_admin,
     key_envelope, refresh_token_ciphertext, mailbox_passphrase_ciphertext,
-    imap_password_ciphertext, imap_password_hash, last_event_id,
-    crashed, created_at, updated_at, deleted_at
+    imap_password_ciphertext, imap_password_hash, primary_alias,
+    last_event_id, crashed, created_at, updated_at, deleted_at
 `
 
 // insert persists a brand-new account row. The unique constraint on
@@ -88,13 +90,13 @@ func (r *repository) insert(ctx context.Context, row *accountRow) error {
     INSERT INTO accounts (
         id, oidc_subject, proton_user_id, email, state, is_admin,
         key_envelope, refresh_token_ciphertext, mailbox_passphrase_ciphertext,
-        imap_password_ciphertext, imap_password_hash, last_event_id,
-        crashed, created_at, updated_at, deleted_at
+        imap_password_ciphertext, imap_password_hash, primary_alias,
+        last_event_id, crashed, created_at, updated_at, deleted_at
     ) VALUES (
         :id, :oidc_subject, :proton_user_id, :email, :state, :is_admin,
         :key_envelope, :refresh_token_ciphertext, :mailbox_passphrase_ciphertext,
-        :imap_password_ciphertext, :imap_password_hash, :last_event_id,
-        :crashed, :created_at, :updated_at, :deleted_at
+        :imap_password_ciphertext, :imap_password_hash, :primary_alias,
+        :last_event_id, :crashed, :created_at, :updated_at, :deleted_at
     )`
 	_, err := r.db.NamedExecContext(ctx, q, row)
 	if err != nil {
@@ -139,6 +141,50 @@ func (r *repository) getByOIDCSubject(ctx context.Context, sub string) (*account
 		return nil, fmt.Errorf("account: get by oidc subject: %w", err)
 	}
 	return &row, nil
+}
+
+// getByPrimaryAlias resolves the SASL `user@host` identity to an
+// account row. Lookup is exact-match on the lower-cased alias; the
+// caller (Service.GetByPrimaryAlias) is responsible for the
+// case-fold + whitespace-trim normalisation so this method's contract
+// matches what the unique index on the column enforces.
+//
+// Governing: SPEC-0003 REQ "SASL PLAIN With user@host Identity".
+func (r *repository) getByPrimaryAlias(ctx context.Context, alias string) (*accountRow, error) {
+	q := `SELECT ` + accountColumns + ` FROM accounts WHERE primary_alias = ?`
+	var row accountRow
+	if err := r.db.GetContext(ctx, &row, q, alias); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrAccountNotFound
+		}
+		return nil, fmt.Errorf("account: get by primary alias: %w", err)
+	}
+	return &row, nil
+}
+
+// setPrimaryAlias writes (or clears, if alias is the empty Null)
+// the per-account primary email alias used by SASL identity lookup.
+// Returns ErrAccountAlreadyExists if another account already owns
+// that alias (the unique partial index on `primary_alias` enforces
+// this at the storage layer).
+//
+// Governing: SPEC-0003 REQ "SASL PLAIN With user@host Identity".
+func (r *repository) setPrimaryAlias(ctx context.Context, id string, alias sql.NullString, now time.Time) error {
+	const q = `UPDATE accounts SET primary_alias = ?, updated_at = ? WHERE id = ?`
+	res, err := r.db.ExecContext(ctx, q, alias, now, id)
+	if err != nil {
+		var sqliteErr *sqlite.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
+			return ErrAccountAlreadyExists
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "UNIQUE constraint failed") &&
+			strings.Contains(msg, "accounts.primary_alias") {
+			return ErrAccountAlreadyExists
+		}
+		return fmt.Errorf("account: set primary alias: %w", err)
+	}
+	return checkOneRow(res, "set primary alias")
 }
 
 // list returns all accounts ordered by created_at ascending. UUIDv7

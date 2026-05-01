@@ -812,6 +812,89 @@ func TestCreateTrimsOIDCSubject(t *testing.T) {
 	}
 }
 
+// TestPrimaryAlias covers the SASL identity lookup contract used by
+// the IMAP and SMTP servers (SPEC-0003 / SPEC-0004): set + get round-
+// trip, case-fold + trim normalisation, NULL multiplicity, and the
+// unique-index collision when two accounts try to claim the same
+// alias.
+//
+// Governing: SPEC-0003 REQ "SASL PLAIN With user@host Identity".
+func TestPrimaryAlias(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	// New accounts have an empty alias and are not findable.
+	a1, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-alias-1"})
+	if err != nil {
+		t.Fatalf("Create a1: %v", err)
+	}
+	if a1.PrimaryAlias != "" {
+		t.Errorf("new account PrimaryAlias = %q, want empty", a1.PrimaryAlias)
+	}
+	a2, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-alias-2"})
+	if err != nil {
+		t.Fatalf("Create a2: %v", err)
+	}
+	if _, err := svc.GetByPrimaryAlias(ctx, "joe@reduit.example"); !errors.Is(err, ErrAccountNotFound) {
+		t.Errorf("lookup before set = %v, want ErrAccountNotFound", err)
+	}
+
+	// Two NULL aliases coexist (partial unique index).
+	// (Implicit — both Create calls succeeded above.)
+
+	// Provision an alias on a1 with mixed-case + whitespace input;
+	// lookup with a different case must still resolve.
+	if err := svc.SetPrimaryAlias(ctx, a1.ID, "  Joe@Reduit.Example  "); err != nil {
+		t.Fatalf("SetPrimaryAlias: %v", err)
+	}
+	got, err := svc.GetByPrimaryAlias(ctx, "JOE@reduit.EXAMPLE")
+	if err != nil {
+		t.Fatalf("GetByPrimaryAlias (case-fold): %v", err)
+	}
+	if got.ID != a1.ID {
+		t.Errorf("GetByPrimaryAlias returned ID %q, want %q", got.ID, a1.ID)
+	}
+	if got.PrimaryAlias != "joe@reduit.example" {
+		t.Errorf("PrimaryAlias stored = %q, want lowercased+trimmed", got.PrimaryAlias)
+	}
+
+	// Lookup with empty / whitespace identity = ErrAccountNotFound,
+	// not a panic and not a false-positive match.
+	for _, q := range []string{"", "   ", "\t\n"} {
+		if _, err := svc.GetByPrimaryAlias(ctx, q); !errors.Is(err, ErrAccountNotFound) {
+			t.Errorf("GetByPrimaryAlias(%q) = %v, want ErrAccountNotFound", q, err)
+		}
+	}
+
+	// Collision: a2 cannot take the same alias.
+	err = svc.SetPrimaryAlias(ctx, a2.ID, "joe@reduit.example")
+	if !errors.Is(err, ErrAccountAlreadyExists) {
+		t.Errorf("colliding SetPrimaryAlias = %v, want ErrAccountAlreadyExists", err)
+	}
+
+	// a2 can take a different alias.
+	if err := svc.SetPrimaryAlias(ctx, a2.ID, "hannah@reduit.example"); err != nil {
+		t.Fatalf("SetPrimaryAlias a2 unique: %v", err)
+	}
+
+	// Clearing a1's alias frees it up for a2.
+	if err := svc.SetPrimaryAlias(ctx, a1.ID, ""); err != nil {
+		t.Fatalf("SetPrimaryAlias clear a1: %v", err)
+	}
+	if _, err := svc.GetByPrimaryAlias(ctx, "joe@reduit.example"); !errors.Is(err, ErrAccountNotFound) {
+		t.Errorf("lookup after clear = %v, want ErrAccountNotFound", err)
+	}
+	if err := svc.SetPrimaryAlias(ctx, a2.ID, "joe@reduit.example"); err != nil {
+		t.Fatalf("SetPrimaryAlias a2 after a1 cleared: %v", err)
+	}
+
+	// SetPrimaryAlias on a missing account row returns ErrAccountNotFound.
+	if err := svc.SetPrimaryAlias(ctx, "missing-id", "ghost@reduit.example"); !errors.Is(err, ErrAccountNotFound) {
+		t.Errorf("SetPrimaryAlias missing-id = %v, want ErrAccountNotFound", err)
+	}
+}
+
 // TestIsAdminRejectsEmptySubject locks in the empty-string defense:
 // even if OIDC_ADMIN_SUBS contains a stray empty entry (e.g. from
 // "OIDC_ADMIN_SUBS=,sub-foo"), an account with an empty subject must
