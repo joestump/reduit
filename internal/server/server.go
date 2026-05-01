@@ -22,10 +22,10 @@ import (
 // Deps are the dependencies a Server needs to start. Wired by
 // internal/cli/serve at startup.
 type Deps struct {
-	Store        *store.Store
+	Store          *store.Store
 	GetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
-	Logger       *slog.Logger
-	Version      string // for /healthz response body
+	Logger         *slog.Logger
+	Version        string // for /healthz response body
 }
 
 // Server holds an http.Server pre-configured with TLS and the
