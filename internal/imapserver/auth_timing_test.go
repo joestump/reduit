@@ -1,3 +1,17 @@
+// Build tag: skip the timing-side-channel test when -race is on.
+// bcrypt at cost 12 takes ~250ms in normal mode and ~4s under the
+// race detector (the race-checked memory accesses inside the
+// EksBlowfish state are O(rounds × 64-byte block) per round). 30
+// samples × 5 cases at 4s each blows the default 10m test timeout.
+// The test is a wall-clock-based assertion, not a concurrency test,
+// so race coverage is not meaningful here. Run as:
+//
+//	go test ./internal/imapserver/ -run TestAuthFailureIsConstantTime
+//
+// without `-race` to exercise the timing invariant.
+
+//go:build !race
+
 package imapserver
 
 import (
