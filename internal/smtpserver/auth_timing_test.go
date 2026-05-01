@@ -29,20 +29,34 @@ func TestAuthFailureIsConstantTime(t *testing.T) {
 	stub := newBcryptStubAccounts()
 	stub.addAccount(t, "acct-active", "alice@reduit.example", "alice-password", account.StateActive)
 	stub.addAccount(t, "acct-suspended", "bob@reduit.example", "bob-password", account.StateSuspended)
+	stub.addAccount(t, "acct-deleted", "carol@reduit.example", "carol-password", account.StateSoftDeleted)
+	stub.addAccount(t, "acct-pending", "dave@reduit.example", "dave-password", account.StatePendingProtonSetup)
 	srv := startTestServer(t, stub, NewSessions())
 	srv.disableRateLimit()
 
 	const samples = 30
+	// Cases mirror IMAP's auth-timing cases plus the three branches
+	// the hostile reviewer flagged as missing on the SMTP side:
+	// non-PLAIN mechanism, soft-deleted account, pending-proton-setup
+	// account. Every branch must hit `burnDummyBcrypt` so the wall-
+	// clock cost matches the wrong-password baseline.
 	cases := []struct {
 		name     string
 		username string
 		password string
+		mech     string // empty -> AUTH PLAIN; non-empty -> AUTH <mech>
 	}{
-		{"wrong-password", "alice@reduit.example", "definitely-wrong"},
-		{"unknown-user", "ghost@reduit.example", "any-password"},
-		{"suspended", "bob@reduit.example", "bob-password"},
-		{"malformed-identity-no-at", "joeexample.com", "any-password"},
-		{"malformed-identity-non-ascii", "jo\xc3\xa9@example.com", "any-password"},
+		{name: "wrong-password", username: "alice@reduit.example", password: "definitely-wrong"},
+		{name: "unknown-user", username: "ghost@reduit.example", password: "any-password"},
+		{name: "suspended", username: "bob@reduit.example", password: "bob-password"},
+		{name: "soft-deleted", username: "carol@reduit.example", password: "carol-password"},
+		{name: "pending-proton-setup", username: "dave@reduit.example", password: "dave-password"},
+		{name: "malformed-identity-no-at", username: "joeexample.com", password: "any-password"},
+		{name: "malformed-identity-non-ascii", username: "jo\xc3\xa9@example.com", password: "any-password"},
+		// Non-PLAIN mechanism: the server rejects with 504, but it
+		// burns one bcrypt comparison along the way so the timing is
+		// identical to a wrong-password attempt.
+		{name: "non-plain-mech", username: "alice@reduit.example", password: "any-password", mech: "GSSAPI"},
 	}
 
 	medians := make(map[string]time.Duration, len(cases))
@@ -50,7 +64,11 @@ func TestAuthFailureIsConstantTime(t *testing.T) {
 		durations := make([]time.Duration, 0, samples)
 		for i := 0; i < samples; i++ {
 			start := time.Now()
-			_ = authPlain(t, srv.addr, tc.username, tc.password)
+			if tc.mech == "" {
+				_ = authPlain(t, srv.addr, tc.username, tc.password)
+			} else {
+				_ = authMech(t, srv.addr, tc.mech)
+			}
 			durations = append(durations, time.Since(start))
 		}
 		drop := samples / 10
