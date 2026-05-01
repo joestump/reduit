@@ -221,3 +221,14 @@ var errSenderRejected = &smtp.SMTPError{
 	EnhancedCode: smtp.EnhancedCode{5, 7, 1},
 	Message:      "Sender address rejected: not authorized for this account",
 }
+
+// errAccountSuspended is the response the suspension fan-out injects
+// onto every live session for the suspended account. The connection
+// is force-closed immediately after.
+//
+// Governing: SPEC-0004 REQ "Per-Session Authentication Lifetime".
+var errAccountSuspended = &smtp.SMTPError{
+	Code:         421,
+	EnhancedCode: smtp.EnhancedCode{4, 7, 1},
+	Message:      "Account suspended",
+}
