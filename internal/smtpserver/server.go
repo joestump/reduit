@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +47,17 @@ const (
 	DefaultMaxMessageBytes = 25 * 1024 * 1024 // 25 MiB
 	DefaultSubmitTimeout   = 60 * time.Second
 )
+
+// DefaultMaxLineLength caps a single SMTP command/response line. RFC
+// 5321 §4.5.3.1.6 puts the practical ceiling at 1000 octets for the
+// reverse-path/forward-path commands; we round up to 2000 to match the
+// upstream emersion/go-smtp default at v0.24.0 and pin it explicitly so
+// a future upstream default change does not silently widen our parser.
+//
+// Governing: SPEC-0004 REQ "Recipient and Message Size Limits" —
+// per-command-line cap is part of the input-validation surface; pinned
+// here so review can see the value without grepping go-smtp source.
+const DefaultMaxLineLength = 2000
 
 // Config bundles the construction-time knobs for Server. All fields
 // other than the empty-string / zero defaults are required; defaults
@@ -202,20 +214,37 @@ func New(cfg Config) (*Server, error) {
 	// large attachments can flow.
 	smtpSrv.WriteTimeout = cfg.resolveSubmitTimeout()
 	smtpSrv.ReadTimeout = cfg.resolveSubmitTimeout()
-	// AllowInsecureAuth = false ON PURPOSE: the upstream library's
-	// `authAllowed()` check refuses AUTH on non-TLS connections when
-	// this flag is unset. Combined with the tls.Listen wrapper below
-	// AND the *tls.Conn assertion in NewSession, this is a third
-	// independent guard against cleartext auth.
+	// AllowInsecureAuth is set true ON PURPOSE: we wrap every accepted
+	// *tls.Conn in a *lockedConn (see lockedconn.go) to serialise
+	// writes between the handler and the suspension goroutine. The
+	// upstream `authAllowed()` check uses a CONCRETE `c.conn.(*tls.Conn)`
+	// assertion (not interface-based), so the wrapper hides TLS from
+	// it. We replace go-smtp's check with two stronger Reduit-side
+	// guards:
+	//   1. The listener is `tls.Listen`, which ONLY produces TLS
+	//      connections (no cleartext bytes ever flow through Accept).
+	//   2. Backend.NewSession (backend.go) calls `isTLSConn` which
+	//      walks the `Unwrap() net.Conn` chain through the lockedConn
+	//      and asserts the underlying conn is a *tls.Conn before
+	//      returning a session. A non-TLS conn produces 523 5.7.10
+	//      "TLS required" and the session is refused.
+	// These two guards together provide the same end-to-end property
+	// as `AllowInsecureAuth=false` would, without losing the write-
+	// serialisation safety the lockedConn buys.
 	//
-	// Governing: SPEC-0004 REQ "TLS Required, SMTPS Only".
-	smtpSrv.AllowInsecureAuth = false
+	// Governing: SPEC-0004 REQ "TLS Required, SMTPS Only" (defence in
+	// depth via tls.Listen + isTLSConn assertion in NewSession).
+	smtpSrv.AllowInsecureAuth = true
 	// TLSConfig is left nil so the upstream library does NOT advertise
 	// STARTTLS in EHLO. The TLS handshake happens at the listener
 	// layer (tls.Listen below) before any SMTP bytes flow.
 	//
 	// Governing: SPEC-0004 REQ "TLS Required, SMTPS Only".
 	smtpSrv.TLSConfig = nil
+	// MaxLineLength caps a single SMTP command/response line. Pinned
+	// to DefaultMaxLineLength so the parser limit is review-visible and
+	// stable across go-smtp upstream changes.
+	smtpSrv.MaxLineLength = DefaultMaxLineLength
 	smtpSrv.ErrorLog = slogAdapter{logger: logger}
 
 	return &Server{
@@ -262,10 +291,20 @@ func (s *Server) Start() error {
 		NextProtos: []string{"smtp"},
 	}
 	addr := s.cfg.resolveAddr()
-	ln, err := tls.Listen("tcp", addr, tlsCfg)
+	rawLn, err := tls.Listen("tcp", addr, tlsCfg)
 	if err != nil {
 		return fmt.Errorf("smtpserver: listen %s: %w", addr, err)
 	}
+	// Wrap every accepted *tls.Conn in a lockedConn so all writes —
+	// the handler goroutine's response flushes AND the suspension
+	// goroutine's `421` injection — share a single per-conn mutex.
+	// Without this, multi-line responses (e.g. EHLO's `250-...` cascade)
+	// can interleave with a concurrent dropWith421 write and produce
+	// corrupted framing on the wire. See lockedconn.go for the full
+	// rationale.
+	//
+	// Governing: SPEC-0004 REQ "Per-Session Authentication Lifetime".
+	ln := &lockedListener{Listener: rawLn}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -313,9 +352,13 @@ type slogAdapter struct {
 }
 
 func (a slogAdapter) Printf(format string, args ...interface{}) {
-	a.logger.Warn("smtp server log", slog.String("msg", fmt.Sprintf(format, args...)))
+	a.logger.Warn("smtp server log",
+		slog.String("msg", strings.TrimRight(fmt.Sprintf(format, args...), "\r\n")))
 }
 
 func (a slogAdapter) Println(args ...interface{}) {
-	a.logger.Warn("smtp server log", slog.String("msg", fmt.Sprintln(args...)))
+	// fmt.Sprintln appends a trailing newline; trim before passing to
+	// slog so handlers don't render a stray "\n" in the output.
+	a.logger.Warn("smtp server log",
+		slog.String("msg", strings.TrimRight(fmt.Sprintln(args...), "\r\n")))
 }

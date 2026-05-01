@@ -323,9 +323,23 @@ func (s *session) Logout() error {
 // registry on suspension / deletion. There is no public hook in
 // emersion/go-smtp to inject a synthetic response onto a live
 // connection, so we write the line directly to the underlying conn
-// and then close it. The client's next read returns the 421 followed
-// by EOF; any in-flight DATA write on the client side observes a
-// closed conn.
+// and then close it.
+//
+// SAFETY: the conn handed to us by go-smtp is a *lockedConn (wired in
+// at the listener layer in server.go). Both this Write and the
+// handler goroutine's response flushes go through the same per-conn
+// write mutex, so a 250-line EHLO continuation cannot interleave with
+// our 421 line on the wire. Without the lockedConn wrapper this would
+// be a wire-protocol corruption race.
+//
+// We deliberately do NOT set a write deadline here. The `*tls.Conn`
+// is shared with the handler goroutine; mutating its deadline would
+// race against any in-flight handler write. The Sessions registry
+// owns the per-session deadline (`dropPerSessionDeadline`, 750ms) and
+// the top-level deadline (`dropTotalDeadline`, 1s); when either
+// expires it calls `forceClose` which hard-closes the underlying
+// socket. Any in-flight write here will then observe net.ErrClosed
+// and unwind — no separate write-deadline needed.
 //
 // Governing: SPEC-0004 REQ "Per-Session Authentication Lifetime".
 func (s *session) dropWith421(reason string) {
@@ -336,12 +350,11 @@ func (s *session) dropWith421(reason string) {
 	if nc == nil {
 		return
 	}
-	// Set a tight write deadline so a slow client cannot wedge this
-	// goroutine past the per-session deadline.
-	_ = nc.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
 	// Format: `421 4.7.1 <reason>\r\n`. Mirrors the canonical
 	// errAccountSuspended response so a client that knows the spec
 	// gets the same payload regardless of which path delivered it.
+	// Single Write call so the lockedConn mutex covers the whole line
+	// in one atomic transaction against any concurrent handler write.
 	line := "421 " +
 		smtpEnhancedCodeString(errAccountSuspended.EnhancedCode) +
 		" " + reason + "\r\n"
