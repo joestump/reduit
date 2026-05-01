@@ -77,6 +77,13 @@ func (s *session) Close() error {
 // in-flight commands; the underlying TCP close is observable to the
 // other goroutines via their next read returning net.ErrClosed.
 //
+// Note: `Conn.Bye` acquires the per-connection write mutex. If a slow
+// client is mid-literal-write, this can block for up to the upstream
+// `literalWriteTimeout` (5 minutes). The Sessions.DropForAccount
+// caller wraps this in a goroutine with a per-session deadline; once
+// the deadline expires, `forceClose` is invoked to hard-close the
+// underlying conn without the write-lock dance.
+//
 // Governing: SPEC-0003 REQ "Per-Session Authentication Lifetime".
 func (s *session) dropWithBye(reason string) {
 	if s.conn == nil {
@@ -86,6 +93,22 @@ func (s *session) dropWithBye(reason string) {
 	// We deliberately ignore the write error: if the client already
 	// hung up, the close still happens.
 	_ = s.conn.Bye(reason)
+}
+
+// forceClose hard-closes the underlying TCP/TLS connection without
+// acquiring any IMAP write lock. Used by the Sessions registry when
+// the per-session BYE-write deadline expires. After this returns, any
+// goroutine still holding `encMutex` on this connection will observe
+// `net.ErrClosed` on its next write and unwind.
+//
+// Governing: SPEC-0003 REQ "Per-Session Authentication Lifetime".
+func (s *session) forceClose() {
+	if s.conn == nil {
+		return
+	}
+	if nc := s.conn.NetConn(); nc != nil {
+		_ = nc.Close()
+	}
 }
 
 // Login implements emersion/go-imap's Session.Login. It is invoked

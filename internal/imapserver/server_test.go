@@ -411,12 +411,19 @@ func TestSessionsRegistryDirect(t *testing.T) {
 }
 
 type testDropper struct {
-	onDrop func(string)
+	onDrop  func(string)
+	onClose func()
 }
 
 func (t *testDropper) dropWithBye(reason string) {
 	if t.onDrop != nil {
 		t.onDrop(reason)
+	}
+}
+
+func (t *testDropper) forceClose() {
+	if t.onClose != nil {
+		t.onClose()
 	}
 }
 
