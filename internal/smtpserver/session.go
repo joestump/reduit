@@ -1,6 +1,9 @@
 // Per-connection SMTP submission session. Owns the SASL PLAIN auth
-// flow. MAIL FROM authorization, recipient cap, and the DATA stub
-// land in a follow-up commit.
+// flow, MAIL FROM authorization, recipient cap, and the DATA stub
+// that drops the body and logs a stub event. The real outbox handoff
+// (encryption + Proton submission) lands in story #22; the suspension
+// drop (dropWith421 / forceClose) lands in the follow-up commit on
+// the same branch.
 //
 // Governing: ADR-0007 (emersion go-smtp), SPEC-0004.
 
@@ -40,6 +43,11 @@ type session struct {
 	accountID  string
 	primary    string // normalised primary alias of the authed account
 	registered bool
+
+	// Per-message state (cleared on Reset / successful Data).
+	hasFrom    bool
+	from       string
+	recipients []string
 }
 
 // Compile-time interface assertions.
@@ -168,49 +176,139 @@ func (s *session) login(username, password string) error {
 	return nil
 }
 
-// Mail implements smtp.Session.Mail. STUB — MAIL FROM authorization
-// against the primary alias lands in a follow-up commit. For now we
-// require AUTH and reject any sender so the listener is unusable for
-// actual submission until the rest of the spec is wired.
-func (s *session) Mail(_ string, _ *smtp.MailOptions) error {
+// Mail implements smtp.Session.Mail. SPEC-0004's "Submission
+// Authorization" requirement: the MAIL FROM address must match the
+// authenticated account's primary alias. Multi-alias support requires
+// a per-alias table populated by the sync worker; the SPEC carves
+// that out as future work.
+//
+// Governing: SPEC-0004 REQ "Submission Authorization".
+//
+// TODO(spec-0004): multi-alias support pending sync worker. Today the
+// only authorised sender is the SASL identity itself.
+func (s *session) Mail(from string, _ *smtp.MailOptions) error {
 	s.mu.Lock()
 	authed := s.accountID != ""
+	primary := s.primary
 	s.mu.Unlock()
+
+	if !authed {
+		// SPEC-0004 inherits SPEC-0003's auth posture: no submission
+		// without prior AUTH. emersion's framing already requires the
+		// HELO + AUTH dance, but defence in depth.
+		return smtp.ErrAuthRequired
+	}
+
+	normalised := strings.ToLower(strings.TrimSpace(from))
+	if normalised == "" || normalised != primary {
+		s.logger.Info("smtp mail rejected",
+			slog.String("event", "smtp_mail_rejected"),
+			slog.String("remote", s.remote),
+			slog.String("account_id", s.accountIDLocked()),
+			slog.String("reason", "not_primary_alias"),
+			slog.Int("from_bytes", len(from)))
+		return errSenderRejected
+	}
+
+	s.mu.Lock()
+	s.hasFrom = true
+	s.from = normalised
+	s.recipients = nil
+	s.mu.Unlock()
+	return nil
+}
+
+// Rcpt implements smtp.Session.Rcpt. The recipient cap is enforced by
+// the upstream library (`server.MaxRecipients`); we just echo the
+// recipient back into the per-message state so DATA can log it. We
+// require AUTH and a prior MAIL FROM defensively.
+//
+// Governing: SPEC-0004 REQ "Recipient and Message Size Limits".
+func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
+	s.mu.Lock()
+	authed := s.accountID != ""
+	hasFrom := s.hasFrom
+	s.mu.Unlock()
+
 	if !authed {
 		return smtp.ErrAuthRequired
 	}
-	// Stub: deferred to the MAIL FROM authorization commit.
-	return &smtp.SMTPError{
-		Code:         421,
-		EnhancedCode: smtp.EnhancedCode{4, 0, 0},
-		Message:      "submission not yet implemented",
+	if !hasFrom {
+		return &smtp.SMTPError{
+			Code:         503,
+			EnhancedCode: smtp.EnhancedCode{5, 5, 1},
+			Message:      "MAIL FROM required before RCPT TO",
+		}
 	}
+
+	s.mu.Lock()
+	s.recipients = append(s.recipients, to)
+	s.mu.Unlock()
+	return nil
 }
 
-// Rcpt implements smtp.Session.Rcpt. STUB — recipient handling lands
-// in the same follow-up commit as Mail.
-func (s *session) Rcpt(_ string, _ *smtp.RcptOptions) error {
-	return smtp.ErrAuthRequired
-}
-
-// Data implements smtp.Session.Data. STUB — drains the reader and
-// returns a deferred error. Real implementation in the follow-up.
+// Data implements smtp.Session.Data. STUB: this story stops at
+// accepting the message body. The real outbox handoff (encryption +
+// Proton submission via the per-account worker) lands in story #22.
+//
+// We still fully consume the reader so the upstream library can write
+// a clean response, AND we propagate any read error (notably
+// smtp.ErrDataTooLarge from the size-limited dataReader) so a 1 GiB
+// attempt fails fast at the size limit rather than buffering 1 GiB
+// before rejection.
+//
+// Governing: SPEC-0004 REQ "Recipient and Message Size Limits", and
+// SPEC-0004 REQ "Outbox Handoff and Synchronous Confirmation"
+// (deferred to #22).
 func (s *session) Data(r io.Reader) error {
-	_, _ = io.Copy(io.Discard, r)
-	return &smtp.SMTPError{
-		Code:         421,
-		EnhancedCode: smtp.EnhancedCode{4, 0, 0},
-		Message:      "submission not yet implemented",
+	// TODO(#22): hand to per-account outbox worker. For now, count the
+	// bytes, log the envelope + size, and drop the body.
+	n, err := io.Copy(io.Discard, r)
+	if err != nil {
+		// Streaming size cap (smtp.ErrDataTooLarge) and any other
+		// read error are returned verbatim. The upstream library maps
+		// *smtp.SMTPError to its code/message; non-SMTP errors map to
+		// the 554 fallback in dataErrorToStatus.
+		s.logger.Info("smtp data error",
+			slog.String("event", "smtp_data_error"),
+			slog.String("remote", s.remote),
+			slog.String("account_id", s.accountIDLocked()),
+			slog.Int64("bytes_read", n),
+			slog.String("error", err.Error()))
+		return err
 	}
+
+	s.mu.Lock()
+	rcpt := append([]string(nil), s.recipients...)
+	from := s.from
+	acct := s.accountID
+	s.mu.Unlock()
+
+	s.logger.Info("smtp data accepted",
+		slog.String("event", "smtp_data_accepted_stub"),
+		slog.String("remote", s.remote),
+		slog.String("account_id", acct),
+		slog.String("from", from),
+		slog.Int("recipients", len(rcpt)),
+		slog.Int64("bytes", n))
+	return nil
 }
 
-// Reset implements smtp.Session.Reset. No per-message state to clear
-// in this initial commit.
-func (s *session) Reset() {}
+// Reset implements smtp.Session.Reset. Clear per-message state but
+// preserve the auth state — RFC 5321: RSET resets the transaction,
+// not the connection.
+func (s *session) Reset() {
+	s.mu.Lock()
+	s.hasFrom = false
+	s.from = ""
+	s.recipients = nil
+	s.mu.Unlock()
+}
 
 // Logout implements smtp.Session.Logout. Called once when the
-// connection ends. Unregister from the live-session map so a later
-// DropForAccount does not race with a finished connection.
+// connection ends (QUIT or remote close). Unregister from the live-
+// session map so a later DropForAccount does not race with a
+// finished connection.
 func (s *session) Logout() error {
 	s.mu.Lock()
 	acct := s.accountID
@@ -223,9 +321,19 @@ func (s *session) Logout() error {
 	return nil
 }
 
+// accountIDLocked returns the current account ID, taking the session
+// lock to read it. Useful for logging where the caller doesn't already
+// hold s.mu.
+func (s *session) accountIDLocked() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.accountID
+}
+
 // logFailure emits a structured INFO record for an authentication
 // failure. The supplied SASL identity is NOT included — only the
-// remote address and the categorised reason.
+// remote address and the categorised reason. Mirrors the IMAP
+// listener's same-named helper.
 func (s *session) logFailure(reason string, extras ...slog.Attr) {
 	attrs := []slog.Attr{
 		slog.String("event", "smtp_auth_failed"),

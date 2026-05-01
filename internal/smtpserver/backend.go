@@ -209,3 +209,15 @@ var ErrAuthFailed = &smtp.SMTPError{
 	EnhancedCode: smtp.EnhancedCode{5, 7, 8},
 	Message:      "Authentication failed",
 }
+
+// errSenderRejected is the canonical SPEC-0004 "MAIL FROM does not
+// match a known alias" response. Wired up exactly per the spec's
+// "Submission Authorization" requirement so a black-box client probe
+// gets the byte-identical text the spec mandates.
+//
+// Governing: SPEC-0004 REQ "Submission Authorization".
+var errSenderRejected = &smtp.SMTPError{
+	Code:         553,
+	EnhancedCode: smtp.EnhancedCode{5, 7, 1},
+	Message:      "Sender address rejected: not authorized for this account",
+}
