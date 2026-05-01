@@ -40,6 +40,32 @@ const bcryptCost = 12
 // (no padding) that produces 32 displayable ASCII characters.
 const imapPasswordRandomBytes = 20
 
+// bcryptMaxPasswordBytes is bcrypt's hard input ceiling. bcrypt
+// silently truncates inputs longer than 72 bytes, which would let two
+// distinct passwords (sharing the first 72 bytes) hash to the same
+// digest — a verification footgun for externally-supplied secrets.
+const bcryptMaxPasswordBytes = 72
+
+// Column-name AAD constants. Every Seal/Open call passes the matching
+// canonical column name as additional authenticated data so an
+// attacker (or buggy code) with DB write cannot copy a ciphertext from
+// one column into another column that shares the same per-account
+// data key — the AEAD tag will fail to verify with the wrong AAD.
+//
+// Governing: ADR-0003. Column-name AAD prevents ciphertext substitution
+// across columns sealed with the same per-account key.
+const (
+	aadRefreshToken      = "refresh_token_ciphertext"
+	aadMailboxPassphrase = "mailbox_passphrase_ciphertext"
+	aadIMAPPassword      = "imap_password_ciphertext"
+)
+
+// ErrIMAPPasswordTooLong is returned when an externally-supplied IMAP
+// password exceeds bcrypt's 72-byte input ceiling. Internal callers
+// (RotateIMAPPassword) generate a fixed 32-char secret and never trip
+// this; the guard exists for SealIMAPPassword's "admin override" path.
+var ErrIMAPPasswordTooLong = fmt.Errorf("account: imap password exceeds %d bytes (bcrypt input ceiling)", bcryptMaxPasswordBytes)
+
 // ErrSecretNotPresent is returned by Open* helpers when the requested
 // secret column is NULL/empty (i.e. the secret has not been sealed yet).
 var ErrSecretNotPresent = errors.New("account: secret not present")
@@ -67,7 +93,7 @@ func (s *service) SealRefreshToken(ctx context.Context, accountID string, plaint
 	}
 	defer zeroDataKey(&dk)
 
-	sealed, err := cryptenv.Seal(dk[:], plaintext, nil)
+	sealed, err := cryptenv.Seal(dk[:], plaintext, []byte(aadRefreshToken))
 	if err != nil {
 		return fmt.Errorf("account: seal refresh token: %w", err)
 	}
@@ -92,7 +118,7 @@ func (s *service) OpenRefreshToken(ctx context.Context, accountID string) ([]byt
 	if len(row.RefreshTokenCiphertext) == 0 {
 		return nil, ErrSecretNotPresent
 	}
-	pt, err := cryptenv.Open(dk[:], row.RefreshTokenCiphertext, nil)
+	pt, err := cryptenv.Open(dk[:], row.RefreshTokenCiphertext, []byte(aadRefreshToken))
 	if err != nil {
 		return nil, fmt.Errorf("account: open refresh token: %w", err)
 	}
@@ -106,7 +132,7 @@ func (s *service) SealMailboxPassphrase(ctx context.Context, accountID string, p
 	}
 	defer zeroDataKey(&dk)
 
-	sealed, err := cryptenv.Seal(dk[:], plaintext, nil)
+	sealed, err := cryptenv.Seal(dk[:], plaintext, []byte(aadMailboxPassphrase))
 	if err != nil {
 		return fmt.Errorf("account: seal mailbox passphrase: %w", err)
 	}
@@ -123,7 +149,7 @@ func (s *service) OpenMailboxPassphrase(ctx context.Context, accountID string) (
 	if len(row.MailboxPassphraseCiphertext) == 0 {
 		return nil, ErrSecretNotPresent
 	}
-	pt, err := cryptenv.Open(dk[:], row.MailboxPassphraseCiphertext, nil)
+	pt, err := cryptenv.Open(dk[:], row.MailboxPassphraseCiphertext, []byte(aadMailboxPassphrase))
 	if err != nil {
 		return nil, fmt.Errorf("account: open mailbox passphrase: %w", err)
 	}
@@ -134,14 +160,21 @@ func (s *service) OpenMailboxPassphrase(ctx context.Context, accountID string) (
 // that need to *generate* a new password should use RotateIMAPPassword
 // instead; SealIMAPPassword exists so externally-supplied passwords
 // (e.g. admin override) can still take the same persistence path.
+//
+// Returns ErrIMAPPasswordTooLong if plaintext exceeds 72 bytes; bcrypt
+// silently truncates beyond that, which would let two distinct
+// passwords sharing a 72-byte prefix verify against the same hash.
 func (s *service) SealIMAPPassword(ctx context.Context, accountID string, plaintext []byte) error {
+	if len(plaintext) > bcryptMaxPasswordBytes {
+		return ErrIMAPPasswordTooLong
+	}
 	dk, _, err := s.loadDataKey(ctx, accountID)
 	if err != nil {
 		return err
 	}
 	defer zeroDataKey(&dk)
 
-	sealed, err := cryptenv.Seal(dk[:], plaintext, nil)
+	sealed, err := cryptenv.Seal(dk[:], plaintext, []byte(aadIMAPPassword))
 	if err != nil {
 		return fmt.Errorf("account: seal imap password: %w", err)
 	}
@@ -162,7 +195,7 @@ func (s *service) OpenIMAPPassword(ctx context.Context, accountID string) ([]byt
 	if len(row.IMAPPasswordCiphertext) == 0 {
 		return nil, ErrSecretNotPresent
 	}
-	pt, err := cryptenv.Open(dk[:], row.IMAPPasswordCiphertext, nil)
+	pt, err := cryptenv.Open(dk[:], row.IMAPPasswordCiphertext, []byte(aadIMAPPassword))
 	if err != nil {
 		return nil, fmt.Errorf("account: open imap password: %w", err)
 	}

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -60,11 +61,10 @@ type Service interface {
 	// account, or an error if no token has been stored.
 	OpenRefreshToken(ctx context.Context, accountID string) ([]byte, error)
 
-	// UpdateRefreshToken is an alias for SealRefreshToken intended for
-	// external callers (e.g. internal/proton's RefreshTokenSaver
-	// callback) that already have the freshly-sealed bytes — except in
-	// our case we always seal here so that the data key never leaves
-	// the account package. Plaintext in, sealed-on-disk out.
+	// UpdateRefreshToken is an alias for SealRefreshToken named for the
+	// shape that external callers (e.g. internal/proton's
+	// RefreshTokenSaver callback) read most naturally. Plaintext in,
+	// sealed-on-disk out — the data key never leaves the account package.
 	UpdateRefreshToken(ctx context.Context, accountID string, plaintext []byte) error
 
 	SealMailboxPassphrase(ctx context.Context, accountID string, plaintext []byte) error
@@ -133,6 +133,10 @@ func newUUIDv7() (string, error) {
 // SPEC-0001 REQ "Per-Account Data Key" (fresh data key, sealed envelope),
 // SPEC-0001 REQ "Admin Flag" (is_admin set from allowlist at create time).
 func (s *service) Create(ctx context.Context, params CreateParams) (*Account, error) {
+	// Defensive trim so a sub pasted with a leading/trailing space
+	// matches the in-memory allowlist (which is configured by an
+	// operator who may also have pasted with whitespace).
+	params.OIDCSubject = strings.TrimSpace(params.OIDCSubject)
 	if params.OIDCSubject == "" {
 		return nil, errors.New("account: OIDCSubject is required")
 	}
@@ -239,25 +243,61 @@ func transitionAllowed(from, to State) bool {
 	return allowed[to]
 }
 
+// Transition validates and persists a state change atomically. Validation
+// is encoded as a `state IN (<allowed-prev-states>)` clause on the UPDATE
+// so two racing callers cannot both move the same account from a single
+// source state to two different targets — only one will see RowsAffected=1.
+//
+// Governing: SPEC-0001 REQ "Account Lifecycle States". The conditional
+// UPDATE collapses read-validate-write into one atomic step, removing the
+// TOCTOU window the original Go-side validation had.
 func (s *service) Transition(ctx context.Context, id string, next State) (*Account, error) {
 	if !next.Valid() {
 		return nil, fmt.Errorf("%w: target state %q is not valid", ErrInvalidTransition, next)
 	}
-	row, err := s.repo.getByID(ctx, id)
+	allowedFrom := allowedPrevStates(next)
+	if len(allowedFrom) == 0 {
+		// next is a known state but unreachable (e.g. nothing transitions
+		// INTO pending_proton_setup). We could short-circuit, but we still
+		// want to distinguish missing-account from invalid-transition, so
+		// fall through to the read below for the error message.
+		if _, err := s.repo.getByID(ctx, id); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: target state %q has no legal predecessor", ErrInvalidTransition, next)
+	}
+
+	ok, err := s.repo.transitionState(ctx, id, allowedFrom, next, s.now().UTC())
 	if err != nil {
 		return nil, err
 	}
-	current := State(row.State)
-	if current == next {
-		return nil, fmt.Errorf("%w: already in state %q", ErrInvalidTransition, current)
-	}
-	if !transitionAllowed(current, next) {
+	if !ok {
+		// Either the account does not exist, or its current state is not
+		// a legal predecessor of `next`. Re-read to disambiguate.
+		row, getErr := s.repo.getByID(ctx, id)
+		if getErr != nil {
+			return nil, getErr
+		}
+		current := State(row.State)
+		if current == next {
+			return nil, fmt.Errorf("%w: already in state %q", ErrInvalidTransition, current)
+		}
 		return nil, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, current, next)
 	}
-	if err := s.repo.updateState(ctx, id, next, s.now().UTC()); err != nil {
-		return nil, err
-	}
 	return s.GetByID(ctx, id)
+}
+
+// allowedPrevStates is the inverse of allowedTransitions: given a
+// target state, return every state legally allowed to precede it.
+// Used by the conditional UPDATE in Transition.
+func allowedPrevStates(next State) []State {
+	var prev []State
+	for from, tos := range allowedTransitions {
+		if tos[next] {
+			prev = append(prev, from)
+		}
+	}
+	return prev
 }
 
 func (s *service) Delete(ctx context.Context, id string) (*Account, error) {
@@ -265,7 +305,11 @@ func (s *service) Delete(ctx context.Context, id string) (*Account, error) {
 }
 
 func (s *service) IsAdmin(a *Account) bool {
-	if a == nil {
+	if a == nil || a.OIDCSubject == "" {
+		// Defense-in-depth: a misconfigured OIDC_ADMIN_SUBS that contains
+		// "" (e.g. from "OIDC_ADMIN_SUBS=,sub-foo") would otherwise grant
+		// admin to any account whose subject is empty. Mirror the guard
+		// in Account.AdminBy so the two answers always agree.
 		return false
 	}
 	return slices.Contains(s.adminSubs, a.OIDCSubject)

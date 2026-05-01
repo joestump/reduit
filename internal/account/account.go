@@ -67,10 +67,10 @@ type Account struct {
 	DeletedAt            *time.Time
 }
 
-// IsAdmin reports whether the given OIDC subject appears in the admin
-// allowlist (the `OIDC_ADMIN_SUBS` config). Comparison is exact and
-// case-sensitive — Pocket ID and most OIDC providers issue opaque
-// subjects so case-insensitivity would be unsafe.
+// AdminBy reports whether the account's OIDC subject appears in the
+// supplied admin allowlist (typically the `OIDC_ADMIN_SUBS` config).
+// Comparison is exact and case-sensitive — Pocket ID and most OIDC
+// providers issue opaque subjects so case-insensitivity would be unsafe.
 //
 // Governing: SPEC-0001 REQ "Admin Flag".
 func (a Account) AdminBy(adminSubs []string) bool {

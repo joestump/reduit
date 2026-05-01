@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // repository is the sqlx-backed CRUD layer for the accounts table. It
@@ -95,9 +97,15 @@ func (r *repository) insert(ctx context.Context, row *accountRow) error {
     )`
 	_, err := r.db.NamedExecContext(ctx, q, row)
 	if err != nil {
-		// modernc.org/sqlite surfaces the constraint message in err.Error;
-		// match by substring rather than driver-specific error codes so
-		// a future driver swap doesn't silently break this branch.
+		// Prefer the typed sqlite error code so this branch survives
+		// driver message-text changes. Fall back to a substring match
+		// against the unique-constraint message so a future driver swap
+		// still has a chance to surface ErrAccountAlreadyExists rather
+		// than 500-ing the OIDC login path.
+		var sqliteErr *sqlite.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
+			return ErrAccountAlreadyExists
+		}
 		msg := err.Error()
 		if strings.Contains(msg, "UNIQUE constraint failed") &&
 			strings.Contains(msg, "accounts.oidc_subject") {
@@ -144,25 +152,55 @@ func (r *repository) list(ctx context.Context) ([]*accountRow, error) {
 	return rows, nil
 }
 
-// updateState transitions an account row. The repository layer trusts
-// the caller (Service.Transition) to have validated the diagram; it
-// just persists the change and bumps updated_at (and deleted_at when
-// transitioning to soft_deleted).
-func (r *repository) updateState(ctx context.Context, id string, next State, now time.Time) error {
+// transitionState atomically advances an account from any state in
+// `allowedFrom` to `next`. Returns (ok=true) when exactly one row was
+// updated, (ok=false) when no row matched the WHERE clause (meaning
+// another writer raced ahead and changed state since validation, or
+// the account does not exist).
+//
+// Callers that need to distinguish "wrong state" from "missing row"
+// must re-read after a false result.
+//
+// Governing: SPEC-0001 REQ "Account Lifecycle States" — the conditional
+// WHERE clause makes the read-validate-write a single atomic step at
+// the SQL layer, removing the TOCTOU window between Service-side
+// validation and the UPDATE.
+func (r *repository) transitionState(ctx context.Context, id string, allowedFrom []State, next State, now time.Time) (bool, error) {
+	if len(allowedFrom) == 0 {
+		return false, nil
+	}
+	placeholders := make([]string, len(allowedFrom))
+	for i := range allowedFrom {
+		placeholders[i] = "?"
+	}
+	inList := strings.Join(placeholders, ",")
+
+	var (
+		q    string
+		args []any
+	)
 	if next == StateSoftDeleted {
-		const q = `UPDATE accounts SET state = ?, updated_at = ?, deleted_at = ? WHERE id = ?`
-		res, err := r.db.ExecContext(ctx, q, string(next), now, now, id)
-		if err != nil {
-			return fmt.Errorf("account: update state (soft delete): %w", err)
-		}
-		return checkOneRow(res, "update state")
+		q = `UPDATE accounts SET state = ?, updated_at = ?, deleted_at = ? ` +
+			`WHERE id = ? AND state IN (` + inList + `)`
+		args = []any{string(next), now, now, id}
+	} else {
+		q = `UPDATE accounts SET state = ?, updated_at = ? ` +
+			`WHERE id = ? AND state IN (` + inList + `)`
+		args = []any{string(next), now, id}
 	}
-	const q = `UPDATE accounts SET state = ?, updated_at = ? WHERE id = ?`
-	res, err := r.db.ExecContext(ctx, q, string(next), now, id)
+	for _, s := range allowedFrom {
+		args = append(args, string(s))
+	}
+
+	res, err := r.db.ExecContext(ctx, q, args...)
 	if err != nil {
-		return fmt.Errorf("account: update state: %w", err)
+		return false, fmt.Errorf("account: transition state: %w", err)
 	}
-	return checkOneRow(res, "update state")
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("account: transition state rows affected: %w", err)
+	}
+	return n == 1, nil
 }
 
 // updateRefreshToken stores a sealed refresh token blob.
