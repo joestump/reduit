@@ -14,12 +14,12 @@ import (
 )
 
 // worker is the per-account goroutine harness. The harness handles
-// lifecycle (start/stop, panic recovery, drain notification) and a
-// stub tick loop. Story #16 replaces the stub body inside tick() with
-// a real call to client.GetEvent under AcquireProtonSlot.
+// lifecycle (start/stop, panic recovery, drain notification) and the
+// per-tick event-stream consumption added by story #16.
 //
 // Governing: SPEC-0002 — the harness is the substrate every later
-// story depends on. The body is intentionally tiny in this PR.
+// story depends on; story #17 layers backoff/IMAP-notify/permanent-
+// error semantics on top.
 type worker struct {
 	id     string
 	sup    *Supervisor
@@ -37,6 +37,12 @@ type worker struct {
 	// stopOnce guards signalStop so multiple stop signals collapse
 	// into a single cancel.
 	stopOnce sync.Once
+
+	// proc is the lazily-constructed event processor. Built on the
+	// first tick that successfully resolves a proton.Client via the
+	// supervisor's ClientFactory; nil until then. Single-goroutine
+	// (only the run loop touches it), so no lock.
+	proc *eventProcessor
 
 	// panicker is an optional test-only hook invoked at the top of
 	// each tick body. Production never sets it (nil → no-op). Tests
@@ -138,14 +144,22 @@ func (w *worker) run() {
 	}
 }
 
-// tick is one cycle of the worker loop. In this PR it is a stub:
-// acquire a Proton-call slot, log "alive", release. Story #16
-// replaces the body with `client.GetEvent` plumbing.
+// tick is one cycle of the worker loop. The body acquires a
+// process-wide Proton concurrency slot, runs the event-stream
+// processor up to MaxConsecutiveTicks times to drain any backlog, and
+// releases the slot.
 //
 // Governing: SPEC-0002 REQ "Concurrency Limits" — the AcquireProtonSlot
-// call is what enforces the global cap. Wiring it now (even around a
-// no-op) means story #16 inherits the constraint without having to
-// remember to add it.
+// call is what enforces the global cap. The slot is held across the
+// entire chained burst (not re-acquired per processOnce call) for two
+// reasons: (1) we already hold one upstream HTTP keep-alive
+// connection, so re-acquiring would just thrash the semaphore; (2)
+// the per-call cap is "in-flight calls", and chained calls in a tight
+// loop are still serially in-flight from this worker's perspective.
+//
+// Within the burst we honour both ctx.Done and the
+// MaxConsecutiveTicks cap so the worker stays responsive to graceful
+// shutdown and so a runaway "More=true" loop cannot starve the ticker.
 //
 // Defer ordering matters: the recover() defer is registered AFTER the
 // release() defer so that, on panic, defers unwind LIFO and the
@@ -178,9 +192,73 @@ func (w *worker) tick() {
 		}
 	}()
 
+	// Test-only hook from #15. Story #17 replaces this with a real
+	// injection-based panic test once the proton.Client mock can fire
+	// panics inside GetEvent.
 	if w.panicker != nil {
 		w.panicker()
 	}
-	w.logger.LogAttrs(w.ctx, slog.LevelDebug, "sync: worker tick (stub)")
-	// TODO(#16): client.GetEvent + cursor persistence goes here.
+
+	// "No-Proton" mode: ClientFactory was nil at supervisor
+	// construction. The worker still runs (so lifecycle tests don't
+	// need a stub Proton client) but emits no Proton calls.
+	if w.sup.cfg.ClientFactory == nil {
+		w.logger.LogAttrs(w.ctx, slog.LevelDebug, "sync: worker tick (no-Proton mode)")
+		return
+	}
+
+	// Lazy bootstrap of the per-worker event processor. We do this in
+	// tick() rather than at start() so a transient ClientFactory
+	// failure (e.g. account secrets briefly missing right after
+	// activation) does not permanently disable the worker — the next
+	// tick will retry. A persistent failure manifests as a steady
+	// stream of ERROR logs, which is the observable signal we want.
+	if w.proc == nil {
+		client, err := w.sup.cfg.ClientFactory(w.ctx, w.id)
+		if err != nil {
+			w.logger.LogAttrs(w.ctx, slog.LevelError,
+				"sync: client factory failed; will retry next tick",
+				slog.Any("err", err),
+			)
+			return
+		}
+		proc, err := newEventProcessor(w.ctx, w.id, w.sup.svc, client, w.logger)
+		if err != nil {
+			w.logger.LogAttrs(w.ctx, slog.LevelError,
+				"sync: event processor bootstrap failed; will retry next tick",
+				slog.Any("err", err),
+			)
+			return
+		}
+		w.proc = proc
+	}
+
+	// Drain the backlog. SPEC-0002's "Tick the loop ASAP after a
+	// non-empty batch" intent is implemented here: if processOnce
+	// reports more=true we immediately call again rather than waiting
+	// for the next ticker fire. The MaxConsecutiveTicks cap and the
+	// ctx.Done check ensure the loop cannot starve graceful shutdown.
+	for i := 0; i < w.sup.cfg.MaxConsecutiveTicks; i++ {
+		if w.ctx.Err() != nil {
+			return
+		}
+		more, err := w.proc.processOnce(w.ctx)
+		if err != nil {
+			// Story #17 will classify (transient vs permanent) and
+			// emit backoff. For #16 plumbing we just log + bail; the
+			// next ticker fire retries.
+			w.logger.LogAttrs(w.ctx, slog.LevelError,
+				"sync: event processing failed; will retry next tick",
+				slog.Any("err", err),
+			)
+			return
+		}
+		if !more {
+			return
+		}
+	}
+	w.logger.LogAttrs(w.ctx, slog.LevelDebug,
+		"sync: max consecutive ticks reached; yielding to ticker",
+		slog.Int("limit", w.sup.cfg.MaxConsecutiveTicks),
+	)
 }

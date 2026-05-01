@@ -2,18 +2,25 @@
 // (the "sync workers") and the Supervisor that starts/stops them in
 // response to account-state transitions.
 //
-// This package is the v0.1 foundation laid by issue #15: it implements
-// the supervisor and the worker lifecycle harness, but the worker body
-// itself is a stub that loops on a tick. Subsequent stories fill in
-// the body:
+// As of issue #16 the worker is functional plumbing: each tick
+// resolves a proton.Client via the configured ClientFactory, calls
+// GetEvent under the process-wide concurrency semaphore, and persists
+// the new cursor atomically via account.Service.SetSyncState. On
+// startup the worker resumes from the persisted cursor (or bootstraps
+// from GetLatestEventID on first-ever boot via the ErrNoSyncState
+// sentinel). The actual mailbox/UID materialisation derived from
+// events is deferred to issue #19's IMAP work; #16 wires the cursor
+// pipeline so #19 has somewhere to plug its derived-state writes via
+// the SyncStateTxWork callback supported by SetSyncState.
 //
-//   - Issue #16 wires the worker's tick to client.GetEvent and the
-//     event-cursor persistence path (SPEC-0002 REQ "Event Cursor
-//     Persistence").
+// Subsequent stories fill in the remaining SPEC-0002 surface:
+//
 //   - Issue #17 layers backoff-with-jitter, IMAP IDLE pubsub
-//     publication, and crash isolation/admin-clear semantics
+//     publication, and permanent-error account-state transitions
 //     (SPEC-0002 REQ "Backoff on Failure", "IMAP Update Notification",
-//     "Panic Isolation").
+//     refresh-token-revoked handling).
+//   - Issue #19 lands the mailbox/UID materialisation that consumes
+//     the cursor pipeline plumbed here.
 //
 // Wiring into cmd/reduit's serve command is intentionally deferred to
 // the v0.2 consolidation PR per the design doc; this package is fully

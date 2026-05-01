@@ -14,7 +14,26 @@ import (
 	"time"
 
 	"github.com/joestump/reduit/internal/account"
+	"github.com/joestump/reduit/internal/proton"
 )
+
+// ClientFactory hands the worker a session-bearing proton.Client for
+// the supplied account. The composition root (cmd/reduit's serve) will
+// wire this to a closure that resolves the account's secrets via
+// account.Service and calls proton.Manager.WithAccount; tests inject
+// a stub that returns a fake Client so the worker loop can be
+// exercised without standing up a real Proton session.
+//
+// The factory is invoked once per worker startup. Returning an error
+// (e.g. because secrets are missing or the refresh token has been
+// revoked) causes the worker to log + exit; the supervisor does NOT
+// retry — recovery is an admin action via the activate transition.
+//
+// Governing: ADR-0001 (go-proton-api), SPEC-0002 REQ "Event Cursor
+// Persistence". The factory keeps the supervisor decoupled from the
+// proton package's concrete Manager so this package's tests do not
+// need to spin up an httptest Proton server.
+type ClientFactory func(ctx context.Context, accountID string) (proton.Client, error)
 
 // Default tunables. The values are deliberately conservative — small
 // enough that an under-resourced single-tenant deployment can't
@@ -39,6 +58,14 @@ const (
 	// worker still running at this mark is canceled via context. Per
 	// SPEC-0002 REQ "Graceful Shutdown".
 	DefaultHardShutdown = 30 * time.Second
+
+	// DefaultMaxConsecutiveTicks bounds the within-tick GetEvent
+	// chain. Picked at 20 because Proton's event endpoint coalesces
+	// up to 50 events per call; 20 chained calls drains a 1000-event
+	// backlog in one wakeup, which is well above any plausible
+	// per-account event volume between ticks. Beyond that the ticker
+	// reasserts so the worker stays responsive to context cancel.
+	DefaultMaxConsecutiveTicks = 20
 )
 
 // Config tunes the Supervisor at construction time. The zero value is
@@ -71,6 +98,33 @@ type Config struct {
 	// Now overrides the time source. Used by tests to drive tick
 	// loops deterministically. nil means time.Now.
 	Now func() time.Time
+
+	// ClientFactory is invoked once per worker startup to obtain a
+	// session-bearing proton.Client. nil means workers run in
+	// "no-Proton" mode: they do not call GetEvent, do not touch the
+	// cursor, and emit a single DEBUG log per tick. This degraded
+	// mode exists so the supervisor still behaves correctly in tests
+	// that exercise lifecycle (start/stop/panic) without needing a
+	// fake Proton client. Production callers MUST supply a non-nil
+	// factory.
+	//
+	// Governing: SPEC-0002 REQ "Event Cursor Persistence" — the
+	// factory is the only path through which a worker reaches Proton.
+	ClientFactory ClientFactory
+
+	// MaxConsecutiveTicks caps how many times a single worker
+	// invocation may chain GetEvent calls within one tick (i.e. when
+	// More=true on the previous batch). The cap exists so a runaway
+	// More-loop cannot starve the ticker for sibling work or block
+	// graceful shutdown indefinitely. <= 0 means
+	// DefaultMaxConsecutiveTicks (20).
+	//
+	// Governing: SPEC-0002 — "Tick the loop ASAP after a non-empty
+	// batch" is the design intent (Proton's events are incremental so
+	// a backlog should drain promptly), but unbounded chaining would
+	// violate "Graceful Shutdown" by trapping the worker in a tight
+	// loop while ctx.Done waits to be observed.
+	MaxConsecutiveTicks int
 }
 
 // resolved fills in defaults for every zero-valued field. Returned by
@@ -96,6 +150,9 @@ func (c Config) resolved() Config {
 	}
 	if c.Now == nil {
 		c.Now = time.Now
+	}
+	if c.MaxConsecutiveTicks <= 0 {
+		c.MaxConsecutiveTicks = DefaultMaxConsecutiveTicks
 	}
 	return c
 }
