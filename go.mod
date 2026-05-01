@@ -2,6 +2,15 @@ module github.com/joestump/reduit
 
 go 1.26.1
 
+// Pin the compiler toolchain explicitly so setup-go and local builds
+// use a stdlib free of the GO-2025 vulnerabilities flagged by govulncheck:
+//   - GO-2025-3956 / CVE-2025-58189 (crypto/tls KeyUpdate DoS)
+//   - GO-2025-3957 / CVE-2025-58186 (crypto/x509 unexpected panic)
+//   - GO-2025-3955 / CVE-2025-58188 (crypto/x509 NotAfter time DoS)
+// All three are fixed in 1.26.2. The `go 1.26.1` line above is the
+// language-version floor; `toolchain` pins the actual compiler.
+toolchain go1.26.2
+
 require (
 	github.com/ProtonMail/go-proton-api v0.4.1-0.20260424150947-6bf7f5a61eb8
 	github.com/ProtonMail/gopenpgp/v2 v2.10.0-proton
@@ -26,7 +35,7 @@ require (
 	github.com/PuerkitoBio/goquery v1.12.0 // indirect
 	github.com/andybalholm/cascadia v1.3.3 // indirect
 	github.com/bradenaw/juniper v0.15.3 // indirect
-	github.com/cloudflare/circl v1.6.2 // indirect
+	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/cronokirby/saferith v0.33.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/emersion/go-message v0.16.0 // indirect
