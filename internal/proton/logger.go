@@ -25,6 +25,8 @@ import (
 // The adapter never panics on a nil underlying logger: nil is replaced
 // by a no-op handler at the Manager constructor (see resolveOptions).
 type slogRestyAdapter struct {
+	// log already has source=resty bound via With(), so per-call
+	// LogAttrs sites do not need to construct the attribute again.
 	log *slog.Logger
 }
 
@@ -34,24 +36,18 @@ func newRestyLogger(l *slog.Logger) resty.Logger {
 	if l == nil {
 		l = slog.New(slog.NewTextHandler(discardWriter{}, nil))
 	}
-	return &slogRestyAdapter{log: l}
+	return &slogRestyAdapter{log: l.With(slog.String("source", "resty"))}
 }
 
 // Errorf records an error-level event. We do not gate on Enabled here —
 // errors are cheap and the logger should always see them.
 func (a *slogRestyAdapter) Errorf(format string, v ...any) {
-	a.log.LogAttrs(context.Background(), slog.LevelError,
-		fmt.Sprintf(format, v...),
-		slog.String("source", "resty"),
-	)
+	a.log.LogAttrs(context.Background(), slog.LevelError, fmt.Sprintf(format, v...))
 }
 
 // Warnf records a warn-level event.
 func (a *slogRestyAdapter) Warnf(format string, v ...any) {
-	a.log.LogAttrs(context.Background(), slog.LevelWarn,
-		fmt.Sprintf(format, v...),
-		slog.String("source", "resty"),
-	)
+	a.log.LogAttrs(context.Background(), slog.LevelWarn, fmt.Sprintf(format, v...))
 }
 
 // Debugf records a debug-level event, but only if the underlying
@@ -61,8 +57,5 @@ func (a *slogRestyAdapter) Debugf(format string, v ...any) {
 	if !a.log.Enabled(context.Background(), slog.LevelDebug) {
 		return
 	}
-	a.log.LogAttrs(context.Background(), slog.LevelDebug,
-		fmt.Sprintf(format, v...),
-		slog.String("source", "resty"),
-	)
+	a.log.LogAttrs(context.Background(), slog.LevelDebug, fmt.Sprintf(format, v...))
 }

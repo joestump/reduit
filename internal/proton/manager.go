@@ -4,6 +4,8 @@ package proton
 
 import (
 	"context"
+	"fmt"
+	"sync/atomic"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 )
@@ -15,9 +17,44 @@ import (
 // One Manager per process is the normal pattern (multi-account is
 // achieved by minting many Client values from the same Manager). The
 // Manager is safe for concurrent use.
+//
+// The refresh-token persistence callback is stored as an atomic.Pointer
+// so the composition root can install it after construction (the
+// account service is sometimes initialised lazily) and every adopted
+// client picks it up on the next rotation. Resolving the callback at
+// fire time — instead of capturing it once at adopt time — closes the
+// silent-no-op failure mode flagged in the hostile review of PR #37.
 type Manager struct {
-	up   *gpa.Manager
-	opts ClientOptions
+	up      *gpa.Manager
+	opts    ClientOptions
+	refrCBP atomic.Pointer[RefreshTokenCallback]
+}
+
+// refreshTokenCallback returns the currently registered persistence
+// callback, or nil if none was wired. Safe to call from any goroutine.
+func (m *Manager) refreshTokenCallback() RefreshTokenCallback {
+	p := m.refrCBP.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// SetRefreshTokenCallback installs (or replaces) the persistence
+// callback. It is safe to call after NewManager and after Clients have
+// been minted: every refresh handler resolves the callback at fire
+// time, so adopted clients are never deaf to a callback registered
+// later in the boot sequence.
+//
+// Passing nil clears the callback (rotations will be silently dropped
+// — which is what tests want, but production callers should treat it
+// as a misconfiguration).
+func (m *Manager) SetRefreshTokenCallback(cb RefreshTokenCallback) {
+	if cb == nil {
+		m.refrCBP.Store(nil)
+		return
+	}
+	m.refrCBP.Store(&cb)
 }
 
 // NewManager constructs a Manager from a chain of Option values. The
@@ -47,10 +84,14 @@ func NewManager(opts ...Option) *Manager {
 	// still safe.
 	upOpts = append(upOpts, gpa.WithLogger(newRestyLogger(resolved.Logger)))
 
-	return &Manager{
+	m := &Manager{
 		up:   gpa.New(upOpts...),
 		opts: resolved,
 	}
+	if resolved.OnRefreshTokenChange != nil {
+		m.SetRefreshTokenCallback(resolved.OnRefreshTokenChange)
+	}
+	return m
 }
 
 // NewClient wraps an already-authenticated session (uid + access +
@@ -73,6 +114,13 @@ func (m *Manager) NewClient(_ context.Context, uid, accessTok, refreshTok string
 // Persisting rotated refresh tokens is handled separately via
 // WithRefreshTokenCallback (the composition root wires that callback
 // into the account service when both packages are available).
+//
+// Performance contract: Manager.WithAccount calls UID(), AccessToken(),
+// and RefreshToken() exactly once per invocation, but it MAY be invoked
+// frequently (sync workers, the SMTP outbox, and MCP tools each call
+// it on demand). Implementations that decrypt-on-demand SHOULD cache
+// the decrypted values inside the snapshot — three KDF derivations per
+// WithAccount call adds up under load.
 //
 // Governing: ADR-0001 (go-proton-api).
 type AccountSnapshot interface {
@@ -113,9 +161,14 @@ func (m *Manager) WithAccount(ctx context.Context, snap AccountSnapshot) (Client
 // the SRP exchange (callers may inspect TwoFA to decide whether to
 // continue with AuthTOTP / AuthFIDO2), plus a non-nil error on failure.
 //
-// On success, OnRefreshTokenChange (if configured) is invoked once
-// with the initial refresh token so the account service can persist
-// it before the first /auth/v4/refresh round-trip.
+// On success, the registered RefreshTokenCallback is invoked once with
+// the initial refresh token so the account service can persist it
+// before the first /auth/v4/refresh round-trip. If that initial
+// persistence fails the login is unwound (upstream session closed,
+// non-nil error returned) so the caller cannot mistakenly believe a
+// session exists for which Reduit has no on-disk record.
+//
+// Governing: hostile-review Concern 4 of PR #37.
 func (m *Manager) NewClientWithLogin(ctx context.Context, username, password string) (Client, *AuthInfo, error) {
 	// We need AuthInfo separately so callers can branch on the
 	// returned 2FA configuration. The SRP exchange below uses the
@@ -134,19 +187,34 @@ func (m *Manager) NewClientWithLogin(ctx context.Context, username, password str
 	c := &clientImpl{mgr: m}
 	c.adoptUpstream(up)
 
-	if cb := m.opts.OnRefreshTokenChange; cb != nil {
-		// Best-effort initial persistence; surface errors via the
-		// configured logger but do not fail the login. The caller
-		// can re-issue if needed.
-		if cbErr := cb(ctx, auth.RefreshToken); cbErr != nil {
-			m.opts.Logger.Error(
-				"failed to persist initial proton refresh token",
-				"err", cbErr,
-			)
-		}
+	if cbErr := m.fireInitialRefreshCallback(ctx, auth.RefreshToken); cbErr != nil {
+		// Tear down so we don't leak a session the caller will
+		// believe is alive. Logout returns the AuthDelete error,
+		// which we swallow because we already have the more
+		// actionable cbErr to report.
+		_ = c.Logout(context.Background())
+		return nil, &info, cbErr
 	}
 
 	return c, &info, nil
+}
+
+// fireInitialRefreshCallback invokes the persistence callback exactly
+// once with the freshly minted refresh token. Returns a wrapped error
+// (so callers can errors.Is the underlying cause) when the callback
+// fails, or nil when no callback is configured.
+//
+// Centralising this here lets NewClientWithLogin and any future
+// Manager-level login path share the same error semantics.
+func (m *Manager) fireInitialRefreshCallback(ctx context.Context, refreshToken string) error {
+	cb := m.refreshTokenCallback()
+	if cb == nil {
+		return nil
+	}
+	if err := cb(ctx, refreshToken); err != nil {
+		return fmt.Errorf("proton: persist initial refresh token: %w", err)
+	}
+	return nil
 }
 
 // Close releases the underlying *gpa.Manager's idle HTTP connections.

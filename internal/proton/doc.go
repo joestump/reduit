@@ -20,13 +20,14 @@
 //
 //	v0.4.1-0.20260424150947-6bf7f5a61eb8
 //
-// This is the tip-of-master commit selected by Go module resolution
-// against the larger Proton dependency cluster (gluon, gopenpgp, etc.).
-// Upstream's most recent stable tag is v0.4.0; the pseudo-version above
-// satisfies the issue requirement of "v0.4.0 or later" and is the
-// version transitively required by the rest of the Proton stack we
-// depend on. When bumping, update this comment, regenerate go.sum, and
-// re-run the package tests.
+// This is manually pinned to the tip-of-master commit current as of
+// 2026-04-24, chosen so the rest of the Proton dependency cluster
+// (gluon, gopenpgp, the Proton-resty fork, etc.) resolves to a
+// mutually compatible set. Upstream's most recent stable tag is
+// v0.4.0; the pseudo-version above satisfies the issue requirement of
+// "v0.4.0 or later" and is the version transitively required by the
+// rest of the Proton stack we depend on. When bumping, update this
+// comment, regenerate go.sum, and re-run the package tests.
 //
 // # Resty replace directive
 //

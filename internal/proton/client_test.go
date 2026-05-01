@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -167,30 +169,48 @@ func TestClient_RefreshTokenCallback_FiresOn401(t *testing.T) {
 	var (
 		messageCalls int32
 		refreshCalls int32
+		// refreshBody captures the most recent /auth/v4/refresh request
+		// payload so we can assert on Concern 5 of the hostile review:
+		// the upstream client must actually adopt the rotated refresh
+		// token, not just fire a callback with the right string.
+		refreshBodyMu sync.Mutex
+		refreshBodies []string
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/auth/v4/refresh" && r.Method == http.MethodPost:
-			atomic.AddInt32(&refreshCalls, 1)
+			body, _ := io.ReadAll(r.Body)
+			refreshBodyMu.Lock()
+			refreshBodies = append(refreshBodies, string(body))
+			refreshBodyMu.Unlock()
+			n := atomic.AddInt32(&refreshCalls, 1)
+			// Each rotation hands back a fresh refresh token so we
+			// can assert the upstream client adopted the previous
+			// one (i.e. the second refresh-body should carry newRef
+			// not oldRef).
+			ref := newRef
+			if n > 1 {
+				ref = newRef + "-2"
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"UserID":       newUserID,
 				"UID":          uid,
 				"AccessToken":  newAcc,
-				"RefreshToken": newRef,
+				"RefreshToken": ref,
 				"Scope":        "self",
 			})
 		case strings.HasPrefix(r.URL.Path, "/mail/v4/messages/"):
 			n := atomic.AddInt32(&messageCalls, 1)
-			if n == 1 {
-				// First call: simulate expired access token.
+			// Calls 1 and 3 simulate an expired access token; calls
+			// 2 and 4 should carry the freshly rotated bearer.
+			if n == 1 || n == 3 {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
 				_, _ = w.Write([]byte(`{"Code":401,"Error":"access token expired"}`))
 				return
 			}
-			// Subsequent call: must carry the new access token.
 			if got := r.Header.Get("Authorization"); got != "Bearer "+newAcc {
 				http.Error(w, "wrong access token: "+got, http.StatusBadRequest)
 				return
@@ -235,6 +255,97 @@ func TestClient_RefreshTokenCallback_FiresOn401(t *testing.T) {
 	}
 	if v, _ := gotRefresh.Load().(string); v != newRef {
 		t.Fatalf("expected callback to receive %q, got %q", newRef, v)
+	}
+
+	// Trigger a second 401 -> /auth/v4/refresh round-trip. If the
+	// upstream client really adopted newRef the second refresh request
+	// body must contain newRef (not oldRef). This catches the bug
+	// where the callback fires with the right string but the upstream
+	// client was silently still pinned to the old refresh token.
+	if _, err := c.GetMessage(context.Background(), "m1"); err != nil {
+		t.Fatalf("second GetMessage: %v", err)
+	}
+	refreshBodyMu.Lock()
+	defer refreshBodyMu.Unlock()
+	if len(refreshBodies) != 2 {
+		t.Fatalf("expected 2 refresh bodies, got %d", len(refreshBodies))
+	}
+	if !strings.Contains(refreshBodies[1], newRef) {
+		t.Fatalf("second refresh request must carry newRef=%q in body; got %q", newRef, refreshBodies[1])
+	}
+}
+
+// TestManager_SetRefreshTokenCallback_LateBindingFires asserts the
+// fix for hostile-review Blocker 2 of PR #37: a callback registered
+// after NewManager (and after a Client has been minted) MUST still
+// fire on the next refresh rotation. The previous implementation
+// captured the callback at adopt time, so a later setter would be
+// silently ignored. We now resolve the callback inside the handler
+// closure — this test pins that contract.
+func TestManager_SetRefreshTokenCallback_LateBindingFires(t *testing.T) {
+	t.Parallel()
+
+	const (
+		uid    = "uid-late"
+		oldRef = "old-refresh"
+		newAcc = "new-access"
+		newRef = "late-refresh"
+	)
+
+	var messageCalls int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/auth/v4/refresh" && r.Method == http.MethodPost:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"UserID":       "user-1",
+				"UID":          uid,
+				"AccessToken":  newAcc,
+				"RefreshToken": newRef,
+				"Scope":        "self",
+			})
+		case strings.HasPrefix(r.URL.Path, "/mail/v4/messages/"):
+			n := atomic.AddInt32(&messageCalls, 1)
+			if n == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"Code":401,"Error":"access token expired"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Message":{"ID":"m1","Subject":"after refresh"}}`))
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	// Manager constructed WITHOUT WithRefreshTokenCallback — and a
+	// Client minted before any callback is registered.
+	m := newTestManager(t, srv)
+	c := m.NewClient(context.Background(), uid, "expired-access", oldRef)
+
+	// Now wire the callback after construction (after the Client
+	// already has its auth handler installed).
+	var (
+		got           atomic.Value // string
+		callbackCalls int32
+	)
+	m.SetRefreshTokenCallback(func(_ context.Context, refresh string) error {
+		atomic.AddInt32(&callbackCalls, 1)
+		got.Store(refresh)
+		return nil
+	})
+
+	if _, err := c.GetMessage(context.Background(), "m1"); err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if n := atomic.LoadInt32(&callbackCalls); n != 1 {
+		t.Fatalf("expected late-bound callback to fire exactly once, got %d", n)
+	}
+	if v, _ := got.Load().(string); v != newRef {
+		t.Fatalf("expected late-bound callback to receive %q, got %q", newRef, v)
 	}
 }
 
@@ -314,12 +425,10 @@ func TestManager_WithAccount_RejectsEmptySnapshot(t *testing.T) {
 	t.Cleanup(m.Close)
 
 	cases := map[string]AccountSnapshot{
-		"nil":            nil,
-		"missing uid":    fakeAccount{access: "a", refresh: "r"},
-		"missing access": fakeAccount{uid: "u", refresh: "r"},
-		"missing refresh": fakeAccount{
-			uid: "u", access: "a",
-		},
+		"nil":             nil,
+		"missing uid":     fakeAccount{access: "a", refresh: "r"},
+		"missing access":  fakeAccount{uid: "u", refresh: "r"},
+		"missing refresh": fakeAccount{uid: "u", access: "a"},
 	}
 	for name, snap := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -357,5 +466,112 @@ func TestClient_LogoutIdempotent(t *testing.T) {
 	// Second call must be a no-op (no panic, no network).
 	if err := c.Logout(context.Background()); err != nil {
 		t.Fatalf("second Logout: %v", err)
+	}
+}
+
+// TestClient_LogoutVsConcurrentReads_NoRace exercises the lifecycle
+// RWMutex against `go test -race`: many ListMessages goroutines fire
+// in parallel while a Logout races them. The contract is:
+//
+//   - No goroutine panics or trips the race detector.
+//   - In-flight ListMessages calls observe a coherent state — either
+//     the upstream client is alive (call succeeds) or the session was
+//     already torn down (ErrNotAuthenticated).
+//   - Once Logout returns, every subsequent call returns
+//     ErrNotAuthenticated.
+//
+// Governing: hostile-review Blocker 3 of PR #37.
+func TestClient_LogoutVsConcurrentReads_NoRace(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/auth/v4" && r.Method == http.MethodDelete:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Code":1000}`))
+		case r.URL.Path == "/mail/v4/messages":
+			// Two-call dance: first GET-via-override returns the
+			// message count, second returns the page.
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Query().Get("Page") == "" && r.URL.Query().Get("PageSize") == "" {
+				_, _ = w.Write([]byte(`{"Total":1}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"Messages":[{"ID":"m1","Subject":"x"}],"Stale":0}`))
+		default:
+			http.Error(w, "unexpected", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	m := newTestManager(t, srv)
+	c := m.NewClient(context.Background(), "uid", "acc", "ref")
+
+	const workers = 16
+	var (
+		wg    sync.WaitGroup
+		ready sync.WaitGroup
+		start = make(chan struct{})
+	)
+	wg.Add(workers)
+	ready.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			ready.Done()
+			<-start
+			for range 40 {
+				_, err := c.ListMessages(context.Background(), MessageFilter{})
+				if err != nil && !errors.Is(err, ErrNotAuthenticated) {
+					// Any non-authentication error means the
+					// upstream call ran on a torn-down client
+					// — that's the race we're trying to prevent.
+					t.Errorf("unexpected ListMessages error: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	ready.Wait()
+	close(start)
+
+	// Race the Logout against the in-flight readers.
+	if err := c.Logout(context.Background()); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	wg.Wait()
+
+	// Post-Logout, every call must be ErrNotAuthenticated.
+	if _, err := c.ListMessages(context.Background(), MessageFilter{}); !errors.Is(err, ErrNotAuthenticated) {
+		t.Fatalf("post-Logout ListMessages must return ErrNotAuthenticated, got %v", err)
+	}
+}
+
+// TestManager_NewClientWithLogin_FailsIfInitialPersistFails asserts the
+// fix for hostile-review Concern 4 of PR #37: when the persistence
+// callback fails on the initial-token write, NewClientWithLogin must
+// fail the login (not log-and-shrug). Otherwise the caller believes a
+// session exists for which Reduit has no on-disk record.
+func TestManager_NewClientWithLogin_FailsIfInitialPersistFails(t *testing.T) {
+	// We cannot exercise the full SRP login against an httptest
+	// server (the upstream client expects a Proton-shaped SRP
+	// exchange). Drive the helper directly instead — that's where
+	// the policy lives.
+	t.Parallel()
+
+	m := NewManager()
+	t.Cleanup(m.Close)
+
+	wantErr := errors.New("disk full")
+	m.SetRefreshTokenCallback(func(_ context.Context, _ string) error {
+		return wantErr
+	})
+
+	err := m.fireInitialRefreshCallback(context.Background(), "anything")
+	if err == nil {
+		t.Fatalf("expected non-nil error from fireInitialRefreshCallback")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected wrapped wantErr, got %v", err)
 	}
 }

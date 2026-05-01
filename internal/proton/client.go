@@ -62,18 +62,20 @@ var ErrNotAuthenticated = errors.New("proton: client has no active session")
 // download, logout). Anything outside this set should require a fresh
 // ADR before being added.
 //
-// Concrete implementations are obtained from Manager.NewClient or
-// Manager.NewClientWithLogin. The interface is stable; the underlying
-// upstream library is not.
+// Concrete implementations are obtained from Manager.NewClient,
+// Manager.WithAccount, or Manager.NewClientWithLogin. The interface is
+// stable; the underlying upstream library is not.
+//
+// Note: there is intentionally no Auth method on Client. New sessions
+// come from Manager.NewClientWithLogin so that (a) callers can branch
+// on the returned *AuthInfo to detect 2FA requirements and (b) one
+// session-bearing Client cannot silently swap to a different user's
+// tokens mid-flight (which would invalidate any goroutine holding a
+// reference to the upstream client).
 type Client interface {
 	// AuthInfo fetches the SRP challenge for `username`. Pre-auth
 	// (does not require a session). Round-trips /auth/v4/info.
 	AuthInfo(ctx context.Context, req AuthInfoReq) (AuthInfo, error)
-
-	// Auth performs SRP login for `username` with `password` (raw
-	// bytes — no salt yet). On success the wrapping Client adopts
-	// the returned UID/access/refresh tokens. Pre-auth.
-	Auth(ctx context.Context, username string, password []byte) (Auth, error)
 
 	// AuthTOTP submits a TOTP second factor against /auth/v4/2fa.
 	// Requires an active session (post-Auth, pre-2FA-complete).
@@ -119,16 +121,24 @@ type Client interface {
 
 // clientImpl is the production wrapper around go-proton-api's *Client.
 // It also keeps a reference to the owning Manager so pre-auth calls
-// (AuthInfo, Auth) can route through the Manager-level methods.
+// (AuthInfo) can route through the Manager-level methods.
+//
+// Lifecycle invariant: client lifecycle (adopt/Logout) is serialized by
+// upMu (RWMutex). Per-call methods take RLock so concurrent reads can
+// proceed in parallel but Logout (write lock) drains all in-flight
+// reads before tearing down the upstream client. This eliminates the
+// race documented in the hostile review of PR #37 where Logout could
+// Close() an upstream client mid-request.
 type clientImpl struct {
 	mgr       *Manager
-	upMu      sync.Mutex
+	upMu      sync.RWMutex
 	up        *gpa.Client // nil if pre-auth or post-Logout
 	loggedOut bool
 }
 
-// adoptUpstream replaces the underlying *gpa.Client and registers the
-// auth handler that drives the refresh-token persistence callback.
+// adoptUpstream installs `up` as the live upstream client and registers
+// the auth handler that drives the refresh-token persistence callback.
+// Takes the lifecycle write lock; safe to call concurrently with reads.
 func (c *clientImpl) adoptUpstream(up *gpa.Client) {
 	c.upMu.Lock()
 	defer c.upMu.Unlock()
@@ -143,23 +153,27 @@ func (c *clientImpl) adoptUpstream(up *gpa.Client) {
 }
 
 // installRefreshHandler wires AddAuthHandler so refresh-token rotations
-// invoke the user-supplied RefreshTokenCallback. We call AddAuthHandler
-// once per upstream client; the upstream library itself dedupes nothing,
-// so we must avoid attaching to the same *gpa.Client twice.
+// invoke whichever RefreshTokenCallback is registered on the Manager
+// at *fire time*, not adopt time. Resolving the callback inside the
+// closure (instead of capturing it once at adopt time) means the
+// composition root can swap the callback in after construction — useful
+// when the account service is initialised lazily — without leaving
+// adopted clients permanently deaf to rotations.
+//
+// Governing: hostile-review Blocker 2 of PR #37.
 func (c *clientImpl) installRefreshHandler(up *gpa.Client) {
-	cb := c.mgr.opts.OnRefreshTokenChange
-	if cb == nil {
-		return
-	}
-	log := c.mgr.opts.Logger
 	up.AddAuthHandler(func(a gpa.Auth) {
+		cb := c.mgr.refreshTokenCallback()
+		if cb == nil {
+			return
+		}
 		// AuthHandler runs synchronously inside go-proton-api's
 		// authRefresh path. Use Background ctx so a cancelled
 		// caller-ctx doesn't prevent us from persisting the token —
 		// the rotation has already happened upstream.
 		ctx := context.Background()
 		if err := cb(ctx, a.RefreshToken); err != nil {
-			log.LogAttrs(ctx, slog.LevelError,
+			c.mgr.opts.Logger.LogAttrs(ctx, slog.LevelError,
 				"failed to persist rotated proton refresh token",
 				slog.Any("err", err),
 			)
@@ -167,14 +181,29 @@ func (c *clientImpl) installRefreshHandler(up *gpa.Client) {
 	})
 }
 
-// requireSession returns the upstream client or ErrNotAuthenticated.
-func (c *clientImpl) requireSession() (*gpa.Client, error) {
-	c.upMu.Lock()
-	defer c.upMu.Unlock()
+// requireSession returns the upstream client or ErrNotAuthenticated,
+// holding the lifecycle read lock for the caller's duration.
+//
+// The caller MUST invoke the returned release func when done so Logout
+// can proceed. Implemented as a deferred release pattern (instead of a
+// raw RLock release in callers) so per-method bodies stay tidy and we
+// can't accidentally drop the read lock before the upstream call
+// returns. The release func is safe to call multiple times.
+func (c *clientImpl) requireSession() (*gpa.Client, func(), error) {
+	c.upMu.RLock()
 	if c.up == nil || c.loggedOut {
-		return nil, ErrNotAuthenticated
+		c.upMu.RUnlock()
+		return nil, func() {}, ErrNotAuthenticated
 	}
-	return c.up, nil
+	var released bool
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		c.upMu.RUnlock()
+	}
+	return c.up, release, nil
 }
 
 // AuthInfo (pre-auth) routes through the Manager.
@@ -182,53 +211,33 @@ func (c *clientImpl) AuthInfo(ctx context.Context, req AuthInfoReq) (AuthInfo, e
 	return c.mgr.up.AuthInfo(ctx, req)
 }
 
-// Auth performs SRP login at the Manager level and adopts the resulting
-// upstream client. After this call the wrapping Client carries the new
-// UID/access/refresh tokens.
-func (c *clientImpl) Auth(ctx context.Context, username string, password []byte) (Auth, error) {
-	up, auth, err := c.mgr.up.NewClientWithLogin(ctx, username, password)
-	if err != nil {
-		return Auth{}, err
-	}
-	c.adoptUpstream(up)
-	// Fire the refresh-token callback once on initial login so the
-	// account record gets the very first refresh token, not just
-	// rotations after that.
-	if cb := c.mgr.opts.OnRefreshTokenChange; cb != nil {
-		if cbErr := cb(ctx, auth.RefreshToken); cbErr != nil {
-			c.mgr.opts.Logger.LogAttrs(ctx, slog.LevelError,
-				"failed to persist initial proton refresh token",
-				slog.Any("err", cbErr),
-			)
-		}
-	}
-	return auth, nil
-}
-
 // AuthTOTP submits the TOTP second factor.
 func (c *clientImpl) AuthTOTP(ctx context.Context, code string) error {
-	up, err := c.requireSession()
+	up, release, err := c.requireSession()
 	if err != nil {
 		return err
 	}
+	defer release()
 	return up.Auth2FA(ctx, Auth2FAReq{TwoFactorCode: code})
 }
 
 // AuthFIDO2 submits the FIDO2 second factor.
 func (c *clientImpl) AuthFIDO2(ctx context.Context, req FIDO2Req) error {
-	up, err := c.requireSession()
+	up, release, err := c.requireSession()
 	if err != nil {
 		return err
 	}
+	defer release()
 	return up.Auth2FA(ctx, Auth2FAReq{FIDO2: req})
 }
 
 // KeySalts fetches the per-key salt list.
 func (c *clientImpl) KeySalts(ctx context.Context) (Salts, error) {
-	up, err := c.requireSession()
+	up, release, err := c.requireSession()
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	return up.GetSalts(ctx)
 }
 
@@ -239,65 +248,91 @@ func (c *clientImpl) Unlock(user User, addresses []Address, saltedKeyPass []byte
 
 // GetEvent forwards to the upstream client.
 func (c *clientImpl) GetEvent(ctx context.Context, eventID string) ([]Event, bool, error) {
-	up, err := c.requireSession()
+	up, release, err := c.requireSession()
 	if err != nil {
 		return nil, false, err
 	}
+	defer release()
 	return up.GetEvent(ctx, eventID)
 }
 
 // GetMessage forwards to the upstream client.
 func (c *clientImpl) GetMessage(ctx context.Context, messageID string) (Message, error) {
-	up, err := c.requireSession()
+	up, release, err := c.requireSession()
 	if err != nil {
 		return Message{}, err
 	}
+	defer release()
 	return up.GetMessage(ctx, messageID)
 }
 
 // ListMessages wraps the upstream paged GetMessageMetadata.
 func (c *clientImpl) ListMessages(ctx context.Context, filter MessageFilter) ([]MessageMetadata, error) {
-	up, err := c.requireSession()
+	up, release, err := c.requireSession()
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	return up.GetMessageMetadata(ctx, filter)
 }
 
 // SendDraft submits a draft for delivery.
 func (c *clientImpl) SendDraft(ctx context.Context, draftID string, req SendDraftReq) (Message, error) {
-	up, err := c.requireSession()
+	up, release, err := c.requireSession()
 	if err != nil {
 		return Message{}, err
 	}
+	defer release()
 	return up.SendDraft(ctx, draftID, req)
 }
 
 // GetAttachment downloads the decrypted bytes of an attachment.
 func (c *clientImpl) GetAttachment(ctx context.Context, attachmentID string) ([]byte, error) {
-	up, err := c.requireSession()
+	up, release, err := c.requireSession()
 	if err != nil {
 		return nil, err
 	}
+	defer release()
 	return up.GetAttachment(ctx, attachmentID)
 }
 
 // Logout revokes the session and tears down the upstream client.
 // Calling Logout twice (or on a pre-auth client) is a no-op.
+//
+// On a network-partition AuthDelete failure the local state is still
+// torn down (the upstream session will expire server-side after the
+// access-token TTL). Callers that need stronger revoke-or-fail
+// semantics should retry AuthDelete themselves before calling Logout.
+//
+// Governing: hostile-review Blocker 3 of PR #37 — the previous
+// implementation released the lock between AuthDelete and Close, which
+// allowed adoptUpstream to swap c.up under our feet and have the second
+// Close wipe the wrong client. We now do AuthDelete + Close on a
+// snapshot taken under the write lock, hold the write lock across both
+// calls, and nil out c.up so the "c.up != nil implies live client"
+// invariant is restored.
 func (c *clientImpl) Logout(ctx context.Context) error {
+	// Phase 1: take the write lock to drain any in-flight reads (each
+	// per-call method holds RLock for the duration of its upstream
+	// request), snapshot the upstream client, mark loggedOut, and nil
+	// c.up so any subsequent read takes the ErrNotAuthenticated path.
 	c.upMu.Lock()
-	up := c.up
-	already := c.loggedOut
-	c.upMu.Unlock()
-	if up == nil || already {
+	if c.up == nil || c.loggedOut {
+		c.upMu.Unlock()
 		return nil
 	}
-	delErr := up.AuthDelete(ctx)
-	c.upMu.Lock()
+	up := c.up
 	c.loggedOut = true
-	if c.up != nil {
-		c.up.Close()
-	}
+	c.up = nil
 	c.upMu.Unlock()
+
+	// Phase 2: AuthDelete and Close run on the local snapshot with no
+	// lock held, so a slow network can't starve callers of WithAccount
+	// or NewClientWithLogin (which need the write lock). No one else
+	// holds a reference to `up` (we nilled c.up under the write lock,
+	// and per-call methods always re-resolve c.up under RLock), so the
+	// snapshot is exclusively ours.
+	delErr := up.AuthDelete(ctx)
+	up.Close()
 	return delErr
 }
