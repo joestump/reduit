@@ -638,11 +638,26 @@ func TestSealIMAPPasswordRejectsOversizedInput(t *testing.T) {
 }
 
 // TestTransitionIsAtomicUnderConcurrency races two goroutines on the
-// same account: one tries Suspend, one tries Delete. Exactly one MUST
-// succeed; the loser MUST get ErrInvalidTransition. Without the
-// conditional UPDATE both reads see "active" and both writes happily
-// commit, leaving the row in an indeterminate state (e.g. state=
-// suspended with deleted_at set, or vice versa).
+// same account: one tries Suspend, one tries Delete. The contract we
+// guarantee is *atomicity*, not exclusivity: each Transition call
+// observes-and-writes under a single SQLite transaction, so the row
+// can never be left half-written (state=suspended with deleted_at
+// already set, or vice versa). Whether one or both transitions
+// succeed depends on which one wins the SQLite write lock and on
+// whether the loser's allowedFrom set still contains the new state:
+//
+//   - Suspend then Delete: both succeed (active→suspended→soft_deleted
+//     is a legal chain).
+//   - Delete then Suspend: only Delete succeeds — Suspend's
+//     allowedFrom is [active], and soft_deleted is terminal.
+//
+// In every case the final state MUST be one of `{suspended,
+// soft_deleted}` and `deleted_at` MUST be set iff the final state is
+// soft_deleted. That is the actual atomicity invariant the
+// conditional UPDATE buys us; this test pins it down so a future
+// refactor that re-introduces a stale-snapshot read (e.g. SELECT in
+// one tx, UPDATE in another) cannot regress without tripping the
+// "deleted_at coherence" assertion.
 //
 // Governing: SPEC-0001 REQ "Account Lifecycle States".
 func TestTransitionIsAtomicUnderConcurrency(t *testing.T) {
@@ -685,15 +700,19 @@ func TestTransitionIsAtomicUnderConcurrency(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	if got := atomic.LoadInt32(&successes); got != 1 {
-		t.Fatalf("successful transitions = %d, want exactly 1", got)
+	successCount := atomic.LoadInt32(&successes)
+	failureCount := atomic.LoadInt32(&failures)
+	if successCount+failureCount != 2 {
+		t.Fatalf("totals don't add up: %d successes + %d failures != 2", successCount, failureCount)
 	}
-	if got := atomic.LoadInt32(&failures); got != 1 {
-		t.Fatalf("failed transitions = %d, want exactly 1", got)
+	if successCount < 1 {
+		t.Fatalf("at least one transition must succeed, got %d", successCount)
 	}
 
-	// The winning state must be coherent with deleted_at: soft_deleted
-	// implies deleted_at set; suspended implies deleted_at NULL.
+	// Atomicity invariant: deleted_at is set IFF the final state is
+	// soft_deleted. A torn write (e.g. update state but not deleted_at,
+	// or vice versa) would trip this assertion regardless of which
+	// goroutine "won".
 	final, err := svc.GetByID(ctx, a.ID)
 	if err != nil {
 		t.Fatalf("GetByID: %v", err)

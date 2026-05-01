@@ -11,8 +11,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
+	"runtime/debug"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +23,22 @@ import (
 	"github.com/joestump/reduit/internal/cryptenv"
 	"github.com/joestump/reduit/internal/store"
 )
+
+// TransitionCallback is invoked by Service.Transition (and by
+// convenience wrappers like Service.Delete) AFTER a state change has
+// successfully committed. Callbacks fire synchronously, in registration
+// order, with the previous state, the next state, and a snapshot of
+// the account post-transition. They MUST NOT block for long: keep the
+// work bounded and offload anything heavy to a goroutine.
+//
+// A panic in a callback is recovered by the dispatcher so a single
+// misbehaving subscriber cannot poison the rest of the chain or fail
+// the surrounding Transition call (which has already committed).
+//
+// Governing: SPEC-0002 REQ "One Worker Per Active Account" — the sync
+// supervisor subscribes here so worker start/stop is driven by an
+// in-process event, not a DB poll loop.
+type TransitionCallback func(ctx context.Context, prev, next State, account *Account)
 
 // Service is the contract every consumer (HTTP handlers, sync worker,
 // IMAP/SMTP servers, MCP tools) talks to.
@@ -82,6 +101,14 @@ type Service interface {
 	// VerifyIMAPPassword compares a candidate plaintext against the
 	// stored bcrypt hash. Returns nil on match, an error otherwise.
 	VerifyIMAPPassword(ctx context.Context, accountID string, candidate []byte) error
+
+	// OnTransition registers cb to be invoked after every successful
+	// state transition. Returns an unsubscribe func; callers SHOULD
+	// invoke it on shutdown to free the slot. Multiple callbacks are
+	// supported and fired in registration order.
+	//
+	// Governing: SPEC-0002 REQ "One Worker Per Active Account".
+	OnTransition(cb TransitionCallback) (unsubscribe func())
 }
 
 // CreateParams collects the inputs to Service.Create. ProtonUserID
@@ -99,6 +126,19 @@ type service struct {
 	adminSubs []string
 	now       func() time.Time
 	newID     func() (string, error)
+
+	// transitionCBs holds the live set of transition subscribers. A
+	// pointer-keyed registration cell is used so unsubscribe is O(1)
+	// without needing every caller to track a numeric ID.
+	transitionMu sync.RWMutex
+	transitionCB map[*transitionReg]struct{}
+}
+
+// transitionReg is the registration cell for a TransitionCallback.
+// We key the map by *transitionReg (not the func value) because
+// function values are not comparable in Go.
+type transitionReg struct {
+	cb TransitionCallback
 }
 
 // New constructs a Service backed by the given store, master key, and
@@ -111,11 +151,12 @@ func New(s *store.Store, master cryptenv.MasterKey, adminSubs []string) Service 
 	subs := make([]string, len(adminSubs))
 	copy(subs, adminSubs)
 	return &service{
-		repo:      &repository{db: s.DB},
-		master:    master,
-		adminSubs: subs,
-		now:       time.Now,
-		newID:     newUUIDv7,
+		repo:         &repository{db: s.DB},
+		master:       master,
+		adminSubs:    subs,
+		now:          time.Now,
+		newID:        newUUIDv7,
+		transitionCB: make(map[*transitionReg]struct{}),
 	}
 }
 
@@ -267,7 +308,7 @@ func (s *service) Transition(ctx context.Context, id string, next State) (*Accou
 		return nil, fmt.Errorf("%w: target state %q has no legal predecessor", ErrInvalidTransition, next)
 	}
 
-	ok, err := s.repo.transitionState(ctx, id, allowedFrom, next, s.now().UTC())
+	ok, prev, err := s.repo.transitionState(ctx, id, allowedFrom, next, s.now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -284,7 +325,18 @@ func (s *service) Transition(ctx context.Context, id string, next State) (*Accou
 		}
 		return nil, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, current, next)
 	}
-	return s.GetByID(ctx, id)
+	updated, err := s.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// Fire post-commit subscribers. Failures are logged-and-swallowed by
+	// the dispatcher so a misbehaving subscriber cannot fail the
+	// surrounding caller (whose write has already committed).
+	//
+	// Governing: SPEC-0002 REQ "One Worker Per Active Account" — the
+	// sync supervisor consumes these notifications.
+	s.fireTransition(ctx, prev, next, updated)
+	return updated, nil
 }
 
 // allowedPrevStates is the inverse of allowedTransitions: given a
@@ -322,4 +374,67 @@ func zeroDataKey(dk *cryptenv.DataKey) {
 	for i := range dk {
 		dk[i] = 0
 	}
+}
+
+// OnTransition implements Service.OnTransition. The returned
+// unsubscribe func is idempotent.
+func (s *service) OnTransition(cb TransitionCallback) func() {
+	if cb == nil {
+		return func() {}
+	}
+	reg := &transitionReg{cb: cb}
+	s.transitionMu.Lock()
+	s.transitionCB[reg] = struct{}{}
+	s.transitionMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.transitionMu.Lock()
+			delete(s.transitionCB, reg)
+			s.transitionMu.Unlock()
+		})
+	}
+}
+
+// fireTransition snapshots the current callback set under the read
+// lock, releases the lock, and then invokes each callback synchronously.
+// Snapshotting first means a callback that re-enters Service (e.g. by
+// calling Get/Transition) cannot deadlock against the dispatcher's lock.
+//
+// Each callback is wrapped in a recover so a panicking subscriber can
+// neither crash the caller of Transition nor prevent later subscribers
+// from running.
+func (s *service) fireTransition(ctx context.Context, prev, next State, account *Account) {
+	s.transitionMu.RLock()
+	if len(s.transitionCB) == 0 {
+		s.transitionMu.RUnlock()
+		return
+	}
+	cbs := make([]TransitionCallback, 0, len(s.transitionCB))
+	for reg := range s.transitionCB {
+		cbs = append(cbs, reg.cb)
+	}
+	s.transitionMu.RUnlock()
+
+	for _, cb := range cbs {
+		s.invokeTransitionCB(ctx, cb, prev, next, account)
+	}
+}
+
+// invokeTransitionCB is split out so the deferred recover is per-cb and
+// a panicking callback only cancels its own invocation.
+func (s *service) invokeTransitionCB(ctx context.Context, cb TransitionCallback, prev, next State, account *Account) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Default().LogAttrs(ctx, slog.LevelError,
+				"account transition callback panicked",
+				slog.String("account_id", account.ID),
+				slog.String("prev", string(prev)),
+				slog.String("next", string(next)),
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
+		}
+	}()
+	cb(ctx, prev, next, account)
 }

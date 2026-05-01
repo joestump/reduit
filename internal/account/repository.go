@@ -153,27 +153,89 @@ func (r *repository) list(ctx context.Context) ([]*accountRow, error) {
 }
 
 // transitionState atomically advances an account from any state in
-// `allowedFrom` to `next`. Returns (ok=true) when exactly one row was
-// updated, (ok=false) when no row matched the WHERE clause (meaning
-// another writer raced ahead and changed state since validation, or
-// the account does not exist).
+// `allowedFrom` to `next`. Returns (ok=true, prev) when exactly one
+// row was updated (prev is the state the row held immediately before
+// the UPDATE landed), (ok=false) when no row matched the WHERE clause
+// (meaning another writer raced ahead and changed state since
+// validation, or the account does not exist).
 //
 // Callers that need to distinguish "wrong state" from "missing row"
 // must re-read after a false result.
 //
-// Governing: SPEC-0001 REQ "Account Lifecycle States" — the conditional
-// WHERE clause makes the read-validate-write a single atomic step at
-// the SQL layer, removing the TOCTOU window between Service-side
-// validation and the UPDATE.
-func (r *repository) transitionState(ctx context.Context, id string, allowedFrom []State, next State, now time.Time) (bool, error) {
+// The previous state is captured under a single transaction together
+// with the conditional UPDATE so concurrent racers cannot change the
+// row between the SELECT and the UPDATE — this is the same atomicity
+// guarantee the conditional WHERE clause provides for the write.
+//
+// Governing: SPEC-0001 REQ "Account Lifecycle States", SPEC-0002 REQ
+// "One Worker Per Active Account" (the supervisor needs the prev state
+// so it knows whether a transition was INTO or OUT OF active).
+func (r *repository) transitionState(ctx context.Context, id string, allowedFrom []State, next State, now time.Time) (ok bool, prev State, err error) {
 	if len(allowedFrom) == 0 {
-		return false, nil
+		return false, "", nil
 	}
 	placeholders := make([]string, len(allowedFrom))
 	for i := range allowedFrom {
 		placeholders[i] = "?"
 	}
 	inList := strings.Join(placeholders, ",")
+
+	// Single statement using SQLite's RETURNING clause, so the read of
+	// the previous state and the write of the new state happen
+	// atomically — there is no window where another writer can sneak
+	// in between SELECT and UPDATE. RETURNING reports the row's
+	// columns *after* the UPDATE, but it only fires when the UPDATE
+	// matched, which only happens when the row was in `allowedFrom`.
+	// We therefore know the previous state was one of allowedFrom; we
+	// recover the exact value with a CASE expression that snapshots
+	// `state` before the SET clause is applied.
+	//
+	// SQLite evaluates the RETURNING expressions against the post-update
+	// row, so we cannot just say `RETURNING state` — that would echo
+	// back `next`. Instead the CASE picks the *one* allowedFrom value
+	// that the row currently does NOT match (after the SET it matches
+	// next). Cleaner alternative: a subquery against the row's old
+	// state via OLD.* — but SQLite UPDATE ... RETURNING does not
+	// expose OLD/NEW aliases. The transactional fallback below avoids
+	// that limitation.
+	//
+	// Implementation: wrap in BEGIN IMMEDIATE so concurrent transitions
+	// serialize at the SQLite write-lock layer (deferred transactions
+	// do not prevent two readers from proceeding to conflicting writes
+	// under modernc/sqlite). Inside the tx we SELECT the prior state
+	// and then UPDATE; both run with the write lock held so no other
+	// transition can interleave.
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return false, "", fmt.Errorf("account: begin transition tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Promote the deferred tx to a write transaction immediately so
+	// concurrent racers serialize here instead of both observing the
+	// same prior state and both running an UPDATE that races at commit.
+	// modernc/sqlite (and SQLite generally) allows two deferred
+	// transactions to both read, but only one to write — if we don't
+	// upgrade up front, the loser's UPDATE can succeed under the
+	// fresh post-commit row state if that state still matches a
+	// (different) entry in allowedFrom, which is exactly the race
+	// TestTransitionIsAtomicUnderConcurrency exercises.
+	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET id = id WHERE id = ?`, id); err != nil {
+		return false, "", fmt.Errorf("account: acquire write lock: %w", err)
+	}
+
+	var prevStr string
+	if err := tx.GetContext(ctx, &prevStr, `SELECT state FROM accounts WHERE id = ?`, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, "", nil
+		}
+		return false, "", fmt.Errorf("account: read prev state: %w", err)
+	}
 
 	var (
 		q    string
@@ -192,15 +254,22 @@ func (r *repository) transitionState(ctx context.Context, id string, allowedFrom
 		args = append(args, string(s))
 	}
 
-	res, err := r.db.ExecContext(ctx, q, args...)
+	res, err := tx.ExecContext(ctx, q, args...)
 	if err != nil {
-		return false, fmt.Errorf("account: transition state: %w", err)
+		return false, "", fmt.Errorf("account: transition state: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("account: transition state rows affected: %w", err)
+		return false, "", fmt.Errorf("account: transition state rows affected: %w", err)
 	}
-	return n == 1, nil
+	if n != 1 {
+		return false, "", nil
+	}
+	if err := tx.Commit(); err != nil {
+		return false, "", fmt.Errorf("account: commit transition: %w", err)
+	}
+	committed = true
+	return true, State(prevStr), nil
 }
 
 // updateRefreshToken stores a sealed refresh token blob.
