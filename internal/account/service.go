@@ -109,6 +109,25 @@ type Service interface {
 	//
 	// Governing: SPEC-0002 REQ "One Worker Per Active Account".
 	OnTransition(cb TransitionCallback) (unsubscribe func())
+
+	// GetByPrimaryAlias resolves a SASL PLAIN `local@host` identity
+	// to the owning account. Returns ErrAccountNotFound if no row
+	// matches. Lookup is case-insensitive and whitespace-trimmed —
+	// the wire form supplied by the IMAP/SMTP client is normalised
+	// before comparison so "Joe@Example.COM" and "joe@example.com "
+	// both resolve to the same row.
+	//
+	// Governing: SPEC-0003 REQ "SASL PLAIN With user@host Identity".
+	GetByPrimaryAlias(ctx context.Context, alias string) (*Account, error)
+
+	// SetPrimaryAlias stores (or clears, when alias is empty) the
+	// canonical local@host SASL identity for the account. Returns
+	// ErrAccountAlreadyExists when another account already owns the
+	// alias. The alias is normalised (trim + lower-case) before
+	// storage so lookups are reliable.
+	//
+	// Governing: SPEC-0003 REQ "SASL PLAIN With user@host Identity".
+	SetPrimaryAlias(ctx context.Context, accountID, alias string) error
 }
 
 // CreateParams collects the inputs to Service.Create. ProtonUserID
@@ -238,6 +257,52 @@ func (s *service) GetByID(ctx context.Context, id string) (*Account, error) {
 		return nil, err
 	}
 	return row.toAccount(), nil
+}
+
+// normalisePrimaryAlias trims surrounding whitespace and lower-cases
+// the supplied SASL identity. Returns the normalised string and a
+// flag indicating whether the result is non-empty. Invalid format
+// (empty, missing or multi-`@`, embedded NUL/CR/LF) is the caller's
+// responsibility — this helper only normalises; it does not validate.
+//
+// Governing: SPEC-0003 REQ "SASL PLAIN With user@host Identity".
+// Case-insensitive comparison matches what most consumer mail clients
+// expect (Apple Mail, Thunderbird treat email addresses as case-folded
+// in the local part, even though RFC 5321 technically lets the local
+// part be case-sensitive). For Reduit's use case — the operator owns
+// the alias namespace — case-folding is the safe default.
+func normalisePrimaryAlias(alias string) (string, bool) {
+	trimmed := strings.TrimSpace(alias)
+	if trimmed == "" {
+		return "", false
+	}
+	return strings.ToLower(trimmed), true
+}
+
+// GetByPrimaryAlias implements Service.GetByPrimaryAlias.
+func (s *service) GetByPrimaryAlias(ctx context.Context, alias string) (*Account, error) {
+	norm, ok := normalisePrimaryAlias(alias)
+	if !ok {
+		return nil, ErrAccountNotFound
+	}
+	row, err := s.repo.getByPrimaryAlias(ctx, norm)
+	if err != nil {
+		return nil, err
+	}
+	return row.toAccount(), nil
+}
+
+// SetPrimaryAlias implements Service.SetPrimaryAlias.
+//
+// Empty alias clears the column (NULL). The unique partial index on
+// `primary_alias` permits multiple NULL values so unprovisioned
+// accounts coexist freely.
+func (s *service) SetPrimaryAlias(ctx context.Context, accountID, alias string) error {
+	var stored sql.NullString
+	if norm, ok := normalisePrimaryAlias(alias); ok {
+		stored = sql.NullString{String: norm, Valid: true}
+	}
+	return s.repo.setPrimaryAlias(ctx, accountID, stored, s.now().UTC())
 }
 
 func (s *service) List(ctx context.Context) ([]*Account, error) {

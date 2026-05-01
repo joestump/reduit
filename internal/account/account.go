@@ -60,11 +60,17 @@ type Account struct {
 	HasMailboxPassphrase bool
 	HasIMAPPassword      bool
 	IMAPPasswordHash     string
-	LastEventID          string
-	Crashed              bool
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
-	DeletedAt            *time.Time
+	// PrimaryAlias is the canonical `local@host` form clients use as
+	// the SASL PLAIN identity. NULL/empty means the account has not
+	// yet been provisioned with an alias and SASL lookups will fail.
+	//
+	// Governing: SPEC-0003 REQ "SASL PLAIN With user@host Identity".
+	PrimaryAlias string
+	LastEventID  string
+	Crashed      bool
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	DeletedAt    *time.Time
 }
 
 // AdminBy reports whether the account's OIDC subject appears in the
