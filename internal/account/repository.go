@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -211,8 +212,21 @@ func (r *repository) transitionState(ctx context.Context, id string, allowedFrom
 	}
 	committed := false
 	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+		if committed {
+			return
+		}
+		// Rollback failures are not actionable from the caller's
+		// perspective (we already returned from the operation), but a
+		// failure here usually means the underlying connection is in
+		// an undefined state — log at WARN so operators can correlate
+		// with subsequent driver errors. sql.ErrTxDone is the benign
+		// "already rolled back / committed" case and is filtered out.
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			slog.Default().LogAttrs(ctx, slog.LevelWarn,
+				"account: transition tx rollback failed",
+				slog.String("account_id", id),
+				slog.Any("err", rbErr),
+			)
 		}
 	}()
 

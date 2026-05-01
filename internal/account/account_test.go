@@ -673,6 +673,24 @@ func TestTransitionIsAtomicUnderConcurrency(t *testing.T) {
 		t.Fatalf("seed active: %v", err)
 	}
 
+	// Register an OnTransition subscriber AFTER the seed so we only
+	// count callbacks from the racing goroutines below. The supervisor
+	// (SPEC-0002 REQ "One Worker Per Active Account") depends on each
+	// successful Transition firing exactly one callback with the
+	// correct prev/next pair — including in the chained case where
+	// Suspend lands first and then Delete observes state=suspended.
+	type cbCapture struct{ prev, next State }
+	var (
+		cbMu  sync.Mutex
+		cbLog []cbCapture
+	)
+	unsub := svc.OnTransition(func(_ context.Context, prev, next State, _ *Account) {
+		cbMu.Lock()
+		cbLog = append(cbLog, cbCapture{prev: prev, next: next})
+		cbMu.Unlock()
+	})
+	t.Cleanup(unsub)
+
 	var (
 		successes int32
 		failures  int32
@@ -728,6 +746,49 @@ func TestTransitionIsAtomicUnderConcurrency(t *testing.T) {
 		}
 	default:
 		t.Fatalf("final state = %q, want suspended or soft_deleted", final.State)
+	}
+
+	// Callback-fidelity invariant: the OnTransition callback must
+	// fire once per successful Transition, with prev matching the
+	// state actually observed at the moment the conditional UPDATE
+	// landed. The supervisor (SPEC-0002 REQ "One Worker Per Active
+	// Account") consumes these notifications and a missed or
+	// stale-prev callback would cause it to drop or duplicate workers.
+	cbMu.Lock()
+	defer cbMu.Unlock()
+	if int32(len(cbLog)) != successCount {
+		t.Fatalf("callback fires = %d, want %d (one per successful transition)", len(cbLog), successCount)
+	}
+	switch successCount {
+	case 1:
+		// Either Delete won outright (prev=active, next=soft_deleted),
+		// OR Suspend won and Delete failed because soft_deleted is
+		// terminal — but Delete-from-suspended is actually legal
+		// (allowedPrevStates(soft_deleted) includes suspended), so
+		// successCount=1 only happens when the loser raced into a
+		// state from which its target is illegal, which in practice
+		// for this two-target race means the only stable single-
+		// success outcome is "Delete won and Suspend then saw
+		// soft_deleted (terminal)". Pin both legs.
+		if cbLog[0].prev != StateActive {
+			t.Errorf("single-success callback prev = %q, want %q", cbLog[0].prev, StateActive)
+		}
+		if cbLog[0].next != StateSoftDeleted && cbLog[0].next != StateSuspended {
+			t.Errorf("single-success callback next = %q, want suspended or soft_deleted", cbLog[0].next)
+		}
+	case 2:
+		// Both succeeded: the only legal chain is Suspend then Delete
+		// (active→suspended→soft_deleted). The second callback's prev
+		// MUST be suspended — that pins down "no callback was lost in
+		// the chain" which is exactly what the supervisor depends on
+		// to stop the worker on the first transition and not respawn
+		// on the second.
+		if cbLog[0].prev != StateActive || cbLog[0].next != StateSuspended {
+			t.Errorf("first callback = (%s -> %s), want (active -> suspended)", cbLog[0].prev, cbLog[0].next)
+		}
+		if cbLog[1].prev != StateSuspended || cbLog[1].next != StateSoftDeleted {
+			t.Errorf("second callback = (%s -> %s), want (suspended -> soft_deleted)", cbLog[1].prev, cbLog[1].next)
+		}
 	}
 }
 
