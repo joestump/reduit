@@ -195,8 +195,12 @@ is suspended or deleted; in-flight `DATA` commands SHALL fail.
 
 - **WHEN** an admin suspends an account with a live SMTP session that
   is in `DATA` mode
-- **THEN** the server SHALL respond `451 4.7.1 Account suspended`
+- **THEN** the server SHALL respond `421 4.7.1 Account suspended`
   and close the connection within 1 second
+  - 421 (force-close transmission channel) per RFC 5321 §4.2.1, NOT
+    451 (per-command abort): suspension tears the session down within
+    1s, so 421 is the accurate signal. 451 is wrong for a connection
+    that is being closed.
 
 ## Out of Scope
 
