@@ -100,6 +100,13 @@ type Client interface {
 	// events per call; we return the slice as-is.
 	GetEvent(ctx context.Context, eventID string) ([]Event, bool, error)
 
+	// GetLatestEventID returns the cursor for "right now" — the event
+	// ID a brand-new worker should resume from when no on-disk cursor
+	// exists. Round-trips /core/v4/events/latest. Required by SPEC-0002
+	// REQ "Event Cursor Persistence" so a first-time worker does not
+	// re-process the entire historical event log.
+	GetLatestEventID(ctx context.Context) (string, error)
+
 	// GetMessage fetches the full body of one message.
 	GetMessage(ctx context.Context, messageID string) (Message, error)
 
@@ -254,6 +261,16 @@ func (c *clientImpl) GetEvent(ctx context.Context, eventID string) ([]Event, boo
 	}
 	defer release()
 	return up.GetEvent(ctx, eventID)
+}
+
+// GetLatestEventID forwards to the upstream client.
+func (c *clientImpl) GetLatestEventID(ctx context.Context) (string, error) {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return "", err
+	}
+	defer release()
+	return up.GetLatestEventID(ctx)
 }
 
 // GetMessage forwards to the upstream client.
