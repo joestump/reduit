@@ -141,6 +141,9 @@ func (s *session) Login(username, password string) error {
 			slog.String("reason", invalidIdentityReason(err)),
 			slog.Int("identity_bytes", len(username)))
 		s.backend.rateLimit.RecordFailure(s.rateKey)
+		// Burn one bcrypt comparison so this branch matches the
+		// wall-clock cost of the wrong-password branch (Step 5).
+		s.backend.burnDummyBcrypt([]byte(password))
 		return ErrAuthFailed
 	}
 
@@ -158,6 +161,10 @@ func (s *session) Login(username, password string) error {
 				slog.String("error", err.Error()))
 		}
 		s.backend.rateLimit.RecordFailure(s.rateKey)
+		// Uniform-time: burn a bcrypt comparison so unknown-account
+		// and transient-backend-error paths match the cost of the
+		// wrong-password branch.
+		s.backend.burnDummyBcrypt([]byte(password))
 		return ErrAuthFailed
 	}
 
@@ -173,13 +180,26 @@ func (s *session) Login(username, password string) error {
 			slog.String("account_id", acct.ID),
 			slog.String("state", string(acct.State)))
 		s.backend.rateLimit.RecordFailure(s.rateKey)
+		// Uniform-time: burn a bcrypt comparison so suspended /
+		// soft-deleted / pending-Proton-setup paths match the cost
+		// of the wrong-password branch. Without this, an attacker
+		// could time the response and tell which OIDC subjects exist
+		// in which lifecycle state.
+		s.backend.burnDummyBcrypt([]byte(password))
 		return ErrAuthFailed
 	}
 
-	// Step 5: password verify. bcrypt is constant-time-ish; the
-	// short-circuit on missing hash above (state != active path)
-	// also avoids any timing-side-channel that would distinguish
-	// a never-rotated account from a wrong password.
+	// Step 5: password verify. The real bcrypt comparison runs here.
+	// Cost (12) MUST match `bcryptDummyCost` so the wall-clock cost
+	// of THIS branch matches the burnDummyBcrypt() calls in the
+	// failure branches above. If the costs ever drift, the timing
+	// side-channel returns and an attacker can enumerate accounts
+	// by latency alone.
+	//
+	// Governing: SPEC-0003 REQ "Authentication failure returns NO
+	// with no detail" — uniform-time auth (the failure response is
+	// not just byte-identical but takes a uniform amount of CPU, so
+	// a wire observer cannot enumerate account existence by timing).
 	if err := s.backend.accounts.VerifyIMAPPassword(ctx, acct.ID, []byte(password)); err != nil {
 		s.logFailure("password_mismatch",
 			slog.String("account_id", acct.ID),

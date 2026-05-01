@@ -179,6 +179,9 @@ func TestSASLPlainAuthFailuresAreIdentical(t *testing.T) {
 	stub.addAccount("acct-suspended", "bob@reduit.example", "bob-password", account.StateSuspended)
 	stub.addAccount("acct-deleted", "carol@reduit.example", "carol-password", account.StateSoftDeleted)
 	srv := startTestServer(t, stub, NewSessions())
+	// Suppress per-IP back-off; the test asserts response equality
+	// across several failure modes from the same client.
+	srv.disableRateLimit()
 
 	cases := []struct {
 		name     string
