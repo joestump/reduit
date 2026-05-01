@@ -13,11 +13,13 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"time"
 
 	smtp "github.com/emersion/go-smtp"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/joestump/reduit/internal/account"
+	"github.com/joestump/reduit/internal/outbox"
 )
 
 // AccountLookup is the slice of `account.Service` the SMTP backend
@@ -29,14 +31,33 @@ type AccountLookup interface {
 	VerifyIMAPPassword(ctx context.Context, accountID string, candidate []byte) error
 }
 
+// OutboxSubmitter is the slice of outbox.Manager the SMTP backend
+// needs. Decoupling lets unit tests stub the outbox without spinning
+// up real Proton plumbing.
+//
+// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous Confirmation".
+type OutboxSubmitter interface {
+	Submit(ctx context.Context, sub outbox.Submission) outbox.Result
+}
+
 // Backend implements emersion/go-smtp's `Backend` interface. One
 // Backend instance is shared across every connection; per-connection
 // state lives on session.
 type Backend struct {
 	accounts  AccountLookup
 	sessions  *Sessions
+	outbox    OutboxSubmitter
 	logger    *slog.Logger
 	rateLimit *authRateLimiter
+
+	// submitTimeout caps the synchronous outbox.Submit call. Mirrors
+	// the upstream SMTP write timeout — when it fires, the SMTP
+	// response is `451 4.4.7` and the outbox detaches the in-flight
+	// upstream call onto a background retry goroutine.
+	//
+	// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+	// Confirmation" — submission timeout is what bounds DATA latency.
+	submitTimeout time.Duration
 
 	// dummyBcryptHash is a fixed bcrypt hash generated at construction
 	// time and reused on every auth failure branch that does NOT reach
@@ -70,10 +91,15 @@ const bcryptDummyCost = 12
 // NewBackend constructs a Backend. logger may be nil; the default
 // slog logger is used in that case. The Sessions registry is REQUIRED
 // — it is the public hook the suspension code path calls to drop
-// sessions for a freshly-suspended account.
+// sessions for a freshly-suspended account. The outbox submitter is
+// optional at construction time so existing tests for auth / MAIL
+// FROM / RCPT TO continue to compile; a nil submitter wired into
+// session.Data falls back to the legacy stub that just discards the
+// body. Production callers MUST supply a non-nil submitter.
 //
-// Governing: SPEC-0004 REQ "Per-Session Authentication Lifetime".
-func NewBackend(accounts AccountLookup, sessions *Sessions, logger *slog.Logger) (*Backend, error) {
+// Governing: SPEC-0004 REQ "Per-Session Authentication Lifetime",
+// SPEC-0004 REQ "Outbox Handoff and Synchronous Confirmation".
+func NewBackend(accounts AccountLookup, sessions *Sessions, ob OutboxSubmitter, logger *slog.Logger) (*Backend, error) {
 	if accounts == nil {
 		return nil, errors.New("smtpserver: accounts is required")
 	}
@@ -90,9 +116,11 @@ func NewBackend(accounts AccountLookup, sessions *Sessions, logger *slog.Logger)
 	return &Backend{
 		accounts:        accounts,
 		sessions:        sessions,
+		outbox:          ob,
 		logger:          logger,
 		rateLimit:       newAuthRateLimiter(),
 		dummyBcryptHash: dummyHash,
+		submitTimeout:   DefaultSubmitTimeout,
 	}, nil
 }
 
