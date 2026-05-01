@@ -1,0 +1,139 @@
+// Backend wires Reduit's account service into emersion/go-imap v2.
+// Each accepted TCP connection produces a new Session via NewSession;
+// the Session owns the per-connection state and the link back to the
+// shared registry + account service.
+//
+// Governing: ADR-0007 (emersion go-imap v2), SPEC-0003.
+
+package imapserver
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"log/slog"
+	"net"
+
+	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapserver"
+
+	"github.com/joestump/reduit/internal/account"
+)
+
+// AccountLookup is the slice of `account.Service` the IMAP backend
+// needs. Decoupling lets unit tests stub auth without spinning up a
+// SQLite + cryptenv stack.
+type AccountLookup interface {
+	GetByPrimaryAlias(ctx context.Context, alias string) (*account.Account, error)
+	VerifyIMAPPassword(ctx context.Context, accountID string, candidate []byte) error
+}
+
+// Backend implements emersion/go-imap's `Options.NewSession` factory.
+// One Backend instance is shared across every connection; per-
+// connection state lives on Session.
+type Backend struct {
+	accounts  AccountLookup
+	sessions  *Sessions
+	logger    *slog.Logger
+	rateLimit *authRateLimiter
+}
+
+// NewBackend constructs a Backend. logger may be nil; the default
+// slog logger is used in that case. The Sessions registry is
+// REQUIRED — it is the public hook for the suspension code path
+// (#15) to call DropForAccount without coupling to the rest of the
+// server.
+//
+// Governing: SPEC-0003 REQ "Per-Session Authentication Lifetime".
+func NewBackend(accounts AccountLookup, sessions *Sessions, logger *slog.Logger) (*Backend, error) {
+	if accounts == nil {
+		return nil, errors.New("imapserver: accounts is required")
+	}
+	if sessions == nil {
+		return nil, errors.New("imapserver: sessions registry is required")
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &Backend{
+		accounts:  accounts,
+		sessions:  sessions,
+		logger:    logger,
+		rateLimit: newAuthRateLimiter(),
+	}, nil
+}
+
+// NewSession is the callback emersion/go-imap invokes for every
+// accepted connection. We mint a fresh Session bound to the
+// connection's remote address so per-IP rate limiting has a key, and
+// we install a no-PreAuth greeting (the client must AUTHENTICATE
+// before doing anything).
+//
+// Governing: SPEC-0003 REQ "TLS Required, IMAPS Only" — by the time
+// this runs the underlying connection is already a *tls.Conn; we
+// reject any non-TLS conn defensively in case a future caller wires
+// us into a plain listener by mistake.
+func (b *Backend) NewSession(c *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+	netConn := c.NetConn()
+	if _, ok := netConn.(*tls.Conn); !ok {
+		// Defence in depth: the listener must already be tls.Listen.
+		// If it isn't, refuse the session rather than allow cleartext
+		// authentication on a path that would never be tested.
+		b.logger.Warn("imapserver: rejecting non-TLS connection",
+			slog.String("remote", remoteHost(netConn)))
+		return nil, &imapserver.GreetingData{}, &imap.Error{
+			Type: imap.StatusResponseTypeBye,
+			Text: "TLS required",
+		}
+	}
+
+	s := &session{
+		backend: b,
+		conn:    c,
+		remote:  remoteHost(netConn),
+		rateKey: remoteIP(netConn),
+		logger:  b.logger,
+	}
+	return s, nil, nil
+}
+
+// remoteHost is the full "host:port" form used for log breadcrumbs.
+// remoteIP strips the port for use as a rate-limit key (so a single
+// attacker behind one NAT doesn't dilute their failure count by
+// reconnecting from new ephemeral ports).
+func remoteHost(c net.Conn) string {
+	if c == nil {
+		return ""
+	}
+	if a := c.RemoteAddr(); a != nil {
+		return a.String()
+	}
+	return ""
+}
+
+func remoteIP(c net.Conn) string {
+	host := remoteHost(c)
+	if host == "" {
+		return ""
+	}
+	ip, _, err := net.SplitHostPort(host)
+	if err != nil {
+		return host
+	}
+	return ip
+}
+
+// ErrAuthFailed is the byte-identical IMAP error every authentication
+// failure path returns, regardless of underlying cause (bad password,
+// unknown user, suspended account, malformed identity). Per SPEC-0003
+// REQ "Authentication failure returns NO with no detail".
+//
+// The text is intentionally generic and does NOT include any
+// attacker-controlled bytes (especially not the supplied SASL
+// identity), which would otherwise be a vector for IMAP response
+// injection via newline characters.
+var ErrAuthFailed = &imap.Error{
+	Type: imap.StatusResponseTypeNo,
+	Code: imap.ResponseCodeAuthenticationFailed,
+	Text: "Authentication failed",
+}
