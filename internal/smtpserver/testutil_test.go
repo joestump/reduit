@@ -340,6 +340,18 @@ func authPlain(t *testing.T, addr, username, password string) string {
 	return readSMTPLine(t, r)
 }
 
+// authMech runs EHLO + AUTH <mech> with no SASL payload. Used by the
+// timing test to confirm a non-PLAIN mechanism rejection burns the
+// same bcrypt cost as a wrong-password attempt.
+func authMech(t *testing.T, addr, mech string) string {
+	t.Helper()
+	conn := dialTLSClient(t, addr)
+	r := bufio.NewReader(conn)
+	_ = ehlo(t, conn, r)
+	writeSMTPCmd(t, conn, "AUTH "+mech)
+	return readSMTPLine(t, r)
+}
+
 // loginPlain runs EHLO + AUTH PLAIN, asserts success, and returns
 // the open conn + reader so the caller can drive further commands.
 func loginPlain(t *testing.T, addr, username, password string) (*tls.Conn, *bufio.Reader) {
