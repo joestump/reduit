@@ -381,4 +381,3 @@ func TestKindString(t *testing.T) {
 		}
 	}
 }
-
