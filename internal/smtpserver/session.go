@@ -1,9 +1,6 @@
 // Per-connection SMTP submission session. Owns the SASL PLAIN auth
-// flow, MAIL FROM authorization, recipient cap, and the DATA stub
-// that drops the body and logs a stub event. The real outbox handoff
-// (encryption + Proton submission) lands in story #22; the suspension
-// drop (dropWith421 / forceClose) lands in the follow-up commit on
-// the same branch.
+// flow, MAIL FROM authorization, recipient cap, and the DATA stub that
+// will hand off to the per-account outbox in story #22.
 //
 // Governing: ADR-0007 (emersion go-smtp), SPEC-0004.
 
@@ -54,6 +51,7 @@ type session struct {
 var (
 	_ smtp.Session     = (*session)(nil)
 	_ smtp.AuthSession = (*session)(nil)
+	_ sessionDropper   = (*session)(nil)
 )
 
 // AuthMechanisms returns the SASL mechanisms we accept. PLAIN only —
@@ -321,6 +319,50 @@ func (s *session) Logout() error {
 	return nil
 }
 
+// dropWith421 implements sessionDropper. Called by the Sessions
+// registry on suspension / deletion. There is no public hook in
+// emersion/go-smtp to inject a synthetic response onto a live
+// connection, so we write the line directly to the underlying conn
+// and then close it. The client's next read returns the 421 followed
+// by EOF; any in-flight DATA write on the client side observes a
+// closed conn.
+//
+// Governing: SPEC-0004 REQ "Per-Session Authentication Lifetime".
+func (s *session) dropWith421(reason string) {
+	if s.conn == nil {
+		return
+	}
+	nc := s.conn.Conn()
+	if nc == nil {
+		return
+	}
+	// Set a tight write deadline so a slow client cannot wedge this
+	// goroutine past the per-session deadline.
+	_ = nc.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+	// Format: `421 4.7.1 <reason>\r\n`. Mirrors the canonical
+	// errAccountSuspended response so a client that knows the spec
+	// gets the same payload regardless of which path delivered it.
+	line := "421 " +
+		smtpEnhancedCodeString(errAccountSuspended.EnhancedCode) +
+		" " + reason + "\r\n"
+	_, _ = nc.Write([]byte(line))
+	// Best-effort close. forceClose is the deadline fallback.
+	_ = nc.Close()
+}
+
+// forceClose hard-closes the underlying TCP/TLS connection. Used by
+// the Sessions registry when the dropWith421 deadline expires. After
+// this returns, any goroutine still mid-write on this connection
+// observes net.ErrClosed on its next syscall.
+func (s *session) forceClose() {
+	if s.conn == nil {
+		return
+	}
+	if nc := s.conn.Conn(); nc != nil {
+		_ = nc.Close()
+	}
+}
+
 // accountIDLocked returns the current account ID, taking the session
 // lock to read it. Useful for logging where the caller doesn't already
 // hold s.mu.
@@ -342,4 +384,37 @@ func (s *session) logFailure(reason string, extras ...slog.Attr) {
 	}
 	attrs = append(attrs, extras...)
 	s.logger.LogAttrs(context.Background(), slog.LevelInfo, "smtp auth failure", attrs...)
+}
+
+// smtpEnhancedCodeString renders an EnhancedCode as `X.Y.Z`. The
+// upstream library has an internal formatter but does not export it,
+// and we only use this for the dropWith421 wire format so a tiny
+// helper is fine.
+func smtpEnhancedCodeString(c smtp.EnhancedCode) string {
+	return itoa(c[0]) + "." + itoa(c[1]) + "." + itoa(c[2])
+}
+
+// itoa is a tiny non-allocating int formatter for single-digit class
+// codes. We avoid strconv.Itoa to keep the dropWith421 hot path free
+// of allocations under load. (Premature? Possibly. But the alternative
+// is one more import in a security-critical file.)
+func itoa(n int) string {
+	if n >= 0 && n < 10 {
+		return string(rune('0' + n))
+	}
+	// Fallback for anything weird; should never happen with our codes.
+	if n < 0 {
+		n = 0
+	}
+	var buf [4]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if i == len(buf) {
+		return "0"
+	}
+	return string(buf[i:])
 }

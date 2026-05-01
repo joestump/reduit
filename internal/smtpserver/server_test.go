@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -383,5 +384,150 @@ func TestDATAStubReturns250(t *testing.T) {
 	resp := readSMTPLine(t, r)
 	if !strings.HasPrefix(resp, "250 ") {
 		t.Errorf("expected 250 from DATA stub, got %q", resp)
+	}
+}
+
+// TestSessionsDropForAccountClosesLiveSessions covers SPEC-0004's
+// "Per-Session Authentication Lifetime" requirement. Two clients log
+// in for the same account, the suspension code path calls
+// `Sessions.DropForAccount`, and both clients observe a `421 4.7.1`
+// followed by EOF within 1 second.
+//
+// Governing: SPEC-0004 REQ "Per-Session Authentication Lifetime".
+func TestSessionsDropForAccountClosesLiveSessions(t *testing.T) {
+	t.Parallel()
+	stub := newStubAccounts()
+	stub.addAccount("acct-multi", "user@reduit.example", "pw", account.StateActive)
+	registry := NewSessions()
+	srv := startTestServer(t, stub, registry)
+
+	conn1, r1 := loginPlain(t, srv.addr, "user@reduit.example", "pw")
+	conn2, r2 := loginPlain(t, srv.addr, "user@reduit.example", "pw")
+
+	deadline := time.Now().Add(1 * time.Second)
+	for registry.CountForAccount("acct-multi") < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected 2 registered sessions, got %d",
+				registry.CountForAccount("acct-multi"))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	dropStart := time.Now()
+	dropped := registry.DropForAccount("acct-multi", "Account suspended")
+	if dropped != 2 {
+		t.Errorf("DropForAccount returned %d, want 2", dropped)
+	}
+
+	for i, pair := range []struct {
+		conn net.Conn
+		r    *bufio.Reader
+	}{{conn1, r1}, {conn2, r2}} {
+		i := i
+		_ = pair.conn.SetDeadline(time.Now().Add(1 * time.Second))
+		line, err := pair.r.ReadString('\n')
+		if err != nil {
+			t.Errorf("conn %d: read 421: %v", i, err)
+			continue
+		}
+		if !strings.HasPrefix(line, "421 4.7.1 Account suspended") {
+			t.Errorf("conn %d: expected `421 4.7.1 Account suspended`, got %q", i, line)
+		}
+		_, err = pair.r.ReadByte()
+		if err == nil {
+			t.Errorf("conn %d: expected EOF after 421, got more bytes", i)
+		}
+	}
+
+	if elapsed := time.Since(dropStart); elapsed > 1*time.Second {
+		t.Errorf("DropForAccount took %v, want < 1s", elapsed)
+	}
+	if got := registry.CountForAccount("acct-multi"); got != 0 {
+		t.Errorf("registry should be empty after drop, got %d", got)
+	}
+}
+
+// TestSessionsRegistryUnregisterOnLogout confirms a normal client
+// QUIT removes the entry from the registry.
+func TestSessionsRegistryUnregisterOnLogout(t *testing.T) {
+	t.Parallel()
+	stub := newStubAccounts()
+	stub.addAccount("acct-clean", "clean@reduit.example", "pw", account.StateActive)
+	registry := NewSessions()
+	srv := startTestServer(t, stub, registry)
+
+	conn, r := loginPlain(t, srv.addr, "clean@reduit.example", "pw")
+	if registry.CountForAccount("acct-clean") != 1 {
+		t.Fatalf("post-login count = %d, want 1", registry.CountForAccount("acct-clean"))
+	}
+
+	writeSMTPCmd(t, conn, "QUIT")
+	for {
+		_, err := r.ReadString('\n')
+		if err != nil {
+			break
+		}
+	}
+	_ = conn.Close()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for registry.CountForAccount("acct-clean") != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("registry not cleared after QUIT; count = %d",
+				registry.CountForAccount("acct-clean"))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestSessionsRegistryDirect exercises the registry methods without
+// the network. Mirrors the IMAP test of the same name.
+func TestSessionsRegistryDirect(t *testing.T) {
+	t.Parallel()
+	r := NewSessions()
+
+	dropCount := int32(0)
+	d := func() sessionDropper {
+		return &testDropper{onDrop: func(string) { atomic.AddInt32(&dropCount, 1) }}
+	}
+
+	d1 := d()
+	d2 := d()
+	r.register("acct", d1)
+	r.register("acct", d2)
+	if got := r.CountForAccount("acct"); got != 2 {
+		t.Fatalf("count = %d, want 2", got)
+	}
+	dropped := r.DropForAccount("acct", "test")
+	if dropped != 2 {
+		t.Errorf("DropForAccount returned %d, want 2", dropped)
+	}
+	if got := atomic.LoadInt32(&dropCount); got != 2 {
+		t.Errorf("dropper called %d times, want 2", got)
+	}
+	if got := r.CountForAccount("acct"); got != 0 {
+		t.Errorf("count after drop = %d, want 0", got)
+	}
+
+	r.unregister("missing-acct", d1)
+	r.register("", d1)
+	r.register("acct", nil)
+	r.unregister("", d1)
+}
+
+type testDropper struct {
+	onDrop  func(string)
+	onClose func()
+}
+
+func (t *testDropper) dropWith421(reason string) {
+	if t.onDrop != nil {
+		t.onDrop(reason)
+	}
+}
+
+func (t *testDropper) forceClose() {
+	if t.onClose != nil {
+		t.onClose()
 	}
 }
