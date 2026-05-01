@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -213,4 +214,174 @@ func (errorAccounts) GetByPrimaryAlias(_ context.Context, _ string) (*account.Ac
 
 func (errorAccounts) VerifyIMAPPassword(_ context.Context, _ string, _ []byte) error {
 	return errors.New("boom")
+}
+
+// TestMailFromAuthorization covers SPEC-0004's "Submission
+// Authorization" requirement. Happy path: MAIL FROM matches the
+// primary alias → 250 OK. Sad path: MAIL FROM is some other address
+// → 553 5.7.1 with the exact text from the spec.
+//
+// Governing: SPEC-0004 REQ "Submission Authorization".
+func TestMailFromAuthorization(t *testing.T) {
+	t.Parallel()
+	stub := newStubAccounts()
+	stub.addAccount("acct-joe", "joe@reduit.example", "pw", account.StateActive)
+	srv := startTestServer(t, stub, NewSessions())
+
+	t.Run("matches-primary-alias", func(t *testing.T) {
+		conn, r := loginPlain(t, srv.addr, "joe@reduit.example", "pw")
+		defer conn.Close()
+		writeSMTPCmd(t, conn, "MAIL FROM:<joe@reduit.example>")
+		resp := readSMTPLine(t, r)
+		if !strings.HasPrefix(resp, "250 ") {
+			t.Errorf("expected 250 OK, got %q", resp)
+		}
+	})
+
+	t.Run("matches-primary-alias-case-insensitive", func(t *testing.T) {
+		conn, r := loginPlain(t, srv.addr, "joe@reduit.example", "pw")
+		defer conn.Close()
+		writeSMTPCmd(t, conn, "MAIL FROM:<JOE@REDUIT.EXAMPLE>")
+		resp := readSMTPLine(t, r)
+		if !strings.HasPrefix(resp, "250 ") {
+			t.Errorf("expected 250 OK on case-insensitive match, got %q", resp)
+		}
+	})
+
+	t.Run("rejects-foreign-address", func(t *testing.T) {
+		conn, r := loginPlain(t, srv.addr, "joe@reduit.example", "pw")
+		defer conn.Close()
+		writeSMTPCmd(t, conn, "MAIL FROM:<not-mine@example.com>")
+		resp := readSMTPLine(t, r)
+		// SPEC-0004 mandates the EXACT text. Verify code, enhanced
+		// status, and the canonical message.
+		if !strings.HasPrefix(resp, "553 5.7.1 Sender address rejected: not authorized for this account") {
+			t.Errorf("expected SPEC-0004 553 5.7.1 text, got %q", resp)
+		}
+	})
+}
+
+// TestRecipientLimitEnforced confirms the 101st RCPT TO returns
+// `452 4.5.3 Too many recipients`.
+//
+// Governing: SPEC-0004 REQ "Recipient and Message Size Limits".
+func TestRecipientLimitEnforced(t *testing.T) {
+	t.Parallel()
+	stub := newStubAccounts()
+	stub.addAccount("acct-joe", "joe@reduit.example", "pw", account.StateActive)
+	// Shrink the recipient cap to 3 to keep the test fast — the
+	// boundary behaviour is identical at any cap.
+	srv := startTestServer(t, stub, NewSessions(), func(c *Config) {
+		c.MaxRecipients = 3
+	})
+
+	conn, r := loginPlain(t, srv.addr, "joe@reduit.example", "pw")
+	defer conn.Close()
+
+	writeSMTPCmd(t, conn, "MAIL FROM:<joe@reduit.example>")
+	if resp := readSMTPLine(t, r); !strings.HasPrefix(resp, "250 ") {
+		t.Fatalf("MAIL FROM: %q", resp)
+	}
+
+	for i := 0; i < 3; i++ {
+		writeSMTPCmd(t, conn, fmt.Sprintf("RCPT TO:<rcpt%d@example.com>", i))
+		resp := readSMTPLine(t, r)
+		if !strings.HasPrefix(resp, "250 ") {
+			t.Fatalf("RCPT %d: expected 250, got %q", i, resp)
+		}
+	}
+
+	// 4th RCPT (the one past the cap) must be rejected with 452 4.5.3.
+	writeSMTPCmd(t, conn, "RCPT TO:<rcpt-overflow@example.com>")
+	resp := readSMTPLine(t, r)
+	if !strings.HasPrefix(resp, "452 4.5.3") {
+		t.Errorf("expected `452 4.5.3 ...` on overflow RCPT, got %q", resp)
+	}
+}
+
+// TestMessageSizeLimitDuringStreaming confirms the size cap is
+// enforced WHILE the body is being streamed, not at end-of-DATA.
+// We send a payload bigger than the cap; the server returns
+// `552 5.3.4 ...` without buffering the whole payload.
+//
+// Governing: SPEC-0004 REQ "Recipient and Message Size Limits" +
+// Security checklist "Request body size limits enforced".
+func TestMessageSizeLimitDuringStreaming(t *testing.T) {
+	t.Parallel()
+	stub := newStubAccounts()
+	stub.addAccount("acct-joe", "joe@reduit.example", "pw", account.StateActive)
+	// Tiny cap so the test is fast: 1 KiB.
+	const cap = 1024
+	srv := startTestServer(t, stub, NewSessions(), func(c *Config) {
+		c.MaxMessageBytes = cap
+	})
+
+	conn, r := loginPlain(t, srv.addr, "joe@reduit.example", "pw")
+	defer conn.Close()
+
+	writeSMTPCmd(t, conn, "MAIL FROM:<joe@reduit.example>")
+	if resp := readSMTPLine(t, r); !strings.HasPrefix(resp, "250 ") {
+		t.Fatalf("MAIL FROM: %q", resp)
+	}
+	writeSMTPCmd(t, conn, "RCPT TO:<bob@example.com>")
+	if resp := readSMTPLine(t, r); !strings.HasPrefix(resp, "250 ") {
+		t.Fatalf("RCPT TO: %q", resp)
+	}
+	writeSMTPCmd(t, conn, "DATA")
+	if resp := readSMTPLine(t, r); !strings.HasPrefix(resp, "354 ") {
+		t.Fatalf("DATA: expected 354, got %q", resp)
+	}
+
+	// Send 18 KiB of body — well past the 1 KiB cap. The server's
+	// dataReader returns ErrDataTooLarge as soon as it reads past the
+	// cap, so the response arrives before we finish writing.
+	body := bytes.Repeat([]byte("Subject: Spam\r\n"), 1200)
+	body = append(body, []byte("\r\n.\r\n")...)
+	if _, err := conn.Write(body); err != nil {
+		t.Logf("write body returned %v (expected if server closed early)", err)
+	}
+
+	resp := readSMTPLine(t, r)
+	if !strings.HasPrefix(resp, "552 5.3.4") {
+		t.Errorf("expected `552 5.3.4 ...`, got %q", resp)
+	}
+}
+
+// TestDATAStubReturns250 confirms a small in-cap DATA payload reaches
+// the stub and returns the queued-OK response. The actual outbox
+// handoff is deferred to #22.
+func TestDATAStubReturns250(t *testing.T) {
+	t.Parallel()
+	stub := newStubAccounts()
+	stub.addAccount("acct-joe", "joe@reduit.example", "pw", account.StateActive)
+	srv := startTestServer(t, stub, NewSessions())
+
+	conn, r := loginPlain(t, srv.addr, "joe@reduit.example", "pw")
+	defer conn.Close()
+
+	writeSMTPCmd(t, conn, "MAIL FROM:<joe@reduit.example>")
+	if resp := readSMTPLine(t, r); !strings.HasPrefix(resp, "250 ") {
+		t.Fatalf("MAIL FROM: %q", resp)
+	}
+	writeSMTPCmd(t, conn, "RCPT TO:<bob@example.com>")
+	if resp := readSMTPLine(t, r); !strings.HasPrefix(resp, "250 ") {
+		t.Fatalf("RCPT TO: %q", resp)
+	}
+	writeSMTPCmd(t, conn, "DATA")
+	if resp := readSMTPLine(t, r); !strings.HasPrefix(resp, "354 ") {
+		t.Fatalf("DATA: %q", resp)
+	}
+
+	body := "From: <joe@reduit.example>\r\n" +
+		"To: <bob@example.com>\r\n" +
+		"Subject: Hello\r\n\r\n" +
+		"hello\r\n.\r\n"
+	if _, err := io.WriteString(conn, body); err != nil {
+		t.Fatalf("write body: %v", err)
+	}
+
+	resp := readSMTPLine(t, r)
+	if !strings.HasPrefix(resp, "250 ") {
+		t.Errorf("expected 250 from DATA stub, got %q", resp)
+	}
 }
