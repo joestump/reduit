@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/joestump/reduit/internal/account"
 )
 
@@ -89,6 +91,74 @@ func (s *stubAccounts) VerifyIMAPPassword(_ context.Context, accountID string, c
 	return nil
 }
 
+// bcryptStubAccounts mirrors stubAccounts but stores bcrypt hashes
+// (cost 12, matching internal/account.bcryptCost) so VerifyIMAPPassword
+// has the same wall-clock cost as production. Used by the timing
+// side-channel test so the wrong-password branch's latency reflects
+// real bcrypt, not a string-equality stub.
+type bcryptStubAccounts struct {
+	mu      sync.Mutex
+	byAlias map[string]string
+	byID    map[string]*bcryptStubAccount
+}
+
+type bcryptStubAccount struct {
+	ID    string
+	Alias string
+	Hash  []byte
+	State account.State
+}
+
+func newBcryptStubAccounts() *bcryptStubAccounts {
+	return &bcryptStubAccounts{
+		byAlias: make(map[string]string),
+		byID:    make(map[string]*bcryptStubAccount),
+	}
+}
+
+func (s *bcryptStubAccounts) addAccount(t *testing.T, id, alias, password string, state account.State) {
+	t.Helper()
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
+	if err != nil {
+		t.Fatalf("bcrypt generate: %v", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := &bcryptStubAccount{ID: id, Alias: alias, Hash: hash, State: state}
+	s.byID[id] = a
+	if alias != "" {
+		s.byAlias[alias] = id
+	}
+}
+
+func (s *bcryptStubAccounts) GetByPrimaryAlias(_ context.Context, alias string) (*account.Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.byAlias[alias]
+	if !ok {
+		return nil, account.ErrAccountNotFound
+	}
+	a := s.byID[id]
+	return &account.Account{
+		ID:           a.ID,
+		PrimaryAlias: a.Alias,
+		State:        a.State,
+	}, nil
+}
+
+func (s *bcryptStubAccounts) VerifyIMAPPassword(_ context.Context, accountID string, candidate []byte) error {
+	s.mu.Lock()
+	a, ok := s.byID[accountID]
+	s.mu.Unlock()
+	if !ok {
+		return account.ErrAccountNotFound
+	}
+	if err := bcrypt.CompareHashAndPassword(a.Hash, candidate); err != nil {
+		return err
+	}
+	return nil
+}
+
 // generateTestCert mints a fresh self-signed P-256 cert valid for
 // 127.0.0.1 / localhost. Cheap enough to call per-test.
 func generateTestCert(t *testing.T) tls.Certificate {
@@ -123,6 +193,14 @@ func generateTestCert(t *testing.T) tls.Certificate {
 type testServer struct {
 	server *Server
 	addr   string
+}
+
+// disableRateLimit makes the test server treat every per-IP failure
+// counter as if it were zero. Used by the timing test which needs many
+// sequential auth attempts from 127.0.0.1 without the exponential
+// back-off kicking in.
+func (s *testServer) disableRateLimit() {
+	s.server.backend.disableRateLimitForTest()
 }
 
 // startTestServer constructs a Backend wired to the supplied stub,
@@ -186,6 +264,10 @@ func dialTLSClient(t *testing.T, addr string) *tls.Conn {
 		t.Fatalf("tls.Dial: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	// Generous deadline because every auth-failure path now burns one
+	// real bcrypt comparison (~250ms at cost 12) for uniform-time
+	// auth, and parallel tests can saturate a CI runner's CPU and
+	// stretch each bcrypt call several-fold.
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 	return conn
 }
