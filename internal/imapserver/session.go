@@ -245,6 +245,16 @@ func (s *session) Authenticate(mech string) (sasl.Server, error) {
 	if mech != sasl.Plain {
 		s.logFailure("sasl_mechanism_not_supported",
 			slog.String("mech", mech))
+		// Record the failure for rate-limiting too — credential
+		// stuffing is not picky about mechanism names, and an
+		// attacker spamming `AUTHENTICATE GSSAPI` over TLS would
+		// otherwise get unlimited retry plus log churn.
+		s.backend.rateLimit.RecordFailure(s.rateKey)
+		// Uniform-time: burn a bcrypt comparison so this branch
+		// matches the cost of a successful AUTHENTICATE PLAIN with
+		// a wrong password — otherwise an attacker can probe which
+		// mechanisms the server accepts by latency alone.
+		s.backend.burnDummyBcrypt([]byte(mech))
 		return nil, ErrAuthFailed
 	}
 	return sasl.NewPlainServer(func(identity, username, password string) error {
@@ -256,6 +266,7 @@ func (s *session) Authenticate(mech string) (sasl.Server, error) {
 		if identity != "" && identity != username {
 			s.logFailure("sasl_identity_mismatch")
 			s.backend.rateLimit.RecordFailure(s.rateKey)
+			s.backend.burnDummyBcrypt([]byte(password))
 			return ErrAuthFailed
 		}
 		return s.Login(username, password)

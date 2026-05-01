@@ -129,12 +129,29 @@ func New(cfg Config) (*Server, error) {
 		//
 		// Governing: SPEC-0003 REQ "TLS Required, IMAPS Only".
 		TLSConfig: nil,
-		// InsecureAuth = false ensures the emersion core refuses
-		// AUTHENTICATE on any non-TLS connection. Since we listen on
-		// tls.Listen this is belt-and-suspenders, but if a future
-		// refactor accidentally swapped the listener it would
-		// continue to refuse cleartext auth.
-		InsecureAuth: false,
+		// InsecureAuth = true is a deliberate concession to the
+		// capFilter wrapper layer. The emersion library's canAuth()
+		// does a hard `_, ok := c.conn.(*tls.Conn)` type assertion
+		// (conn.go:418-424). Our capFilterConn wraps each accepted
+		// conn so we can strip `IDLE` from the post-auth CAPABILITY
+		// response (see capfilter.go), and that wrapping defeats the
+		// hard type assertion.
+		//
+		// Cleartext auth is STILL structurally impossible:
+		//   1. The listener is `tls.Listen` (Start() below) — every
+		//      accepted conn is a *tls.Conn under our wrapper.
+		//   2. `Backend.NewSession` runs `isTLSConn` (backend.go) which
+		//      drills through `Unwrap() net.Conn` chains and rejects
+		//      any conn that does not eventually resolve to *tls.Conn.
+		//   3. We do not advertise STARTTLS (TLSConfig=nil below) so
+		//      no client can attempt to upgrade a cleartext socket.
+		//
+		// Three independent guards remain. Flipping InsecureAuth to
+		// true only relaxes the type-assertion-based check that the
+		// capFilter wrapper would otherwise defeat outright.
+		//
+		// Governing: SPEC-0003 REQ "TLS Required, IMAPS Only".
+		InsecureAuth: true,
 		Logger:       slogAdapter{logger: logger},
 	})
 
@@ -184,10 +201,17 @@ func (s *Server) Start() error {
 		NextProtos: []string{"imap"},
 	}
 	addr := s.cfg.resolveAddr()
-	ln, err := tls.Listen("tcp", addr, tlsCfg)
+	rawLn, err := tls.Listen("tcp", addr, tlsCfg)
 	if err != nil {
 		return fmt.Errorf("imapserver: listen %s: %w", addr, err)
 	}
+	// Wrap each accepted conn with capFilterConn so post-auth CAPABILITY
+	// responses no longer advertise IDLE — see capfilter.go for the
+	// rationale (story #20 wires the live-update bus; until then the
+	// cap is dishonest).
+	//
+	// Governing: SPEC-0003 REQ "IDLE Support With Live Updates" (deferred).
+	ln := &capFilterListener{Listener: rawLn}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
