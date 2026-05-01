@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/joestump/reduit/internal/cryptenv"
@@ -458,5 +459,289 @@ func TestCreateRequiresOIDCSubject(t *testing.T) {
 	ctx := context.Background()
 	if _, err := svc.Create(ctx, CreateParams{}); err == nil {
 		t.Fatal("Create with empty OIDCSubject should error")
+	}
+	// Whitespace-only subject MUST also be rejected (TrimSpace + empty check).
+	if _, err := svc.Create(ctx, CreateParams{OIDCSubject: "   "}); err == nil {
+		t.Fatal("Create with whitespace-only OIDCSubject should error")
+	}
+}
+
+// TestSealAADPreventsCrossColumnSubstitution proves that ciphertext
+// from one column cannot be decrypted as another column's secret.
+//
+// Threat model: an attacker (or buggy code) with DB write access copies
+// the IMAP-password ciphertext into the refresh-token slot. Without
+// AAD binding the column name into the AEAD tag, OpenRefreshToken
+// would happily decrypt the IMAP password and ship it upstream to
+// Proton. With AAD, the tag fails to verify and Open returns an error.
+//
+// Governing: ADR-0003 (envelope encryption). This test locks in the
+// column-name AAD invariant so a future refactor cannot silently
+// regress to aad=nil.
+func TestSealAADPreventsCrossColumnSubstitution(t *testing.T) {
+	t.Parallel()
+	svc, st := newTestService(t)
+	ctx := context.Background()
+
+	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-aad"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Seal a distinctive plaintext into the IMAP password column.
+	imapPT := []byte("imap-secret-do-not-leak")
+	if err := svc.SealIMAPPassword(ctx, a.ID, imapPT); err != nil {
+		t.Fatalf("SealIMAPPassword: %v", err)
+	}
+	var imapCT []byte
+	if err := st.DB.Get(&imapCT, `SELECT imap_password_ciphertext FROM accounts WHERE id = ?`, a.ID); err != nil {
+		t.Fatalf("read imap ciphertext: %v", err)
+	}
+	if len(imapCT) == 0 {
+		t.Fatal("imap ciphertext unexpectedly empty")
+	}
+
+	// Substitution attack: copy the IMAP ciphertext into the refresh
+	// token column. With aad=nil this would decrypt cleanly; with the
+	// column-name AAD binding it MUST fail.
+	if _, err := st.DB.Exec(
+		`UPDATE accounts SET refresh_token_ciphertext = ? WHERE id = ?`,
+		imapCT, a.ID,
+	); err != nil {
+		t.Fatalf("substitute ciphertext: %v", err)
+	}
+
+	pt, err := svc.OpenRefreshToken(ctx, a.ID)
+	if err == nil {
+		t.Fatalf("OpenRefreshToken on substituted ciphertext returned plaintext %q; want auth failure", pt)
+	}
+	// Belt-and-suspenders: even if a future refactor accidentally
+	// returned plaintext on AAD mismatch, ensure it is NOT the IMAP
+	// secret we tried to smuggle through.
+	if bytes.Equal(pt, imapPT) {
+		t.Fatal("cross-column substitution leaked IMAP password as refresh token")
+	}
+
+	// Symmetric direction: copy refresh-token ciphertext (we have
+	// none right now; seal a known one) into the mailbox passphrase
+	// column and confirm OpenMailboxPassphrase rejects it.
+	rtPT := []byte("refresh-secret-also-do-not-leak")
+	if err := svc.SealRefreshToken(ctx, a.ID, rtPT); err != nil {
+		t.Fatalf("SealRefreshToken: %v", err)
+	}
+	var rtCT []byte
+	if err := st.DB.Get(&rtCT, `SELECT refresh_token_ciphertext FROM accounts WHERE id = ?`, a.ID); err != nil {
+		t.Fatalf("read refresh ciphertext: %v", err)
+	}
+	if _, err := st.DB.Exec(
+		`UPDATE accounts SET mailbox_passphrase_ciphertext = ? WHERE id = ?`,
+		rtCT, a.ID,
+	); err != nil {
+		t.Fatalf("substitute mailbox ciphertext: %v", err)
+	}
+	if pt, err := svc.OpenMailboxPassphrase(ctx, a.ID); err == nil {
+		t.Fatalf("OpenMailboxPassphrase on substituted ciphertext returned plaintext %q; want auth failure", pt)
+	}
+}
+
+// TestOpenWithTamperedCiphertext flips a byte in a stored ciphertext
+// and asserts Open* surfaces an error. This pins down the AEAD
+// authenticity guarantee the package relies on; without it a silent
+// regression to a non-authenticating cipher would only show up in
+// production.
+func TestOpenWithTamperedCiphertext(t *testing.T) {
+	t.Parallel()
+	svc, st := newTestService(t)
+	ctx := context.Background()
+
+	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-tamper"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := svc.SealRefreshToken(ctx, a.ID, []byte("real-token")); err != nil {
+		t.Fatalf("SealRefreshToken: %v", err)
+	}
+
+	var ct []byte
+	if err := st.DB.Get(&ct, `SELECT refresh_token_ciphertext FROM accounts WHERE id = ?`, a.ID); err != nil {
+		t.Fatalf("read ct: %v", err)
+	}
+	if len(ct) < 30 {
+		t.Fatalf("ciphertext unexpectedly short (%d bytes)", len(ct))
+	}
+	// Flip a byte in the middle (avoids the nonce prefix and the tag).
+	tampered := append([]byte(nil), ct...)
+	tampered[len(tampered)/2] ^= 0xFF
+	if _, err := st.DB.Exec(`UPDATE accounts SET refresh_token_ciphertext = ? WHERE id = ?`, tampered, a.ID); err != nil {
+		t.Fatalf("write tampered ct: %v", err)
+	}
+
+	if pt, err := svc.OpenRefreshToken(ctx, a.ID); err == nil {
+		t.Fatalf("OpenRefreshToken on tampered ciphertext returned %q; want auth failure", pt)
+	}
+}
+
+// TestOpenWithWrongMasterKey confirms that a service constructed with
+// a different master key cannot open envelopes sealed under the
+// original. Together with TestOpenWithTamperedCiphertext this locks
+// the AEAD authenticity contract from both ends (wrong key + wrong
+// data).
+func TestOpenWithWrongMasterKey(t *testing.T) {
+	t.Parallel()
+	svc, st := newTestService(t)
+	ctx := context.Background()
+
+	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-wrong-key"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := svc.SealRefreshToken(ctx, a.ID, []byte("payload")); err != nil {
+		t.Fatalf("SealRefreshToken: %v", err)
+	}
+
+	// Build a second Service against the same DB but with a fresh
+	// master key. Envelope-open MUST fail.
+	otherMaster, err := cryptenv.GenerateMasterKey()
+	if err != nil {
+		t.Fatalf("GenerateMasterKey: %v", err)
+	}
+	otherSvc := New(st, otherMaster, nil)
+	if pt, err := otherSvc.OpenRefreshToken(ctx, a.ID); err == nil {
+		t.Fatalf("OpenRefreshToken under wrong master key returned %q; want envelope-open failure", pt)
+	}
+}
+
+// TestSealIMAPPasswordRejectsOversizedInput verifies the explicit
+// 72-byte ceiling on externally-supplied IMAP passwords. bcrypt
+// silently truncates beyond that ceiling, which would let two distinct
+// passwords sharing a 72-byte prefix verify against the same hash.
+func TestSealIMAPPasswordRejectsOversizedInput(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-bcrypt-cap"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	oversized := bytes.Repeat([]byte("A"), bcryptMaxPasswordBytes+1)
+	if err := svc.SealIMAPPassword(ctx, a.ID, oversized); !errors.Is(err, ErrIMAPPasswordTooLong) {
+		t.Fatalf("SealIMAPPassword(oversized) error = %v, want ErrIMAPPasswordTooLong", err)
+	}
+
+	// At-the-ceiling input must still succeed.
+	atCeiling := bytes.Repeat([]byte("B"), bcryptMaxPasswordBytes)
+	if err := svc.SealIMAPPassword(ctx, a.ID, atCeiling); err != nil {
+		t.Fatalf("SealIMAPPassword(at-ceiling) unexpected error: %v", err)
+	}
+}
+
+// TestTransitionIsAtomicUnderConcurrency races two goroutines on the
+// same account: one tries Suspend, one tries Delete. Exactly one MUST
+// succeed; the loser MUST get ErrInvalidTransition. Without the
+// conditional UPDATE both reads see "active" and both writes happily
+// commit, leaving the row in an indeterminate state (e.g. state=
+// suspended with deleted_at set, or vice versa).
+//
+// Governing: SPEC-0001 REQ "Account Lifecycle States".
+func TestTransitionIsAtomicUnderConcurrency(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-race"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := svc.Transition(ctx, a.ID, StateActive); err != nil {
+		t.Fatalf("seed active: %v", err)
+	}
+
+	var (
+		successes int32
+		failures  int32
+		wg        sync.WaitGroup
+		start     = make(chan struct{})
+	)
+
+	race := func(target State) {
+		defer wg.Done()
+		<-start // align goroutine launches
+		_, err := svc.Transition(ctx, a.ID, target)
+		switch {
+		case err == nil:
+			atomic.AddInt32(&successes, 1)
+		case errors.Is(err, ErrInvalidTransition):
+			atomic.AddInt32(&failures, 1)
+		default:
+			t.Errorf("unexpected error from Transition(%s): %v", target, err)
+		}
+	}
+
+	wg.Add(2)
+	go race(StateSuspended)
+	go race(StateSoftDeleted)
+	close(start)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&successes); got != 1 {
+		t.Fatalf("successful transitions = %d, want exactly 1", got)
+	}
+	if got := atomic.LoadInt32(&failures); got != 1 {
+		t.Fatalf("failed transitions = %d, want exactly 1", got)
+	}
+
+	// The winning state must be coherent with deleted_at: soft_deleted
+	// implies deleted_at set; suspended implies deleted_at NULL.
+	final, err := svc.GetByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	switch final.State {
+	case StateSoftDeleted:
+		if final.DeletedAt == nil {
+			t.Error("final state soft_deleted but DeletedAt is nil")
+		}
+	case StateSuspended:
+		if final.DeletedAt != nil {
+			t.Error("final state suspended but DeletedAt is set")
+		}
+	default:
+		t.Fatalf("final state = %q, want suspended or soft_deleted", final.State)
+	}
+}
+
+// TestCreateTrimsOIDCSubject confirms whitespace is stripped from the
+// stored subject so it matches the in-memory allowlist regardless of
+// operator paste hygiene.
+func TestCreateTrimsOIDCSubject(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestService(t, "sub-paste")
+	ctx := context.Background()
+
+	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "  sub-paste  "})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if a.OIDCSubject != "sub-paste" {
+		t.Errorf("OIDCSubject = %q, want trimmed %q", a.OIDCSubject, "sub-paste")
+	}
+	if !svc.IsAdmin(a) {
+		t.Error("IsAdmin should return true after subject is trimmed to match allowlist entry")
+	}
+}
+
+// TestIsAdminRejectsEmptySubject locks in the empty-string defense:
+// even if OIDC_ADMIN_SUBS contains a stray empty entry (e.g. from
+// "OIDC_ADMIN_SUBS=,sub-foo"), an account with an empty subject must
+// not be elevated.
+func TestIsAdminRejectsEmptySubject(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestService(t, "", "sub-foo")
+
+	empty := &Account{OIDCSubject: ""}
+	if svc.IsAdmin(empty) {
+		t.Error("IsAdmin must reject accounts with empty OIDCSubject even if the allowlist contains \"\"")
 	}
 }
