@@ -64,6 +64,13 @@ type MailboxService interface {
 	CountMessagesInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error)
 }
 
+// Compile-time assertion: the production mailbox.Service MUST satisfy
+// imapserver's local MailboxService shape. If a method is added to
+// mailbox.Service (or a signature drifts) and is not mirrored here,
+// the build fails — instead of the interface re-declaration silently
+// missing the method until a runtime caller needs it.
+var _ MailboxService = (mailbox.Service)(nil)
+
 // Backend implements emersion/go-imap's `Options.NewSession` factory.
 // One Backend instance is shared across every connection; per-
 // connection state lives on Session.
