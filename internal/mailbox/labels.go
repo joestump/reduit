@@ -20,6 +20,14 @@ import "strings"
 // labels appear. Trailing `/` is the IMAP hierarchy separator emersion's
 // MatchList uses; we keep it explicit so a label literally named
 // "Labels" at Proton-level does not collide with the namespace root.
+//
+// Note: a Proton user label named e.g. `Sent` or `Inbox` is exposed as
+// `Labels/Sent` (or `Labels/Inbox`) and does NOT collide with the
+// reserved system folder names — they live in different IMAP paths and
+// the (account_id, name) UNIQUE index treats them as distinct rows.
+// The (account_id, proton_label_id) UNIQUE index further pins each
+// label by its Proton ID, so the per-address Sent label and a user
+// label named `Sent` cannot share a row.
 const UserLabelNamespace = "Labels/"
 
 // Kind is the distinction the schema records on every mailbox row:
@@ -158,6 +166,15 @@ func ParseUserLabelName(imapName string) (protonLabelPath string, ok bool) {
 // FormatUserLabelName is the inverse of ParseUserLabelName: it prepends
 // the `Labels/` namespace prefix to a Proton label path. Used by the
 // sync worker when materialising a user label into a mailbox row.
+//
+// TODO(follow-up): RFC 3501 §5.1.3 modified-UTF-7 encoding for non-ASCII
+// label names + escaping for `"`, `(`, `)`, `[`, `]`, `\\`, control
+// characters and CR/LF. Current pass-through works for ASCII labels but
+// will mis-render Proton labels named e.g. `Café` or `Family"Tax\\` in
+// LIST output. Either pre-encode here (using emersion's
+// `go-imap/v2/internal/utf7` shim or x/text/encoding/unicode/utf7) OR
+// reject names with the forbidden bytes at sync time. Track in the
+// SPEC-0003 follow-up bucket alongside the IMAP4rev2 enable.
 func FormatUserLabelName(protonLabelPath string) string {
 	return UserLabelNamespace + protonLabelPath
 }
