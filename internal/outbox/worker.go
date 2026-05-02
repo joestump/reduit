@@ -398,8 +398,11 @@ func panicString(r any) string {
 }
 
 // DefaultPerAccountCap is the SPEC-0004 default per-account
-// concurrency cap. Configurable via REDUIT_OUTBOX_PER_ACCOUNT_CAP at
-// the composition-root layer.
+// concurrency cap. Configurable via the env var EnvPerAccountCap
+// (REDUIT_OUTBOX_PER_ACCOUNT_CAP, see manager.go) — outbox.New honours
+// the env override when Config.PerAccountCap is zero.
+//
+// Governing: SPEC-0004 REQ "Per-Account Outbox Concurrency Limit".
 const DefaultPerAccountCap = 4
 
 // DefaultSubmitTimeout matches smtpserver.DefaultSubmitTimeout. We

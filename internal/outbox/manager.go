@@ -16,9 +16,21 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"strconv"
 	"sync"
 	"time"
 )
+
+// EnvPerAccountCap is the env-var override for the per-account
+// semaphore size. An operator can set this without editing the config
+// file. The composition-root New() consults this when Config.PerAccountCap
+// is zero.
+//
+// Governing: SPEC-0004 REQ "Per-Account Outbox Concurrency Limit" —
+// the cap is operator-tunable; documenting the env var here keeps the
+// promise the PR body makes honest.
+const EnvPerAccountCap = "REDUIT_OUTBOX_PER_ACCOUNT_CAP"
 
 // Config bundles the construction-time knobs for Manager.
 type Config struct {
@@ -85,7 +97,11 @@ func New(cfg Config) (*Manager, error) {
 		cfg.SubmitTimeout = DefaultSubmitTimeout
 	}
 	if cfg.PerAccountCap <= 0 {
-		cfg.PerAccountCap = DefaultPerAccountCap
+		// Honour REDUIT_OUTBOX_PER_ACCOUNT_CAP before falling back to
+		// the package default. The PR body and the worker's package
+		// comment promised this env var; previously it was vapor —
+		// see spec-compliance review (#42 round 1).
+		cfg.PerAccountCap = resolvePerAccountCap()
 	}
 	return &Manager{
 		cfg:        cfg,
@@ -152,6 +168,18 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 		}
 	}
 	return firstErr
+}
+
+// resolvePerAccountCap returns the env-var override for the per-account
+// semaphore size, or DefaultPerAccountCap if unset / malformed. Negative
+// or zero env values fall back to the default.
+func resolvePerAccountCap() int {
+	if env := os.Getenv(EnvPerAccountCap); env != "" {
+		if n, err := strconv.Atoi(env); err == nil && n > 0 {
+			return n
+		}
+	}
+	return DefaultPerAccountCap
 }
 
 // activeWorkerCount returns the number of currently registered
