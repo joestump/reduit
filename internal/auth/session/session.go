@@ -19,6 +19,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -119,6 +120,18 @@ type Identity struct {
 // Callers MUST have wrapped the request through scs.LoadAndSave (the
 // session middleware) before calling this — outside that scope, scs
 // panics.
+//
+// PutIdentity does NOT mirror id.AccountID into the sessions.account_id
+// column itself, because the row is not durably written until SCS
+// commits on the response path. Callers that need a queryable
+// account-id link (for the SPEC-0005 "drop sessions on suspend"
+// scenario) MUST follow up with BindSessionToAccount once the
+// response has flushed; the typical place for that is the same
+// /auth/callback handler that calls PutIdentity, just after a
+// successful redirect-write.
+//
+// Governing: SPEC-0005 REQ "OIDC Login Flow"; SPEC-0005 REQ "Admin
+// Account Management" (drop sessions on suspend).
 func PutIdentity(ctx context.Context, mgr *scs.SessionManager, id Identity) error {
 	if mgr == nil {
 		return errors.New("session: nil manager")
@@ -134,6 +147,98 @@ func PutIdentity(ctx context.Context, mgr *scs.SessionManager, id Identity) erro
 		return err
 	}
 	return nil
+}
+
+// BindSessionToAccount records the (token, account_id) pair in the
+// session_owners sidecar table so a future RevokeSessionsForAccount
+// call can drop every session belonging to a suspended/soft-deleted
+// account in O(log n) on the idx_session_owners_account_id index.
+//
+// A sidecar (rather than an extra column on `sessions`) is required
+// because SCS's sqlite3store commits via `REPLACE INTO sessions(...)`
+// which clobbers any other column on every request. The token is the
+// FK from session_owners → sessions; cascade-on-delete on
+// session_owners is sufficient because we DELETE both rows together
+// in RevokeSessionsForAccount.
+//
+// Callers SHOULD invoke mgr.Commit before BindSessionToAccount so a
+// live `sessions.token` row exists for the FK target; the call site
+// is the post-callback handler in #23, which does this naturally
+// (PutIdentity → Commit → BindSessionToAccount → redirect).
+//
+// Governing: SPEC-0005 REQ "Admin Account Management" (drop sessions
+// on suspend / soft-delete).
+func BindSessionToAccount(ctx context.Context, mgr *scs.SessionManager, db *sql.DB, accountID string) error {
+	if mgr == nil {
+		return errors.New("session: nil manager")
+	}
+	if db == nil {
+		return errors.New("session: nil db")
+	}
+	if accountID == "" {
+		return errors.New("session: empty account id")
+	}
+	token := mgr.Token(ctx)
+	if token == "" {
+		// No session token yet (the caller forgot to wrap with
+		// LoadAndSave, or Commit has not happened). Nothing to bind.
+		return nil
+	}
+	// REPLACE so the bind is idempotent on re-login through the same
+	// browser (the second login renews the token, and the previous
+	// (token, account_id) row is naturally dropped by sessions
+	// cascade if we ever wired a delete-from-sessions trigger; for
+	// now the row simply lingers until the session expires).
+	const q = `INSERT INTO session_owners (token, account_id) VALUES (?, ?)
+	           ON CONFLICT(token) DO UPDATE SET account_id = excluded.account_id, bound_at = CURRENT_TIMESTAMP`
+	if _, err := db.ExecContext(ctx, q, token, accountID); err != nil {
+		return fmt.Errorf("session: bind to account: %w", err)
+	}
+	return nil
+}
+
+// RevokeSessionsForAccount drops every session row owned by the
+// supplied account, returning the number of rows affected. The
+// implementation is a single DELETE FROM sessions keyed by the join
+// to session_owners through the idx_session_owners_account_id index,
+// so cost is O(rows-deleted) regardless of the total session count.
+//
+// Sessions written before the #23 callback handler is in service
+// (i.e. without a corresponding session_owners row) are NOT revoked
+// by this function — they have no recorded owner, by definition
+// cannot have authorised any account-scoped traffic yet, and will
+// expire naturally via the SCS sweep within DefaultLifetime.
+//
+// Idempotent: calling on an account with zero live sessions returns
+// (0, nil).
+//
+// Governing: SPEC-0005 REQ "Admin Account Management" (drop sessions
+// on suspend / soft-delete).
+func RevokeSessionsForAccount(ctx context.Context, db *sql.DB, accountID string) (int64, error) {
+	if db == nil {
+		return 0, errors.New("session: nil db")
+	}
+	if accountID == "" {
+		return 0, errors.New("session: empty account id")
+	}
+	const deleteSessions = `DELETE FROM sessions WHERE token IN (SELECT token FROM session_owners WHERE account_id = ?)`
+	res, err := db.ExecContext(ctx, deleteSessions, accountID)
+	if err != nil {
+		return 0, fmt.Errorf("session: revoke for account: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("session: rows affected: %w", err)
+	}
+	// Drop the now-orphaned owner rows in passing. A leftover row is
+	// harmless (the sessions row it points at is gone, so SCS misses
+	// on Find), but cleaning up keeps the index small and the schema
+	// honest.
+	const deleteOwners = `DELETE FROM session_owners WHERE account_id = ?`
+	if _, err := db.ExecContext(ctx, deleteOwners, accountID); err != nil {
+		return n, fmt.Errorf("session: cleanup session_owners: %w", err)
+	}
+	return n, nil
 }
 
 // GetIdentity returns the cached identity. Subject is empty when no

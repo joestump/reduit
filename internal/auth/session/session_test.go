@@ -170,6 +170,176 @@ func TestReturnToRoundTrip(t *testing.T) {
 	}
 }
 
+// TestBindAndRevokeSessionsForAccount covers C4 from the round-1
+// hostile review: SPEC-0005's "drop sessions on suspend / soft-delete"
+// scenarios need an O(log n) DELETE keyed by account_id, which means
+// the foundation owns (1) populating sessions.account_id at login
+// time and (2) a helper to run the bulk delete.
+//
+// Flow:
+//
+//  1. Two browsers (cookie jars) log in as the same account; a
+//     third browser logs in as a different account.
+//  2. RevokeSessionsForAccount("acct-victim") removes both rows
+//     for the suspended account.
+//  3. The unrelated account's session row survives.
+//
+// Governing: SPEC-0005 REQ "Admin Account Management".
+func TestBindAndRevokeSessionsForAccount(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	defer st.Close()
+	insertAccountForSession(t, st, "acct-victim")
+	insertAccountForSession(t, st, "acct-bystander")
+
+	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer cleanup()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		acct := r.URL.Query().Get("account")
+		id := session.Identity{Subject: "sub-" + acct, AccountID: acct}
+		if err := session.PutIdentity(r.Context(), mgr, id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// Force SCS to commit synchronously so BindSessionToAccount has
+		// a row to UPDATE — production callers in #23 will follow the
+		// same pattern.
+		if _, _, err := mgr.Commit(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := session.BindSessionToAccount(r.Context(), mgr, st.DB.DB, acct); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/me", func(w http.ResponseWriter, r *http.Request) {
+		if !session.IsAuthenticated(r.Context(), mgr) {
+			http.Error(w, "unauth", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	})
+	srv := httptest.NewServer(mgr.LoadAndSave(mux))
+	defer srv.Close()
+
+	browserA := newBrowser(t)
+	loginAs(t, browserA, srv.URL, "acct-victim")
+	browserB := newBrowser(t)
+	loginAs(t, browserB, srv.URL, "acct-victim")
+	browserC := newBrowser(t)
+	loginAs(t, browserC, srv.URL, "acct-bystander")
+
+	// Pre-revoke: every browser is authenticated.
+	for _, b := range []*http.Client{browserA, browserB, browserC} {
+		resp, err := b.Get(srv.URL + "/me")
+		if err != nil {
+			t.Fatalf("/me: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("pre-revoke /me status = %d, want 200", resp.StatusCode)
+		}
+	}
+
+	// Suspend acct-victim → RevokeSessionsForAccount drops both
+	// browserA + browserB sessions.
+	n, err := session.RevokeSessionsForAccount(t.Context(), st.DB.DB, "acct-victim")
+	if err != nil {
+		t.Fatalf("RevokeSessionsForAccount: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("RevokeSessionsForAccount = %d, want 2", n)
+	}
+
+	// Post-revoke: browserA + browserB are 401, browserC still OK.
+	for label, b := range map[string]*http.Client{"A": browserA, "B": browserB} {
+		resp, err := b.Get(srv.URL + "/me")
+		if err != nil {
+			t.Fatalf("post-revoke /me %s: %v", label, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("post-revoke %s status = %d, want 401", label, resp.StatusCode)
+		}
+	}
+	resp, err := browserC.Get(srv.URL + "/me")
+	if err != nil {
+		t.Fatalf("post-revoke /me C: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("bystander session dropped — status %d", resp.StatusCode)
+	}
+}
+
+// TestRevokeSessionsForAccount_NoLiveSessions covers the idempotent
+// "no rows" case.
+func TestRevokeSessionsForAccount_NoLiveSessions(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	defer st.Close()
+	n, err := session.RevokeSessionsForAccount(t.Context(), st.DB.DB, "no-such")
+	if err != nil {
+		t.Fatalf("RevokeSessionsForAccount: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("n = %d, want 0", n)
+	}
+}
+
+// TestRevokeSessionsForAccount_GuardsBadInput covers the nil/empty
+// argument guards.
+func TestRevokeSessionsForAccount_GuardsBadInput(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	defer st.Close()
+	if _, err := session.RevokeSessionsForAccount(t.Context(), nil, "x"); err == nil {
+		t.Error("nil db: expected error, got nil")
+	}
+	if _, err := session.RevokeSessionsForAccount(t.Context(), st.DB.DB, ""); err == nil {
+		t.Error("empty account: expected error, got nil")
+	}
+}
+
+func newBrowser(t *testing.T) *http.Client {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("cookiejar: %v", err)
+	}
+	return &http.Client{Jar: jar}
+}
+
+func loginAs(t *testing.T, c *http.Client, baseURL, accountID string) {
+	t.Helper()
+	resp, err := c.Get(baseURL + "/login?account=" + accountID)
+	if err != nil {
+		t.Fatalf("login (%s): %v", accountID, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("login (%s) status = %d", accountID, resp.StatusCode)
+	}
+}
+
+func insertAccountForSession(t *testing.T, st *store.Store, id string) {
+	t.Helper()
+	const q = `
+		INSERT INTO accounts (id, oidc_subject, state, key_envelope)
+		VALUES (?, ?, 'active', X'00')
+	`
+	if _, err := st.DB.ExecContext(t.Context(), q, id, "sub-"+id); err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+}
+
 // openTempStore opens a fresh on-disk SQLite store and runs every
 // embedded migration. Mirrors the helper used elsewhere in this repo.
 func openTempStore(t *testing.T) *store.Store {

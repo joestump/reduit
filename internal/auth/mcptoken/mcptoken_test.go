@@ -129,6 +129,80 @@ func TestUnknownPlaintextReturnsErrTokenNotFound(t *testing.T) {
 	}
 }
 
+// TestRevokeForAccount covers C4 from the round-1 hostile review:
+// suspending or soft-deleting an account leaves accounts.id in place
+// (state transition, not a DELETE), so the FK cascade does not fire.
+// The foundation MUST therefore expose an explicit per-account revoke
+// helper.
+//
+// Governing: SPEC-0005 REQ "Admin Account Management" (suspend /
+// soft-delete invalidate MCP tokens).
+func TestRevokeForAccount(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	defer st.Close()
+	insertAccount(t, st, "acct-victim")
+	insertAccount(t, st, "acct-bystander")
+	repo := mcptoken.NewRepository(st.DB)
+	ctx := context.Background()
+
+	v1, _ := repo.Issue(ctx, mcptoken.IssueParams{AccountID: "acct-victim"})
+	v2, _ := repo.Issue(ctx, mcptoken.IssueParams{AccountID: "acct-victim"})
+	b1, _ := repo.Issue(ctx, mcptoken.IssueParams{AccountID: "acct-bystander"})
+
+	// Pre-revoke: every token is active.
+	now := time.Now()
+	for _, tok := range []*mcptoken.Token{v1, v2, b1} {
+		got, err := repo.FindByPlaintext(ctx, tok.Plaintext)
+		if err != nil {
+			t.Fatalf("FindByPlaintext: %v", err)
+		}
+		if !got.IsActive(now) {
+			t.Fatalf("pre-revoke token %s inactive", tok.ID)
+		}
+	}
+
+	n, err := repo.RevokeForAccount(ctx, "acct-victim")
+	if err != nil {
+		t.Fatalf("RevokeForAccount: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("RevokeForAccount = %d, want 2", n)
+	}
+
+	// Post-revoke: victim tokens are inactive, bystander still active.
+	for _, tok := range []*mcptoken.Token{v1, v2} {
+		got, err := repo.FindByPlaintext(ctx, tok.Plaintext)
+		if err != nil {
+			t.Fatalf("FindByPlaintext (post-revoke): %v", err)
+		}
+		if got.IsActive(time.Now()) {
+			t.Errorf("victim token %s still IsActive after RevokeForAccount", tok.ID)
+		}
+	}
+	got, err := repo.FindByPlaintext(ctx, b1.Plaintext)
+	if err != nil {
+		t.Fatalf("FindByPlaintext (bystander): %v", err)
+	}
+	if !got.IsActive(time.Now()) {
+		t.Error("bystander token revoked when only victim was suspended")
+	}
+
+	// Idempotent: a second call returns 0.
+	n, err = repo.RevokeForAccount(ctx, "acct-victim")
+	if err != nil {
+		t.Fatalf("RevokeForAccount (idempotent): %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("re-revoke = %d, want 0", n)
+	}
+
+	// Empty account-id is a guard.
+	if _, err := repo.RevokeForAccount(ctx, ""); err == nil {
+		t.Error("RevokeForAccount(\"\") returned nil error")
+	}
+}
+
 // insertAccount minimally satisfies the FK constraint on mcp_tokens.
 // The full account.Service is overkill for these table-only tests.
 func insertAccount(t *testing.T, st *store.Store, id string) {

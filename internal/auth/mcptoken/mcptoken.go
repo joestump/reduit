@@ -226,6 +226,36 @@ func (r *Repository) MarkUsed(ctx context.Context, id string) error {
 	return nil
 }
 
+// RevokeForAccount marks every live (revoked_at IS NULL) MCP token
+// for the supplied account as revoked. Returns the number of rows
+// affected. Idempotent: re-revoking already-revoked tokens is a
+// no-op (the WHERE filter elides them).
+//
+// The mcp_tokens.account_id FK already cascades on hard-delete, but
+// SPEC-0005's "drop sessions" / "stop the sync worker" semantics for
+// suspend and soft-delete operate on a still-extant `accounts` row
+// (state transitions, not a row delete), so the FK does not fire.
+// Account suspension and soft-delete flows MUST therefore call this
+// helper explicitly.
+//
+// Governing: SPEC-0005 REQ "Admin Account Management" (suspend /
+// soft-delete invalidate MCP tokens).
+func (r *Repository) RevokeForAccount(ctx context.Context, accountID string) (int64, error) {
+	if accountID == "" {
+		return 0, errors.New("mcptoken: empty account id")
+	}
+	const q = `UPDATE mcp_tokens SET revoked_at = ? WHERE account_id = ? AND revoked_at IS NULL`
+	res, err := r.db.ExecContext(ctx, q, time.Now().UTC(), accountID)
+	if err != nil {
+		return 0, fmt.Errorf("mcptoken: revoke for account: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("mcptoken: revoke for account rows affected: %w", err)
+	}
+	return n, nil
+}
+
 // HashToken returns the 32-byte SHA-256 of the plaintext bearer.
 // Exported so the bearer-token middleware can hash an incoming
 // Authorization value once before calling FindByHash directly.
