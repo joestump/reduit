@@ -17,11 +17,10 @@ erDiagram
     mailboxes ||--|{ uid_assignments : "assigns"
     accounts {
         text id PK
-        text oidc_subject UK
+        text owner_oidc_sub
         text proton_user_id
         text email
         text state
-        bool is_admin
         blob key_envelope
         blob refresh_token_ciphertext
         blob mailbox_passphrase_ciphertext
@@ -32,6 +31,21 @@ erDiagram
         timestamp deleted_at
     }
 ```
+
+`owner_oidc_sub` is `NOT NULL`. Uniqueness is on the composite
+`(owner_oidc_sub, proton_user_id)` — a given user MUST NOT add the
+same Proton account twice, but two distinct users MAY in principle
+each have a row referencing the same `proton_user_id` (access
+control lives at the per-account relay credentials and MCP tokens).
+There is no longer a uniqueness constraint on `oidc_subject` alone;
+that column has been replaced by `owner_oidc_sub` per ADR-0010. An
+index on `owner_oidc_sub` SHOULD exist for the hot "list my
+accounts" path.
+
+Admin status is no longer materialized as an `is_admin` column.
+It is computed at request time by checking
+`Principal.Subject ∈ OIDC_ADMIN_SUBS`. The schema-migration
+follow-up drops the column.
 
 ## Key data structures
 
@@ -98,19 +112,20 @@ the algorithm and key generation; the migration command lands in v0.5.
 
 ## Open questions
 
-- **Identity model nuance**: a single OIDC subject = a single Reduit
-  account = a single Proton account. What happens if a user has TWO
-  Proton accounts (e.g., personal + family)? v0.1 says "create two
-  Reduit accounts via different OIDC users" (e.g., `joe-personal` and
-  `joe-family` Pocket ID identities). Multi-Proton-per-OIDC-subject
-  is deferred.
 - **Audit trail granularity**: state transitions are logged but not
   retained as queryable rows. v0.5 may add an `audit_events` table.
+- **Normalized `users` table**: deferred per ADR-0010. The current
+  shape (single `owner_oidc_sub` column on `accounts`) suffices at
+  ≤50-account scale. If user-level attributes ever accumulate
+  (preferences, secondary-OIDC linking, display name overrides),
+  backfill from `DISTINCT owner_oidc_sub` and add the FK as a
+  non-breaking forward migration.
 
 ## References
 
 - ADR-0002 (multi-tenant)
 - ADR-0003 (encryption-at-rest)
 - ADR-0006 (SQLite store)
+- ADR-0010 (multi-Proton-account per user)
 - SPEC-0002 (sync worker — reads `last_event_id` from the account row)
 - SPEC-0003 (IMAP server — reads `imap_password_hash` for SASL)
