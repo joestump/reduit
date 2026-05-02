@@ -12,8 +12,8 @@ Transport: HTTP+SSE (Streamable HTTP per the MCP spec) on the same
 HTTPS listener as the admin UI, mounted at `/mcp`.
 
 Governing: ADR-0001 (go-proton-api), ADR-0008 (embedded MCP),
-SPEC-0001 (Account Model), SPEC-0003 (IMAP Server) for label/folder
-mapping consistency.
+ADR-0010 (multi-Proton-account per user), SPEC-0001 (Account Model),
+SPEC-0003 (IMAP Server) for label/folder mapping consistency.
 
 ## Requirements
 
@@ -21,23 +21,33 @@ mapping consistency.
 
 Every MCP tool invocation MUST be authenticated. Authentication MUST
 identify the calling Reduit account and scope all operations to that
-account.
+account. Because a single user (OIDC subject) MAY own multiple
+accounts per ADR-0010, the bearer credential alone MUST be
+sufficient to disambiguate a single account.
 
-#### Scenario: OIDC bearer token authenticates as the OIDC user
-
-- **WHEN** an MCP request carries `Authorization: Bearer <jwt>` and
-  the JWT is a valid OIDC ID token from the configured IdP
-- **THEN** the server SHALL validate the JWT (signature, issuer,
-  audience, expiry, nonce) and bind the request to the account whose
-  OIDC `sub` matches the token's `sub` claim
-
-#### Scenario: Per-user MCP token authenticates as the issuing user
+#### Scenario: Per-account MCP token authenticates as the bound account
 
 - **WHEN** an MCP request carries `Authorization: Bearer <token>`
-  where the token is a Reduit-issued per-user MCP token
+  where the token is a Reduit-issued per-account MCP token
 - **THEN** the server SHALL look up the token by hash (SHA-256 of
   the bearer value) in `mcp_tokens`, verify it's not revoked or
-  expired, and bind the request to the issuing account
+  expired, and bind the request to the issuing account. Per-account
+  tokens are the canonical bearer credential for MCP
+
+#### Scenario: OIDC bearer token requires account selector
+
+- **WHEN** an MCP request carries `Authorization: Bearer <jwt>`
+  where the JWT is a valid OIDC ID token from the configured IdP
+- **THEN** the server SHALL validate the JWT (signature, issuer,
+  audience, expiry, nonce). The request MUST also carry an account
+  selector (e.g., the `X-Reduit-Account` header containing the
+  account's UUID) so the server can disambiguate which of the
+  user's accounts to bind. The server SHALL verify that the
+  selected account is owned by the OIDC `sub` of the JWT (per
+  SPEC-0001's `owner_oidc_sub`) before binding the request. If the
+  selector is missing, the server SHALL respond `400 Bad Request`;
+  if the selector references an account the user does not own,
+  the server SHALL respond `403 Forbidden`
 
 #### Scenario: Unauthenticated MCP request is rejected
 
@@ -217,20 +227,26 @@ avoid one user exhausting per-account Proton API quotas.
 
 ### Requirement: Token Issuance and Revocation
 
-Per-user MCP tokens MUST be issuable from the admin UI and revocable.
+Per-account MCP tokens MUST be issuable from the admin UI and
+revocable. Tokens are scoped to exactly one account; a user who owns
+multiple accounts issues tokens separately for each.
 
-#### Scenario: User issues a new MCP token
+#### Scenario: User issues a new MCP token for an owned account
 
-- **WHEN** an authenticated user creates a token via
-  `/accounts/me/mcp-tokens` (admin UI)
-- **THEN** the server SHALL generate a 32-byte random token, store
+- **WHEN** an authenticated user creates a token via the admin UI
+  scoped to an account they own (e.g.,
+  `/accounts/{id}/mcp-tokens`)
+- **THEN** the server SHALL verify the user owns the referenced
+  account (per SPEC-0001), generate a 32-byte random token, store
   its SHA-256 hash with the issuing account, an optional label, and
   optional expiry. The plaintext token SHALL be returned exactly
-  once via the admin UI
+  once via the admin UI. If the user does not own the referenced
+  account, the server SHALL respond `403 Forbidden`
 
 #### Scenario: User revokes a token
 
-- **WHEN** a user revokes a token via the admin UI
+- **WHEN** a user revokes a token via the admin UI for an account
+  they own
 - **THEN** subsequent MCP requests carrying that token SHALL fail
   with `401 Unauthorized` within 1 second
 

@@ -34,11 +34,11 @@ sequenceDiagram
     participant Idp as OIDC IdP
     participant DB as SQLite
 
-    alt OIDC bearer (JWT)
-        C->>M: POST /mcp (Authorization: Bearer <jwt>)
+    alt OIDC bearer (JWT) + X-Reduit-Account selector
+        C->>M: POST /mcp (Authorization: Bearer <jwt>, X-Reduit-Account: <id>)
         M->>Idp: Verify JWT signature (cached JWKS)
-        M->>DB: Lookup account by oidc_subject
-    else Per-user MCP token
+        M->>DB: Lookup account by id; verify owner_oidc_sub == jwt.sub
+    else Per-account MCP token
         C->>M: POST /mcp (Authorization: Bearer <opaque>)
         M->>DB: SELECT mcp_tokens WHERE token_hash = sha256(opaque)
         M->>DB: Lookup account by token's account_id
@@ -153,7 +153,7 @@ sequenceDiagram
     participant U as User Browser
     participant UI as Admin UI
     participant DB as SQLite
-    U->>UI: POST /accounts/me/mcp-tokens (label="Claude on laptop")
+    U->>UI: POST /accounts/{id}/mcp-tokens (label="Claude on laptop")
     UI->>UI: generate 32 random bytes -> base32 -> token
     UI->>UI: hash := SHA-256(token)
     UI->>DB: INSERT mcp_tokens (account_id, hash, label, created_at)
