@@ -157,7 +157,7 @@ When orchestrating multiple design plugin skills in a single session (e.g., runn
 #### Review
 
 - **Max Pairs**: 2
-- **Merge Strategy**: rebase
+- **Merge Strategy**: squash
 - **Auto Cleanup**: false
 
 - **Max parallel agents**: 4
