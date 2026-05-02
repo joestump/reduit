@@ -1,11 +1,14 @@
 package auth_test
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/joestump/reduit/internal/auth"
@@ -203,6 +206,196 @@ func TestRequireSession_NonGETUnauthorized(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestRequireSession_AccountStateRecheck covers C6 from the round-1
+// hostile review. SPEC-0005's "Authenticated request proceeds"
+// scenario anchors on "an active session for an account": the bind
+// is account-state-sensitive, not just cookie-validity-sensitive. A
+// session issued before the account was suspended MUST stop working
+// on the very next gated request, not only after idle timeout.
+//
+// Three sub-cases:
+//
+//   - active: AccountActive(id) returns (true, nil) → request
+//     proceeds.
+//   - suspended: AccountActive returns (false, nil) → session is
+//     destroyed and the gate denies as if no cookie were present
+//     (302 to /auth/login for GET, 401 for non-GET).
+//   - DB error: AccountActive returns (_, err) → 503 (fail closed).
+//
+// Governing: SPEC-0005 REQ "Authentication Gating"; SPEC-0005 REQ
+// "Admin Account Management".
+func TestRequireSession_AccountStateRecheck(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	defer st.Close()
+	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
+	if err != nil {
+		t.Fatalf("session.New: %v", err)
+	}
+	defer cleanup()
+
+	// State the test toggles between sub-cases.
+	type checkResult struct {
+		ok  bool
+		err error
+	}
+	var (
+		checkMu  sync.Mutex
+		checkRet checkResult
+	)
+	setCheck := func(r checkResult) {
+		checkMu.Lock()
+		defer checkMu.Unlock()
+		checkRet = r
+	}
+	checker := func(ctx context.Context, accountID string) (bool, error) {
+		checkMu.Lock()
+		defer checkMu.Unlock()
+		if accountID != "acct-42" {
+			t.Errorf("checker called with accountID=%q, want %q", accountID, "acct-42")
+		}
+		return checkRet.ok, checkRet.err
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		_ = session.PutIdentity(r.Context(), mgr, session.Identity{Subject: "joe", AccountID: "acct-42"})
+		_, _ = w.Write([]byte("logged in"))
+	})
+	mux.HandleFunc("/protected", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("welcome"))
+	})
+	gate := auth.SessionGate{
+		Manager:       mgr,
+		LoginPath:     "/auth/login",
+		AccountActive: checker,
+	}
+	handler := mgr.LoadAndSave(auth.RequireSession(gate, mux))
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	jar, _ := cookiejar.New(nil)
+	c := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Log in.
+	if _, err := c.Get(srv.URL + "/auth/login"); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+
+	// Active: 200.
+	setCheck(checkResult{ok: true})
+	resp, err := c.Get(srv.URL + "/protected")
+	if err != nil {
+		t.Fatalf("/protected (active): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("active status = %d, want 200", resp.StatusCode)
+	}
+
+	// Suspended: 302 to /auth/login (GET path).
+	setCheck(checkResult{ok: false})
+	resp, err = c.Get(srv.URL + "/protected")
+	if err != nil {
+		t.Fatalf("/protected (suspended): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("suspended status = %d, want 302", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "/auth/login") {
+		t.Errorf("Location = %q, want /auth/login...", loc)
+	}
+
+	// Once destroyed, even with the recheck flipped back to active the
+	// session cookie is dead — re-login is required.
+	setCheck(checkResult{ok: true})
+	resp, err = c.Get(srv.URL + "/protected")
+	if err != nil {
+		t.Fatalf("/protected (post-destroy): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("post-destroy GET status = %d, want 302 (cookie destroyed)", resp.StatusCode)
+	}
+
+	// DB error path: with a fresh login + checker erroring, the gate
+	// returns 503. Re-login first because the previous Destroy killed
+	// the prior session.
+	if _, err := c.Get(srv.URL + "/auth/login"); err != nil {
+		t.Fatalf("re-login: %v", err)
+	}
+	setCheck(checkResult{ok: false, err: errors.New("db down")})
+	resp, err = c.Get(srv.URL + "/protected")
+	if err != nil {
+		t.Fatalf("/protected (db err): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("db-err status = %d, want 503", resp.StatusCode)
+	}
+
+	// Suspended POST → 401 (non-GET path) after fresh login.
+	if _, err := c.Get(srv.URL + "/auth/login"); err != nil {
+		t.Fatalf("re-login (post): %v", err)
+	}
+	setCheck(checkResult{ok: false})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/protected", nil)
+	resp, err = c.Do(req)
+	if err != nil {
+		t.Fatalf("POST /protected (suspended): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("suspended POST status = %d, want 401", resp.StatusCode)
+	}
+}
+
+// TestRequireSession_NoCheckerSkipsRecheck confirms the foundation
+// remains backward-compatible for tests / callers that have not
+// wired AccountActive: a session with empty AccountID still gates on
+// Subject alone.
+func TestRequireSession_NoCheckerSkipsRecheck(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	defer st.Close()
+	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
+	if err != nil {
+		t.Fatalf("session.New: %v", err)
+	}
+	defer cleanup()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		_ = session.PutIdentity(r.Context(), mgr, session.Identity{Subject: "joe", AccountID: "acct-x"})
+	})
+	mux.HandleFunc("/protected", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+	handler := mgr.LoadAndSave(auth.RequireSession(auth.SessionGate{Manager: mgr}, mux))
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	jar, _ := cookiejar.New(nil)
+	c := &http.Client{Jar: jar}
+	if _, err := c.Get(srv.URL + "/auth/login"); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	resp, err := c.Get(srv.URL + "/protected")
+	if err != nil {
+		t.Fatalf("protected: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 }
 

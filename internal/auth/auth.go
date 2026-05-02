@@ -26,6 +26,7 @@
 package auth
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"strings"
@@ -80,6 +81,29 @@ type SessionGate struct {
 	// LoginPath is the redirect target on a missing/invalid session.
 	// SPEC-0005 mandates "/auth/login"; pass that as the value.
 	LoginPath string
+	// AccountActive optionally checks that the session's bound account
+	// is still in a usable state. Returns:
+	//   - (true, nil) when the account is active and the request may
+	//     proceed.
+	//   - (false, nil) when the account exists but is suspended,
+	//     soft-deleted, or otherwise not authorised — the gate force-
+	//     destroys the session and treats the request as
+	//     unauthenticated (302 to LoginPath for GETs, 401 otherwise).
+	//   - (false, err) when the account state could not be checked
+	//     (DB outage). The gate fails closed: 503 Service Unavailable
+	//     so an administrator notices, rather than silently allowing
+	//     a possibly-suspended user through.
+	//
+	// May be nil — when nil, the gate accepts any session that
+	// resolves to a non-empty Subject (the pre-C6 behaviour). Wiring
+	// this in production binds the gate to account lifecycle per
+	// SPEC-0005 REQ "Admin Account Management".
+	//
+	// Governing: SPEC-0005 REQ "Authentication Gating" (Scenario
+	// "Authenticated request proceeds" — "active session for an
+	// account"); SPEC-0005 REQ "Admin Account Management" (suspend /
+	// soft-delete must immediately revoke access).
+	AccountActive func(ctx context.Context, accountID string) (bool, error)
 }
 
 // RequireSession returns middleware that allows allowlisted paths
@@ -87,9 +111,17 @@ type SessionGate struct {
 // unauthenticated requests to /auth/login with a `return_to` query
 // parameter pointing to the originally requested URL.
 //
+// When SessionGate.AccountActive is wired, every authenticated
+// request is checked against the bound account's current state — a
+// suspended/soft-deleted account is treated as unauthenticated even
+// if the cookie is otherwise valid. The session is destroyed in
+// passing so the dropped browser cannot replay the cookie at a
+// future re-login.
+//
 // Governing: SPEC-0005 REQ "Authentication Gating" (Scenarios:
 // Unauthenticated request redirects to login, Authenticated request
-// proceeds, Allowlist bypasses auth).
+// proceeds, Allowlist bypasses auth); SPEC-0005 REQ "Admin Account
+// Management".
 func RequireSession(gate SessionGate, next http.Handler) http.Handler {
 	loginPath := gate.LoginPath
 	if loginPath == "" {
@@ -101,26 +133,58 @@ func RequireSession(gate SessionGate, next http.Handler) http.Handler {
 			return
 		}
 		if gate.Manager != nil && session.IsAuthenticated(r.Context(), gate.Manager) {
+			// SPEC-0005 "Authenticated request proceeds" anchors on
+			// "an active session for an account". Without re-checking
+			// account state on each gated request, a session issued
+			// before suspend remains usable until idle-timeout — that
+			// is the gap C6 closes.
+			if gate.AccountActive != nil {
+				id := session.GetIdentity(r.Context(), gate.Manager)
+				if id.AccountID != "" {
+					ok, err := gate.AccountActive(r.Context(), id.AccountID)
+					if err != nil {
+						// DB outage: fail closed. A 503 is louder than a
+						// silent allow on a possibly-suspended user.
+						http.Error(w, "auth-state check unavailable", http.StatusServiceUnavailable)
+						return
+					}
+					if !ok {
+						// Account no longer authorised. Destroy the
+						// session token (best-effort; failures here MUST
+						// NOT block the response) and force re-login.
+						_ = gate.Manager.Destroy(r.Context())
+						denySessionMissing(w, r, loginPath)
+						return
+					}
+				}
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
-		// Browser GETs get a 302 to /auth/login with return_to. Other
-		// methods get a 401 — POSTs from an expired session shouldn't
-		// silently round-trip through the IdP and lose form state.
-		if r.Method != http.MethodGet {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		u, err := url.Parse(loginPath)
-		if err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-		q := u.Query()
-		q.Set("return_to", r.URL.RequestURI())
-		u.RawQuery = q.Encode()
-		http.Redirect(w, r, u.String(), http.StatusFound)
+		denySessionMissing(w, r, loginPath)
 	})
+}
+
+// denySessionMissing emits the standard "no/invalid session" response:
+// 302 to /auth/login?return_to=… for browser GETs, 401 for other
+// methods. Extracted from RequireSession so the post-account-check
+// "session was valid but account is suspended" branch shares the same
+// response shape — a downstream HTMX swapper can treat both
+// identically.
+func denySessionMissing(w http.ResponseWriter, r *http.Request, loginPath string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	u, err := url.Parse(loginPath)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	q := u.Query()
+	q.Set("return_to", r.URL.RequestURI())
+	u.RawQuery = q.Encode()
+	http.Redirect(w, r, u.String(), http.StatusFound)
 }
 
 // RequireAdmin returns middleware that 403s any request whose session
