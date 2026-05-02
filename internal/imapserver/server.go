@@ -57,6 +57,22 @@ type Config struct {
 	// transitions to Suspended or SoftDeleted.
 	Sessions *Sessions
 
+	// Mailboxes is the per-account mailbox service. Required for the
+	// Session's List/Select/Status/Fetch/Move methods to surface real
+	// data; absent, those methods fall back to the SPEC-0003-compatible
+	// "no such mailbox" stub.
+	//
+	// Governing: SPEC-0003 REQ "UID Stability", SPEC-0003 REQ "Folder
+	// Hierarchy and Mapping", SPEC-0003 REQ "Account Isolation in IMAP
+	// Operations".
+	Mailboxes MailboxService
+
+	// Proton resolves an account ID to its live Proton client. Required
+	// for Move / Copy to translate IMAP folder transitions into Proton
+	// label adjustments. Absent, Move returns a transient `NO` so the
+	// client retries.
+	Proton ProtonClientLookup
+
 	// Logger is the slog.Logger used for connection-level events.
 	// nil falls back to slog.Default().
 	Logger *slog.Logger
@@ -104,7 +120,14 @@ func New(cfg Config) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	backend, err := NewBackend(cfg.Accounts, cfg.Sessions, logger)
+	backendOpts := []BackendOption{}
+	if cfg.Mailboxes != nil {
+		backendOpts = append(backendOpts, WithMailboxes(cfg.Mailboxes))
+	}
+	if cfg.Proton != nil {
+		backendOpts = append(backendOpts, WithProton(cfg.Proton))
+	}
+	backend, err := NewBackend(cfg.Accounts, cfg.Sessions, logger, backendOpts...)
 	if err != nil {
 		return nil, err
 	}

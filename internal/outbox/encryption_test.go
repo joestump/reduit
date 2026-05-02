@@ -69,6 +69,19 @@ func (f *fakeProtonClient) Logout(context.Context) error {
 	panic("fakeProtonClient: Logout not implemented")
 }
 
+// Methods added to proton.Client by SPEC-0002 (GetLatestEventID) and
+// SPEC-0003 (LabelMessages/UnlabelMessages). The outbox does not call
+// any of these — they panic so a regression that does is loud.
+func (f *fakeProtonClient) GetLatestEventID(context.Context) (string, error) {
+	panic("fakeProtonClient: GetLatestEventID not implemented")
+}
+func (f *fakeProtonClient) LabelMessages(context.Context, []string, string) error {
+	panic("fakeProtonClient: LabelMessages not implemented")
+}
+func (f *fakeProtonClient) UnlabelMessages(context.Context, []string, string) error {
+	panic("fakeProtonClient: UnlabelMessages not implemented")
+}
+
 // TestSelectMode_ProtonInternalGetsE2E covers the SPEC-0004 scenario
 // "Proton recipient gets E2E": an internal recipient with at least one
 // active key resolves to ModeProtonE2E.

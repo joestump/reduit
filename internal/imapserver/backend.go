@@ -19,6 +19,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/joestump/reduit/internal/account"
+	"github.com/joestump/reduit/internal/mailbox"
+	"github.com/joestump/reduit/internal/proton"
 )
 
 // AccountLookup is the slice of `account.Service` the IMAP backend
@@ -29,11 +31,53 @@ type AccountLookup interface {
 	VerifyIMAPPassword(ctx context.Context, accountID string, candidate []byte) error
 }
 
+// ProtonClientLookup resolves an account ID to its live Proton client.
+// The IMAP MOVE / COPY handlers call into Proton through this hook to
+// adjust labels. Returns nil + nil when no client is currently bound
+// (e.g. account is mid-Proton-login); the Move handler treats that as
+// a transient failure and refuses the move with a `NO` response so the
+// client retries.
+//
+// Decoupling lets unit tests stub the proton surface without a full
+// account+manager stack.
+//
+// Governing: SPEC-0003 REQ "Folder Hierarchy and Mapping" — system
+// folder moves AND `Labels/*` moves both go through the Proton client.
+type ProtonClientLookup interface {
+	ProtonForAccount(ctx context.Context, accountID string) (proton.Client, error)
+}
+
+// MailboxService is the slice of mailbox.Service the IMAP session
+// needs. Kept as a local interface (not the upstream type) so tests do
+// not have to spin up the SQLite stack. The shape is identical to
+// mailbox.Service; we re-declare here so the imapserver package does
+// not transitively depend on the mailbox package's test fixtures.
+type MailboxService interface {
+	EnsureMailbox(ctx context.Context, accountID, name, protonLabelID string, kind mailbox.Kind) (*mailbox.Mailbox, error)
+	GetMailboxByName(ctx context.Context, accountID, name string) (*mailbox.Mailbox, error)
+	ListMailboxes(ctx context.Context, accountID string) ([]*mailbox.Mailbox, error)
+	AssignUID(ctx context.Context, accountID string, mailboxID, messageID int64) (uint32, error)
+	UpsertMessage(ctx context.Context, msg *mailbox.Message) (int64, error)
+	FindMessageByProtonID(ctx context.Context, accountID, protonID string) (*mailbox.Message, error)
+	RemoveMessageFromMailbox(ctx context.Context, accountID string, mailboxID, messageID int64) (bool, error)
+	ListMessagesInMailbox(ctx context.Context, accountID string, mailboxID int64) ([]*mailbox.MessageInMailbox, error)
+	CountMessagesInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error)
+}
+
+// Compile-time assertion: the production mailbox.Service MUST satisfy
+// imapserver's local MailboxService shape. If a method is added to
+// mailbox.Service (or a signature drifts) and is not mirrored here,
+// the build fails — instead of the interface re-declaration silently
+// missing the method until a runtime caller needs it.
+var _ MailboxService = (mailbox.Service)(nil)
+
 // Backend implements emersion/go-imap's `Options.NewSession` factory.
 // One Backend instance is shared across every connection; per-
 // connection state lives on Session.
 type Backend struct {
 	accounts  AccountLookup
+	mailboxes MailboxService
+	proton    ProtonClientLookup
 	sessions  *Sessions
 	logger    *slog.Logger
 	rateLimit *authRateLimiter
@@ -68,8 +112,15 @@ const bcryptDummyCost = 12
 // (#15) to call DropForAccount without coupling to the rest of the
 // server.
 //
+// `mailboxes` and `protonLookup` are OPTIONAL: when nil, the Session's
+// post-Login methods (List/Select/Status/Move/Fetch) degrade to the
+// pre-#19 stub behaviour (every named mailbox returns "does not
+// exist", LIST is empty). This keeps the existing test fixtures that
+// only exercise the auth path from breaking, and lets the composition
+// root wire mailboxes only when SPEC-0003's mailbox surface is needed.
+//
 // Governing: SPEC-0003 REQ "Per-Session Authentication Lifetime".
-func NewBackend(accounts AccountLookup, sessions *Sessions, logger *slog.Logger) (*Backend, error) {
+func NewBackend(accounts AccountLookup, sessions *Sessions, logger *slog.Logger, opts ...BackendOption) (*Backend, error) {
 	if accounts == nil {
 		return nil, errors.New("imapserver: accounts is required")
 	}
@@ -88,13 +139,36 @@ func NewBackend(accounts AccountLookup, sessions *Sessions, logger *slog.Logger)
 		// allocation failure — both fatal at startup time.
 		return nil, errors.New("imapserver: failed to generate dummy bcrypt hash")
 	}
-	return &Backend{
+	b := &Backend{
 		accounts:        accounts,
 		sessions:        sessions,
 		logger:          logger,
 		rateLimit:       newAuthRateLimiter(),
 		dummyBcryptHash: dummyHash,
-	}, nil
+	}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b, nil
+}
+
+// BackendOption is the functional-options shape NewBackend accepts so
+// that adding a new optional dependency (e.g. a future event-bus hook)
+// does not break the existing call sites.
+type BackendOption func(*Backend)
+
+// WithMailboxes wires the per-account mailbox service into the backend.
+// Required for the Session's List/Select/Status/Fetch/Move methods to
+// return real data — without it those methods fall back to the
+// SPEC-0003-compatible "no such mailbox" stub.
+func WithMailboxes(svc MailboxService) BackendOption {
+	return func(b *Backend) { b.mailboxes = svc }
+}
+
+// WithProton wires the proton client lookup. Required for Move/Copy
+// to translate IMAP folder transitions into Proton label adjustments.
+func WithProton(p ProtonClientLookup) BackendOption {
+	return func(b *Backend) { b.proton = p }
 }
 
 // burnDummyBcrypt runs a bcrypt comparison against the precomputed

@@ -36,6 +36,10 @@ const loginTimeout = 5 * time.Second
 // emersion/go-imap's `Session` interface; the methods that
 // authenticate live in this file and the rest are stubs in
 // session_stubs.go.
+//
+// Per SPEC-0003 REQ "Per-session state is isolated" `selectedState`
+// is per-instance; two sessions for the same account each get their
+// own copy and a SELECT in one cannot disturb the other's view.
 type session struct {
 	backend *Backend
 	conn    *imapserver.Conn
@@ -43,17 +47,20 @@ type session struct {
 	rateKey string
 	logger  *slog.Logger
 
-	mu         sync.Mutex
-	accountID  string
-	registered bool
+	mu            sync.Mutex
+	accountID     string
+	registered    bool
+	selectedState *sessionState
 }
 
 // Compile-time interface assertions. `imapserver.Session` is what
-// emersion/go-imap requires; `sessionDropper` is our internal hook
-// for the Sessions registry to call into the connection.
+// emersion/go-imap requires; `imapserver.SessionMove` advertises MOVE
+// support; `sessionDropper` is our internal hook for the Sessions
+// registry to call into the connection.
 var (
-	_ imapserver.Session = (*session)(nil)
-	_ sessionDropper     = (*session)(nil)
+	_ imapserver.Session     = (*session)(nil)
+	_ imapserver.SessionMove = (*session)(nil)
+	_ sessionDropper         = (*session)(nil)
 )
 
 // Close is called by emersion/go-imap when the connection ends. We

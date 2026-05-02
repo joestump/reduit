@@ -45,3 +45,26 @@ func TestOpenRejectsEmptyPath(t *testing.T) {
 		t.Fatal("expected Open(\"\") to fail")
 	}
 }
+
+// TestWriterDBSerialisesWrites confirms the writer pool is capped at
+// one connection so contended writers wait at the database/sql layer
+// instead of racing for the SQLite file lock and triggering SQLITE_BUSY.
+func TestWriterDBSerialisesWrites(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "writer.db")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	wdb := s.WriterDB()
+	if wdb == nil {
+		t.Fatal("WriterDB returned nil")
+	}
+	if got := wdb.Stats().MaxOpenConnections; got != 1 {
+		t.Errorf("writer MaxOpenConnections = %d, want 1", got)
+	}
+}
