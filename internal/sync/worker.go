@@ -190,54 +190,36 @@ func (w *worker) run() {
 	}
 }
 
-// tick is one cycle of the worker loop. The body acquires a
-// process-wide Proton concurrency slot, runs the event-stream
-// processor up to MaxConsecutiveTicks times to drain any backlog, and
-// releases the slot.
+// tick is one cycle of the worker loop. The body runs the event-stream
+// processor up to MaxConsecutiveTicks times to drain any backlog,
+// acquiring a process-wide Proton concurrency slot AROUND EACH
+// processOnce call (not held across the whole burst) so a contending
+// worker can interleave between iterations.
 //
-// Governing: SPEC-0002 REQ "Concurrency Limits" — the AcquireProtonSlot
-// call is what enforces the global cap. The slot is held across the
-// entire chained burst (not re-acquired per processOnce call) for two
-// reasons: (1) we already hold one upstream HTTP keep-alive
-// connection, so re-acquiring would just thrash the semaphore; (2)
-// the per-call cap is "in-flight calls", and chained calls in a tight
-// loop are still serially in-flight from this worker's perspective.
+// Governing: SPEC-0002 REQ "Concurrency Limits" — the
+// AcquireProtonSlot call is what enforces the global cap. PR #41's
+// hostile review pointed out that holding the slot across the entire
+// burst converts the semaphore from "in-flight ceiling" to "burst
+// ceiling": with cap=8 and 8 workers all bursting, sibling work
+// (admin force-resync, future SMTP outbox, MCP) wedges behind up to
+// 8×20=160 sequential round-trips before getting a turn. We now
+// release between iterations so the semaphore behaves as designed.
+// The cost is one extra acquire per chained iteration, which is
+// O(<<1ms) under the lock-free Go select fast path when slots are
+// free.
 //
 // Within the burst we honour both ctx.Done and the
 // MaxConsecutiveTicks cap so the worker stays responsive to graceful
 // shutdown and so a runaway "More=true" loop cannot starve the ticker.
 //
-// Defer ordering matters: the recover() defer is registered AFTER the
-// release() defer so that, on panic, defers unwind LIFO and the
-// recover-and-log runs FIRST, with the slot release happening only
-// after the panic has been logged and re-raised. Without this
-// ordering, a panicking tick would release its slot back into the
-// semaphore and a sibling worker could grab it before the operator
-// ever sees the panic in the logs. The recover here re-panics so the
-// outer worker.run() recover still observes the panic and performs
-// the worker map cleanup.
-//
-// Governing: SPEC-0002 REQ "Panic Isolation" (panic surfaced in logs
-// before resources recycle).
+// Panic-recover ordering: the recover defer wraps each individual
+// processOnce call (via runProcessOnce) rather than the whole tick.
+// runProcessOnce's defer ordering — recover first, slot release
+// second — preserves the SPEC-0002 REQ "Panic Isolation" invariant
+// that the panic is logged BEFORE the slot returns to the pool, so a
+// sibling worker cannot grab the slot before the operator sees the
+// crash.
 func (w *worker) tick() {
-	release, err := w.sup.AcquireProtonSlot(w.ctx)
-	if err != nil {
-		// ctx canceled while waiting for a slot — fine, we're
-		// draining anyway.
-		return
-	}
-	defer release()
-	defer func() {
-		if r := recover(); r != nil {
-			w.logger.LogAttrs(context.Background(), slog.LevelError,
-				"sync: worker tick panic; logged before slot release",
-				slog.Any("panic", r),
-				slog.String("stack", string(debug.Stack())),
-			)
-			panic(r) // propagate to worker.run()'s recover for cleanup
-		}
-	}()
-
 	// Test-only hook from #15. Story #17 replaces this with a real
 	// injection-based panic test once the proton.Client mock can fire
 	// panics inside GetEvent.
@@ -265,11 +247,19 @@ func (w *worker) tick() {
 		if w.ctx.Err() != nil {
 			return
 		}
-		more, err := w.proc.processOnce(w.ctx)
+		more, err := w.runProcessOnce()
 		if err != nil {
 			// Story #17 will classify (transient vs permanent) and
 			// emit backoff. For #16 plumbing we just log + bail; the
 			// next ticker fire retries.
+			//
+			// errProtonSlotUnavailable is a special case: ctx was
+			// canceled while waiting for a slot (e.g. graceful
+			// shutdown), so we exit silently rather than logging an
+			// error.
+			if err == errProtonSlotUnavailable {
+				return
+			}
 			w.logger.LogAttrs(w.ctx, slog.LevelError,
 				"sync: event processing failed; will retry next tick",
 				slog.Any("err", err),
@@ -284,4 +274,48 @@ func (w *worker) tick() {
 		"sync: max consecutive ticks reached; yielding to ticker",
 		slog.Int("limit", w.sup.cfg.MaxConsecutiveTicks),
 	)
+}
+
+// errProtonSlotUnavailable is a sentinel returned by runProcessOnce
+// when AcquireProtonSlot fails because ctx was canceled. tick() uses
+// this to distinguish "graceful drain in progress" from a real
+// processOnce error — the former should exit silently, the latter
+// gets logged at ERROR.
+var errProtonSlotUnavailable = errSentinel("sync: proton slot acquisition canceled")
+
+// errSentinel is a tiny named type so package-level error variables
+// stay comparable via ==.
+type errSentinel string
+
+func (e errSentinel) Error() string { return string(e) }
+
+// runProcessOnce wraps a single processOnce call in slot-acquire +
+// panic-recover. Releasing the slot between burst iterations is what
+// gives sibling workers a chance to interleave (see tick()).
+//
+// Defer ordering: recover() is registered AFTER release() so panics
+// unwind LIFO with recover running FIRST, the slot release happening
+// only after the panic has been logged and re-raised. A sibling
+// worker therefore cannot grab the slot before the operator sees the
+// crash. The recover re-panics so worker.run()'s outer recover still
+// observes it and performs the live-map cleanup.
+//
+// Governing: SPEC-0002 REQ "Concurrency Limits" + REQ "Panic Isolation".
+func (w *worker) runProcessOnce() (bool, error) {
+	release, err := w.sup.AcquireProtonSlot(w.ctx)
+	if err != nil {
+		return false, errProtonSlotUnavailable
+	}
+	defer release()
+	defer func() {
+		if r := recover(); r != nil {
+			w.logger.LogAttrs(context.Background(), slog.LevelError,
+				"sync: worker tick panic; logged before slot release",
+				slog.Any("panic", r),
+				slog.String("stack", string(debug.Stack())),
+			)
+			panic(r) // propagate to worker.run()'s recover for cleanup
+		}
+	}()
+	return w.proc.processOnce(w.ctx)
 }

@@ -140,15 +140,18 @@ type Service interface {
 	GetSyncState(ctx context.Context, accountID string) (*SyncState, error)
 
 	// SetSyncState commits a cursor advance atomically with any
-	// caller-supplied derived-state writes. The optional
-	// SyncStateTxWork callback is invoked with the open *sqlx.Tx;
-	// returning a non-nil error rolls back the entire transaction
-	// (cursor + derived state). At most one SyncStateTxWork may be
-	// passed; supplying more is a programmer error and panics.
+	// caller-supplied derived-state writes. The txWork callback (which
+	// may be nil) is invoked with the open *sqlx.Tx; returning a
+	// non-nil error rolls back the entire transaction (cursor +
+	// derived state).
+	//
+	// The signature is strict (single nilable parameter, not variadic)
+	// so a misuse like passing two callbacks is a compile-time error,
+	// not a runtime panic. Callers with no derived work pass nil.
 	//
 	// Governing: SPEC-0002 REQ "Event Cursor Persistence" — atomic
 	// commit of cursor and state changes derived from the same batch.
-	SetSyncState(ctx context.Context, accountID, cursor string, txWork ...SyncStateTxWork) error
+	SetSyncState(ctx context.Context, accountID, cursor string, txWork SyncStateTxWork) error
 }
 
 // CreateParams collects the inputs to Service.Create. ProtonUserID

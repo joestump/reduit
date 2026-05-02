@@ -138,25 +138,16 @@ func (s *service) GetSyncState(ctx context.Context, accountID string) (*SyncStat
 // commit-or-nothing invariant is held by Go's defer chain, not by SQL
 // ordering.
 //
-// The optional ...SyncStateTxWork variadic is a deliberate API choice:
-// the common #16 call site is `SetSyncState(ctx, id, cursor)` with no
-// extra work, and the variadic lets that call site stay readable
-// without a sentinel nil. Passing more than one txWork is a programmer
-// error — we panic loudly (caller bug, not runtime error) so the
-// mistake is caught at first invocation rather than silently dropping
-// the second callback.
+// The txWork parameter is a single nilable callback (not variadic):
+// the previous variadic shape let `SetSyncState(ctx, id, cur, w1, w2)`
+// compile and panic at runtime, which traded a compile-time error for
+// a runtime trap. Strict arity catches the mistake at compile time;
+// the common #16 call site passes `nil` to make the no-work case
+// explicit at the call site.
 //
 // Governing: SPEC-0002 REQ "Event Cursor Persistence",
 // SPEC-0002 REQ "Cursor is consistent at shutdown".
-func (s *service) SetSyncState(ctx context.Context, accountID, cursor string, txWork ...SyncStateTxWork) error {
-	if len(txWork) > 1 {
-		panic("account: SetSyncState supports at most one SyncStateTxWork")
-	}
-	var work SyncStateTxWork
-	if len(txWork) == 1 {
-		work = txWork[0]
-	}
-
+func (s *service) SetSyncState(ctx context.Context, accountID, cursor string, txWork SyncStateTxWork) error {
 	tx, err := s.repo.db.BeginTxx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("account: begin sync state tx: %w", err)
@@ -194,8 +185,8 @@ func (s *service) SetSyncState(ctx context.Context, accountID, cursor string, tx
 	if err := upsertSyncStateInTx(ctx, tx, accountID, cursor, s.now().UTC()); err != nil {
 		return err
 	}
-	if work != nil {
-		if err := work(tx); err != nil {
+	if txWork != nil {
+		if err := txWork(tx); err != nil {
 			return fmt.Errorf("account: sync state tx work: %w", err)
 		}
 	}

@@ -110,6 +110,54 @@ func TestClient_GetEvent(t *testing.T) {
 	}
 }
 
+// TestClient_GetLatestEventID covers the production path of the new
+// method clientImpl.GetLatestEventID added for SPEC-0002 REQ "Event
+// Cursor Persistence" (first-boot bootstrap). Mirrors the shape of
+// TestClient_GetEvent so the requireSession() guard, defer release(),
+// and upstream forwarding all execute against an httptest backend.
+//
+// PR #41 hostile-review fix: the previous version of this PR
+// exercised GetLatestEventID only via the in-package fakeProtonClient,
+// leaving the production wrapper untested.
+func TestClient_GetLatestEventID(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/core/v4/events/latest" && r.Method == http.MethodGet:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"EventID":"evt-latest"}`))
+		case r.URL.Path == "/auth/v4" && r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.Error(w, "unexpected request "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	m := newTestManager(t, srv)
+	c := m.NewClient(context.Background(), "uid", "acc", "ref")
+
+	got, err := c.GetLatestEventID(context.Background())
+	if err != nil {
+		t.Fatalf("GetLatestEventID: %v", err)
+	}
+	if got != "evt-latest" {
+		t.Errorf("EventID = %q, want evt-latest", got)
+	}
+
+	// Post-Logout path: a client whose session has been torn down
+	// must reject the call rather than silently returning an empty
+	// cursor (which would be indistinguishable from a real
+	// "no events ever" answer).
+	if err := c.Logout(context.Background()); err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+	if _, err := c.GetLatestEventID(context.Background()); !errors.Is(err, ErrNotAuthenticated) {
+		t.Errorf("post-Logout GetLatestEventID error = %v, want ErrNotAuthenticated", err)
+	}
+}
+
 func TestClient_ListMessages(t *testing.T) {
 	t.Parallel()
 
