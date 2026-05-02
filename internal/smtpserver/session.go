@@ -302,22 +302,6 @@ func (s *session) Data(r io.Reader) error {
 		}
 	}
 
-	// Outbox-less mode (legacy stub): if no submitter is wired in
-	// (e.g. tests that exercise auth + envelope only), behave as the
-	// pre-#22 stub did and return 250 OK after logging. Production
-	// callers always wire an Outbox; the smtpserver.Config doc string
-	// makes that explicit.
-	if s.backend.outbox == nil {
-		s.logger.Info("smtp data accepted",
-			slog.String("event", "smtp_data_accepted_stub"),
-			slog.String("remote", s.remote),
-			slog.String("account_id", acct),
-			slog.String("from", from),
-			slog.Int("recipients", len(rcpt)),
-			slog.Int64("bytes", n))
-		return nil
-	}
-
 	// Synchronous outbox call. The worker enforces its own deadline
 	// (REDUIT_SMTP_SUBMIT_TIMEOUT, default 60s); we pass a parent
 	// ctx so a forced server shutdown can short-circuit the wait.
@@ -370,9 +354,14 @@ func (s *session) Data(r io.Reader) error {
 // conservative: anything we don't recognise becomes 451 (transient,
 // retry) so a flaky upstream doesn't manifest as permanent rejections.
 //
+// Reduit does NOT run a server-side retry loop after a synchronous
+// timeout. The 451 4.4.7 text deliberately does not promise retry;
+// recovery is the sender's MTA re-attempting the SMTP submission per
+// RFC 5321, which is the canonical SMTP-level retry mechanism.
+//
 // Mapping:
 //
-//	ErrSubmissionTimedOut  → 451 4.4.7  Submission timed out, message will be retried
+//	ErrSubmissionTimedOut  → 451 4.4.7  Submission timed out
 //	ErrAccountClosed       → 421 4.7.0  Account no longer authorised
 //	ErrSubmissionEnvelope  → 503 5.5.1  Bad sequence of commands
 //	*ErrKeyLookup          → 451 4.4.4  Key lookup failed (transient)
@@ -398,7 +387,7 @@ func mapOutboxError(err error) *smtp.SMTPError {
 		return &smtp.SMTPError{
 			Code:         451,
 			EnhancedCode: smtp.EnhancedCode{4, 4, 7},
-			Message:      "Submission timed out, message will be retried",
+			Message:      "Submission timed out",
 		}
 	case errors.Is(err, outbox.ErrAccountClosed):
 		return &smtp.SMTPError{
@@ -418,7 +407,7 @@ func mapOutboxError(err error) *smtp.SMTPError {
 		return &smtp.SMTPError{
 			Code:         451,
 			EnhancedCode: smtp.EnhancedCode{4, 4, 4},
-			Message:      "Key lookup failed, message will be retried",
+			Message:      "Key lookup failed",
 		}
 	}
 	var authErr *outbox.ErrProtonAuth

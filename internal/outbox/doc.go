@@ -19,10 +19,13 @@
 //
 // Submission timeout: when the upstream call has not returned within
 // the configured deadline (default 60s, env REDUIT_SMTP_SUBMIT_TIMEOUT)
-// the synchronous waiter returns ErrSubmissionTimedOut. The worker
-// detaches the in-flight call onto a background retry goroutine that
-// continues until completion or process shutdown. Best-effort —
-// see the package README in the PR body for the limits.
+// the synchronous waiter returns ErrSubmissionTimedOut and the SMTP
+// layer responds 451 4.4.7. Reduit does NOT run a server-side retry
+// loop after a timeout — the sender's MTA re-attempting the SMTP
+// submission per RFC 5321 is the canonical recovery path. The
+// in-flight upstream call is left to unwind on its own (its next
+// ctx-aware call observes the cancelled subCtx and returns); a best-
+// effort audit row lands in `outbox_pending` for operator visibility.
 //
 // Encryption-mode selection (security-critical, see SelectMode for the
 // full decision table):

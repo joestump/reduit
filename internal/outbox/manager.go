@@ -35,13 +35,19 @@ type Config struct {
 	Resolver ProtonClientResolver
 
 	// Builder constructs the per-message Proton SendDraftReq from a
-	// classified Submission. Required in production; tests may pass
-	// NoopBuilder to exercise the encryption pipeline only.
+	// classified Submission. REQUIRED — outbox.New rejects nil.
+	// Production callers wire a real Builder (CreateDraft + per-mode
+	// MessagePackage assembly) at the composition root; the only
+	// permitted test-only escape is BuildResult{Skip: true}, which
+	// bypasses SendDraft. There is no production-linkable NoopBuilder
+	// — silent-success was the worst failure mode.
 	Builder Builder
 
-	// PendingStore persists rows for submissions whose synchronous
-	// timeout fired but whose background retry continued. Required;
-	// tests may pass DiscardPendingStore.
+	// PendingStore persists best-effort audit rows for submissions
+	// whose synchronous timeout fired (Reduit returned 451 4.4.7).
+	// Required; tests may pass DiscardPendingStore. Reduit does NOT
+	// run a Reduit-side retry loop after a timeout — recovery is the
+	// sender's MTA re-attempting the SMTP submission.
 	PendingStore PendingStore
 
 	// Logger is the slog.Logger used for outbox events. Nil falls back

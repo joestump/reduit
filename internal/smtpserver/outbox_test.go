@@ -210,8 +210,13 @@ func TestData_OutboxTimeoutMapsTo451(t *testing.T) {
 
 	r, _ := driveDataExchange(t, srv.addr)
 	resp := readSMTPLine(t, r)
+	// Per Blocker-2 fix: the response no longer claims Reduit will
+	// retry; SMTP-level retry is the sender's MTA's responsibility.
 	if !strings.HasPrefix(resp, "451 4.4.7 Submission timed out") {
 		t.Errorf("expected `451 4.4.7 Submission timed out ...`, got %q", resp)
+	}
+	if strings.Contains(resp, "will be retried") {
+		t.Errorf("response promises Reduit-side retry; got %q", resp)
 	}
 }
 
@@ -310,6 +315,27 @@ func TestMapOutboxError_TableDriven(t *testing.T) {
 				t.Errorf("EnhancedCode = %v, want %v", got.EnhancedCode, tc.wantEnh)
 			}
 		})
+	}
+}
+
+// TestNewBackend_RejectsNilSubmitter covers the silent-success guard
+// at the SMTP backend constructor: a nil OutboxSubmitter previously
+// fell through to a "log + 250 OK" stub which composed with NoopBuilder
+// into a path that returned 250 OK for messages that never reached
+// Proton. The constructor now refuses to build a Backend without a
+// real submitter.
+//
+// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+// Confirmation" — silent-success guard at the composition root.
+func TestNewBackend_RejectsNilSubmitter(t *testing.T) {
+	t.Parallel()
+	stub := newStubAccounts()
+	_, err := NewBackend(stub, NewSessions(), nil, nil)
+	if err == nil {
+		t.Fatal("NewBackend accepted nil OutboxSubmitter; expected error")
+	}
+	if !strings.Contains(err.Error(), "OutboxSubmitter is required") {
+		t.Errorf("error = %q, want substring %q", err.Error(), "OutboxSubmitter is required")
 	}
 }
 

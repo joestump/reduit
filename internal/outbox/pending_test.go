@@ -64,42 +64,6 @@ func TestSQLitePendingStore_RecordTimeout(t *testing.T) {
 	}
 }
 
-func TestSQLitePendingStore_RecordTimeoutResolved(t *testing.T) {
-	t.Parallel()
-	s := openMigratedStore(t)
-	insertAccount(t, s, "acct-resolved")
-
-	ps := NewSQLitePendingStore(s.DB)
-	sub := Submission{
-		AccountID:  "acct-resolved",
-		MailFrom:   "joe@reduit.example",
-		Recipients: []string{"alice@proton.me"},
-		Body:       []byte("body"),
-	}
-	ctx := context.Background()
-	if err := ps.RecordTimeoutResolved(ctx, sub); err != nil {
-		t.Fatalf("RecordTimeoutResolved: %v", err)
-	}
-	var status string
-	var failureReason interface{}
-	if err := s.DB.GetContext(ctx, &status,
-		`SELECT status FROM outbox_pending WHERE account_id = ?`, "acct-resolved"); err != nil {
-		t.Fatalf("query: %v", err)
-	}
-	if status != "timeout_resolved" {
-		t.Errorf("status = %q, want timeout_resolved", status)
-	}
-	// failure_reason MUST be NULL on resolved-after-timeout rows so
-	// the admin UI can distinguish "we sent it eventually" cleanly.
-	if err := s.DB.GetContext(ctx, &failureReason,
-		`SELECT failure_reason FROM outbox_pending WHERE account_id = ?`, "acct-resolved"); err != nil {
-		t.Fatalf("query null: %v", err)
-	}
-	if failureReason != nil {
-		t.Errorf("failure_reason = %v, want NULL on resolved row", failureReason)
-	}
-}
-
 func TestSQLitePendingStore_AccountCascade(t *testing.T) {
 	t.Parallel()
 	s := openMigratedStore(t)

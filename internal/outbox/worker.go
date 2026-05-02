@@ -14,6 +14,7 @@ package outbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -37,20 +38,20 @@ type worker struct {
 	closeMu sync.RWMutex
 	closed  bool
 
-	// inflight tracks goroutines (semaphore holders + background retry
-	// goroutines) so Manager.Shutdown can wait for them to drain.
+	// inflight tracks the per-Submit child goroutines (semaphore
+	// holders) so Manager.Shutdown can wait for them to drain.
 	inflight sync.WaitGroup
 }
 
 func newWorker(mgr *Manager, accountID string) *worker {
-	cap := mgr.cfg.PerAccountCap
-	if cap <= 0 {
-		cap = DefaultPerAccountCap
+	capacity := mgr.cfg.PerAccountCap
+	if capacity <= 0 {
+		capacity = DefaultPerAccountCap
 	}
 	return &worker{
 		accountID: accountID,
 		mgr:       mgr,
-		sem:       make(chan struct{}, cap),
+		sem:       make(chan struct{}, capacity),
 	}
 }
 
@@ -58,12 +59,15 @@ func newWorker(mgr *Manager, accountID string) *worker {
 // proton.Client.SendDraft (via the resolver-supplied client), and
 // return the result inside the configured submission deadline.
 //
-// On deadline expiry the synchronous return is ErrSubmissionTimedOut
-// and the in-flight upstream call is detached onto a background
-// goroutine that continues until it returns or Manager.Shutdown is
-// invoked. Best-effort: outcomes from the detached call are logged but
-// not surfaced to the SMTP client (whose connection has already
-// received the 451).
+// On deadline expiry the synchronous return is ErrSubmissionTimedOut.
+// The in-flight upstream child goroutine is left to unwind on its own
+// (its next ctx-aware call observes the cancelled subCtx and returns)
+// and the per-account semaphore slot is released by the child's defer.
+// We do NOT spin up a Reduit-side retry loop: the canonical
+// recovery path is the sender's MTA re-attempting the SMTP submission
+// per RFC 5321, which lands as a fresh Submit on a clean ctx. A
+// Reduit-side retry would be a meaningful chunk of work that bloats
+// this story; it is tracked separately.
 //
 // Submit is safe for concurrent use across goroutines.
 func (w *worker) Submit(ctx context.Context, sub Submission) Result {
@@ -112,17 +116,39 @@ func (w *worker) Submit(ctx context.Context, sub Submission) Result {
 
 	// Run the actual submission on a child goroutine so the parent
 	// (this Submit call) can race the subCtx deadline against
-	// completion. On deadline the child detaches and continues.
+	// completion. resultCh is buffered (cap 1) so the child can send
+	// its outcome and exit even if the parent has already returned
+	// the timeout to the SMTP layer — no Reduit-side consumer is
+	// required.
 	resultCh := make(chan Result, 1)
 	go func() {
 		defer func() {
 			// Slot release happens here, NOT in the parent. If the
-			// parent timed out and detached, the slot is still held by
-			// THIS goroutine until the upstream call returns —
-			// otherwise a slow Proton call would let an extra send
-			// through the cap on its way out.
+			// parent timed out and the child is still unwinding, the
+			// slot remains held until the upstream call observes the
+			// cancelled subCtx and returns — otherwise a slow Proton
+			// call would let an extra send through the cap on its way
+			// out.
 			<-w.sem
 			w.inflight.Done()
+		}()
+		// Recover panics inside w.run (e.g. the fail-loud empty-DraftID
+		// guard) so a misconfigured Builder surfaces as a typed error
+		// rather than crashing the process. The panic is converted to
+		// *ErrProtonReject (SMTP 550) — a permanent reject is the right
+		// signal for "the operator wired the outbox wrong"; the sender
+		// shouldn't retry.
+		defer func() {
+			if r := recover(); r != nil {
+				err := errors.New("outbox: worker panic: " + panicString(r))
+				w.mgr.cfg.Logger.LogAttrs(context.Background(), slog.LevelError,
+					"outbox: worker panic recovered",
+					slog.String("event", "outbox_worker_panic"),
+					slog.String("account_id", sub.AccountID),
+					slog.Any("panic", r),
+				)
+				resultCh <- Result{Err: &ErrProtonReject{Cause: err}}
+			}
 		}()
 		resultCh <- w.run(subCtx, sub)
 	}()
@@ -131,14 +157,41 @@ func (w *worker) Submit(ctx context.Context, sub Submission) Result {
 	case r := <-resultCh:
 		return r
 	case <-subCtx.Done():
-		// Detach: the goroutine above will eventually finish and
-		// drain its result. Spin off a background retry goroutine
-		// that consumes the eventual outcome and logs it.
-		w.detachBackground(sub, resultCh)
+		// Synchronous waiter abandons the in-flight call. The child
+		// goroutine above will observe subCtx.Done() on its next
+		// ctx-aware call (GetPublicKeys / SendDraft), drop its result
+		// into the buffered resultCh, and exit — releasing the slot in
+		// the deferred sem read. Best-effort audit: record that the
+		// SMTP-visible outcome was a timeout. The sender's MTA retries
+		// the SMTP submission per RFC 5321, which is the canonical
+		// recovery path; Reduit does not attempt its own retry.
+		//
+		// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+		// Confirmation" — synchronous-first, no Reduit-side retry.
 		if errors.Is(subCtx.Err(), context.DeadlineExceeded) {
+			// Fire-and-forget the audit row; PendingStore writes are
+			// best-effort and the worker should not block returning
+			// the 451 on a SQLite write.
+			w.recordTimeout(sub, ErrSubmissionTimedOut)
 			return Result{Err: ErrSubmissionTimedOut}
 		}
 		return Result{Err: subCtx.Err()}
+	}
+}
+
+// recordTimeout writes a best-effort audit row for the timeout-
+// abandoned submission. Errors are intentionally swallowed: the audit
+// table is operator-visible context, not a delivery guarantee.
+func (w *worker) recordTimeout(sub Submission, cause error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := w.mgr.cfg.PendingStore.RecordTimeout(ctx, sub, cause); err != nil {
+		w.mgr.cfg.Logger.LogAttrs(context.Background(), slog.LevelWarn,
+			"outbox: pending-store write failed",
+			slog.String("event", "outbox_pending_store_failed"),
+			slog.String("account_id", sub.AccountID),
+			slog.Any("err", err),
+		)
 	}
 }
 
@@ -162,70 +215,41 @@ func (w *worker) run(ctx context.Context, sub Submission) Result {
 
 	w.logEncryptionDecision(sub, modes, nil)
 
-	// SendDraft is the upstream submission. The per-recipient
-	// encryption packet construction happens in the background retry
-	// path / a follow-up story (#23) which builds the
-	// SendDraftReq.AddTextPackage / AddMIMEPackage calls. For v0.1 the
-	// outbox calls SendDraft with an empty package set when the resolver
-	// is a no-op stub (tests), or hands the real pre-built request when
-	// the composition root supplies a Builder.
+	// Builder constructs the per-recipient encryption packet set and
+	// returns the Proton DraftID to submit against. Production builders
+	// MUST return a non-empty DraftID; the test-only Skip flag is the
+	// only legitimate way to bypass the SendDraft call.
 	req, err := w.mgr.cfg.Builder.Build(ctx, sub, modes, client)
 	if err != nil {
 		return Result{Modes: modes, Err: classifyBuilderError(err)}
 	}
 
-	// SendDraft uses the draftID returned by Builder. Empty draftID
-	// here means the builder produced a "no upstream call" result
-	// (used by tests that exercise the encryption pipeline only).
-	if req.DraftID == "" {
+	// Test-only skip: a recording builder exercises the encryption
+	// pipeline without round-tripping to a real Proton. Any production
+	// Builder that sets Skip=true is a bug (it would surface as a fake
+	// 250 OK with no message ever sent), but the responsibility for
+	// that boundary is the composition root's, not the worker's.
+	if req.Skip {
 		return Result{Modes: modes}
+	}
+
+	// Fail-loud guard: an empty DraftID with Skip=false is a programming
+	// error (a Builder that forgot to call CreateDraft, or a test
+	// builder that should have set Skip=true). Panicking here surfaces
+	// the misconfiguration immediately rather than letting a silent
+	// success ship to the SMTP layer as 250 OK.
+	//
+	// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+	// Confirmation" — silent-success is the worst failure mode; fail
+	// loud at the worker boundary.
+	if req.DraftID == "" {
+		panic("outbox: Builder returned empty DraftID with Skip=false; refusing to fake-send")
 	}
 
 	if _, err := client.SendDraft(ctx, req.DraftID, req.Req); err != nil {
 		return Result{Modes: modes, Err: classifySendDraftError(err)}
 	}
 	return Result{Modes: modes}
-}
-
-// detachBackground runs after the synchronous Submit has timed out.
-// It consumes the eventual upstream result, logs it, and persists a
-// row in the `outbox_pending` table so the operator can audit the
-// timeout-detached send via the admin UI (the table is the v0.1
-// surface; richer retry policy lands in #23).
-func (w *worker) detachBackground(sub Submission, resultCh <-chan Result) {
-	w.inflight.Add(1)
-	go func() {
-		defer w.inflight.Done()
-		// Use a fresh background ctx so a cancelled SMTP-side ctx does
-		// not abort the upstream call we already started.
-		select {
-		case r := <-resultCh:
-			w.mgr.cfg.Logger.LogAttrs(context.Background(), slog.LevelWarn,
-				"outbox: background retry completed",
-				slog.String("event", "outbox_background_retry_done"),
-				slog.String("account_id", sub.AccountID),
-				slog.Int("recipients", len(sub.Recipients)),
-				slog.Int("body_bytes", len(sub.Body)),
-				slog.Bool("success", r.Err == nil),
-				slog.String("err", errString(r.Err)),
-			)
-			if r.Err != nil {
-				_ = w.mgr.cfg.PendingStore.RecordTimeout(context.Background(), sub, r.Err)
-			} else {
-				_ = w.mgr.cfg.PendingStore.RecordTimeoutResolved(context.Background(), sub)
-			}
-		case <-w.mgr.shutdownCh:
-			// Shutdown raced us. The upstream call is still in flight;
-			// best we can do is log that we're abandoning it. The
-			// Proton side will either complete or time out on its own
-			// HTTP deadline.
-			w.mgr.cfg.Logger.LogAttrs(context.Background(), slog.LevelWarn,
-				"outbox: background retry abandoned at shutdown",
-				slog.String("event", "outbox_background_retry_abandoned"),
-				slog.String("account_id", sub.AccountID),
-			)
-		}
-	}()
 }
 
 // logEncryptionDecision emits a structured INFO record per submission
@@ -301,15 +325,6 @@ func validateSubmission(sub Submission) error {
 	return nil
 }
 
-// errString is a nil-safe slog adapter so the "err" attribute is
-// rendered consistently whether or not the error is nil.
-func errString(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
-
 // classifyClientError categorises an error returned by
 // ProtonClientResolver.ResolveClient. A resolver that returns
 // ErrAccountClosed (e.g. account suspended after auth) is honoured
@@ -358,6 +373,19 @@ func classifySendDraftError(err error) error {
 		}
 	}
 	return &ErrProtonServer{Cause: err}
+}
+
+// panicString renders a recovered panic value into a single line for
+// the wrapped error. Strings pass through; everything else gets the
+// fmt %v form.
+func panicString(r any) string {
+	if s, ok := r.(string); ok {
+		return s
+	}
+	if e, ok := r.(error); ok {
+		return e.Error()
+	}
+	return fmt.Sprintf("%v", r)
 }
 
 // DefaultPerAccountCap is the SPEC-0004 default per-account

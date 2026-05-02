@@ -1,6 +1,6 @@
 // Worker / Manager / Submit lifecycle tests. Cover the SPEC-0004
 // scenarios: synchronous happy path, Proton failure mapping, timeout
-// + background retry, per-account concurrency cap, cross-account
+// + clean goroutine unwind, per-account concurrency cap, cross-account
 // independence.
 //
 // Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous Confirmation",
@@ -65,7 +65,10 @@ func (b *recordingBuilder) Build(_ context.Context, sub Submission, modes map[st
 	if b.sendErr != nil {
 		return BuildResult{}, b.sendErr
 	}
-	return BuildResult{}, nil
+	// Test-only Skip: do not round-trip to a real Proton SendDraft.
+	// A production Builder must return a real DraftID with Skip=false
+	// so the worker calls SendDraft.
+	return BuildResult{Skip: true}, nil
 }
 
 func (b *recordingBuilder) callCount() int {
@@ -82,15 +85,6 @@ type alwaysInternalClient struct{ fakeProtonClient }
 
 func (alwaysInternalClient) GetPublicKeys(_ context.Context, _ string) (proton.PublicKeys, proton.RecipientType, error) {
 	return proton.PublicKeys{{Flags: proton.KeyStateActive | proton.KeyStateTrusted, PublicKey: "PGP"}}, proton.RecipientTypeInternal, nil
-}
-
-// hangingClient blocks GetPublicKeys until ctx is cancelled. Used by
-// the timeout test.
-type hangingClient struct{ fakeProtonClient }
-
-func (hangingClient) GetPublicKeys(ctx context.Context, _ string) (proton.PublicKeys, proton.RecipientType, error) {
-	<-ctx.Done()
-	return nil, proton.RecipientTypeExternal, ctx.Err()
 }
 
 // rejectingClient returns a Proton-style 401 on every key lookup, used
@@ -115,7 +109,7 @@ func newTestManager(t *testing.T, cfg Config) *Manager {
 		cfg.Resolver = stubResolver{client: &alwaysInternalClient{}}
 	}
 	if cfg.Builder == nil {
-		cfg.Builder = NoopBuilder
+		cfg.Builder = noopBuilder
 	}
 	if cfg.PendingStore == nil {
 		cfg.PendingStore = DiscardPendingStore
@@ -250,12 +244,19 @@ func TestSubmit_ResolverAccountClosedPropagates(t *testing.T) {
 	}
 }
 
-// TestSubmit_TimeoutReturns451AndDetachesBackgroundRetry: a hanging
-// upstream call must fire the configured timeout, surface
-// ErrSubmissionTimedOut to the caller, and continue the upstream call
-// in the background. The PendingStore should observe a recorded
-// timeout when the background call eventually completes.
-func TestSubmit_TimeoutReturns451AndDetachesBackgroundRetry(t *testing.T) {
+// TestSubmit_TimeoutDoesNotLeakGoroutine: a hanging upstream call must
+// fire the configured timeout, surface ErrSubmissionTimedOut to the
+// caller, write an audit row to PendingStore (status=timeout_failed),
+// and let the in-flight child goroutine unwind cleanly when its hold
+// releases. There is NO Reduit-side retry — the sender's MTA retries
+// the SMTP submission per RFC 5321.
+//
+// Companion goleak coverage in TestMain catches a leaked child
+// goroutine that fails to observe the cancelled subCtx and never exits.
+//
+// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+// Confirmation" — synchronous-first, no Reduit-side retry.
+func TestSubmit_TimeoutDoesNotLeakGoroutine(t *testing.T) {
 	t.Parallel()
 	releaseHold := make(chan struct{})
 	pending := &recordingPendingStore{}
@@ -271,17 +272,22 @@ func TestSubmit_TimeoutReturns451AndDetachesBackgroundRetry(t *testing.T) {
 		t.Fatalf("expected ErrSubmissionTimedOut, got %v", res.Err)
 	}
 
-	// Background goroutine is still running. Releasing the hold
-	// causes Build to return success → PendingStore observes a
-	// resolved-after-timeout record.
-	close(releaseHold)
+	// Audit row is written best-effort, off the synchronous path. Wait
+	// briefly for it to land so the assertion is deterministic.
 	deadline := time.Now().Add(2 * time.Second)
-	for pending.resolvedCount() == 0 {
+	for pending.failedCount() == 0 {
 		if time.Now().After(deadline) {
-			t.Fatalf("PendingStore.resolved never recorded; failed=%d", pending.failedCount())
+			t.Fatalf("PendingStore.failed never recorded after timeout; resolved=%d",
+				pending.resolvedCount())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+
+	// Release the hold so the child goroutine can finish and the
+	// per-account semaphore slot is released. Without this the worker
+	// shutdown in t.Cleanup would block, and goleak (TestMain) would
+	// flag the surviving goroutine.
+	close(releaseHold)
 }
 
 // TestSubmit_PerAccountConcurrencyCap: with cap=2, four concurrent
@@ -420,6 +426,74 @@ func TestSubmit_EnvelopeValidation(t *testing.T) {
 	}
 }
 
+// TestNewRejectsNilBuilder confirms outbox.New refuses to construct a
+// Manager without a Builder. The previous "nil Builder OR NoopBuilder
+// = silent 250 OK" path was the worst failure mode the hostile review
+// flagged; the constructor's fail-loud guard is the structural fix.
+//
+// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+// Confirmation" — silent-success guard.
+func TestNewRejectsNilBuilder(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		cfg  Config
+	}{
+		{"nil-resolver", Config{
+			Builder:      noopBuilder,
+			PendingStore: DiscardPendingStore,
+		}},
+		{"nil-builder", Config{
+			Resolver:     stubResolver{client: &alwaysInternalClient{}},
+			PendingStore: DiscardPendingStore,
+		}},
+		{"nil-pending-store", Config{
+			Resolver: stubResolver{client: &alwaysInternalClient{}},
+			Builder:  noopBuilder,
+		}},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			mgr, err := New(tc.cfg)
+			if err == nil {
+				t.Fatalf("New accepted nil-required field; mgr=%v", mgr)
+			}
+		})
+	}
+}
+
+// TestWorker_BuilderEmptyDraftIDFailsLoud covers the silent-success
+// guard inside the worker: a Builder that returns BuildResult{}
+// (DraftID="" and Skip=false) is a programming error and MUST surface
+// as a hard error rather than short-circuit to a fake 250 OK.
+// Implemented as a panic-and-recover so the worker goroutine cannot
+// crash the process; the recovered panic is mapped to *ErrProtonReject
+// (SMTP 550) so the sender does not retry the misconfigured wiring.
+//
+// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+// Confirmation" — fail loud at the worker boundary.
+func TestWorker_BuilderEmptyDraftIDFailsLoud(t *testing.T) {
+	t.Parallel()
+	badBuilder := BuilderFunc(func(_ context.Context, _ Submission, _ map[string]EncryptionMode, _ proton.Client) (BuildResult, error) {
+		return BuildResult{}, nil // empty DraftID, Skip=false → footgun
+	})
+	mgr := newTestManager(t, Config{
+		Resolver: stubResolver{client: &alwaysInternalClient{}},
+		Builder:  badBuilder,
+	})
+
+	res := mgr.Submit(context.Background(), happyPathSubmission())
+	if res.Err == nil {
+		t.Fatal("Submit returned nil error for empty-DraftID Builder; expected fail-loud")
+	}
+	var reject *ErrProtonReject
+	if !errors.As(res.Err, &reject) {
+		t.Fatalf("expected *ErrProtonReject, got %T: %v", res.Err, res.Err)
+	}
+}
+
 // TestManagerShutdown blocks Submit calls after Shutdown.
 func TestManagerShutdown(t *testing.T) {
 	t.Parallel()
@@ -435,37 +509,56 @@ func TestManagerShutdown(t *testing.T) {
 	}
 }
 
-// TestSubmit_ContextHangIsBoundedByTimeout: a hangingClient (which
-// blocks GetPublicKeys until its ctx is cancelled) MUST cause Submit
-// to return within ~SubmitTimeout, not block forever. This is the
-// "submission timed out" SLA.
+// TestSubmit_ContextHangIsBoundedByTimeout: an upstream call that
+// hangs through the deadline MUST cause Submit to return within a
+// strict multiple of SubmitTimeout, not block forever. Bounded means:
+// elapsed < 4×SubmitTimeout (generous slack for scheduling on a busy
+// CI runner; the median is ~1×).
+//
+// The error MUST be ErrSubmissionTimedOut specifically: the SMTP
+// mapping for 451 4.4.7 (timeout) is different from 451 4.4.4
+// (key-lookup), and a sender's MTA may track these distinctly. Per
+// the hostile reviewer (concern 10), the "fail-closed in time" SLA
+// dictates the kind of failure as well as the latency.
+//
+// We hang the Builder (not the key lookup) so the run goroutine is
+// blocked past key-lookup when subCtx fires; that way the parent
+// select on subCtx.Done() deterministically wins the race against
+// resultCh and produces ErrSubmissionTimedOut, not *ErrKeyLookup.
 func TestSubmit_ContextHangIsBoundedByTimeout(t *testing.T) {
 	t.Parallel()
+	const timeout = 100 * time.Millisecond
+	releaseHold := make(chan struct{})
 	mgr := newTestManager(t, Config{
-		Resolver:      stubResolver{client: &hangingClient{}},
-		SubmitTimeout: 100 * time.Millisecond,
+		Resolver:      stubResolver{client: &alwaysInternalClient{}},
+		Builder:       &recordingBuilder{hold: releaseHold},
+		SubmitTimeout: timeout,
 	})
+	t.Cleanup(func() { close(releaseHold) })
 
 	start := time.Now()
 	res := mgr.Submit(context.Background(), happyPathSubmission())
 	elapsed := time.Since(start)
 
-	if elapsed > 1*time.Second {
-		t.Errorf("Submit took %v, want < 1s (timeout=100ms)", elapsed)
+	// Quantitative bound: 4× the configured SubmitTimeout. The
+	// synchronous path returns at ~1× timeout; the 4× margin tolerates
+	// scheduler jitter on a -race runner.
+	if max := 4 * timeout; elapsed > max {
+		t.Errorf("Submit took %v, want < %v (timeout=%v)", elapsed, max, timeout)
 	}
-	// Either the submission timed out (preferred) or the context-
-	// cancel from SelectMode bubbled up as *ErrKeyLookup. Both are
-	// "fail-closed in time" outcomes; assert one of them.
+	// Tighter than "any of two errors": the 451 4.4.7 mapping requires
+	// the ErrSubmissionTimedOut sentinel specifically. *ErrKeyLookup
+	// from a SelectMode-side ctx-cancel would map to 451 4.4.4 and
+	// mislead the sender.
 	if !errors.Is(res.Err, ErrSubmissionTimedOut) {
-		var keyErr *ErrKeyLookup
-		if !errors.As(res.Err, &keyErr) {
-			t.Errorf("err = %v, want ErrSubmissionTimedOut or *ErrKeyLookup", res.Err)
-		}
+		t.Errorf("err = %v, want ErrSubmissionTimedOut", res.Err)
 	}
 }
 
-// recordingPendingStore keeps a count of every Record* call so the
-// timeout test can wait for the background retry's outcome to land.
+// recordingPendingStore counts RecordTimeout calls so the timeout test
+// can wait for the audit row to land. The `resolved` counter is kept
+// (always zero now) so a future regression that resurrects the
+// background-retry path would surface as a non-zero resolved count.
 type recordingPendingStore struct {
 	mu       sync.Mutex
 	failed   int
@@ -475,13 +568,6 @@ type recordingPendingStore struct {
 func (r *recordingPendingStore) RecordTimeout(_ context.Context, _ Submission, _ error) error {
 	r.mu.Lock()
 	r.failed++
-	r.mu.Unlock()
-	return nil
-}
-
-func (r *recordingPendingStore) RecordTimeoutResolved(_ context.Context, _ Submission) error {
-	r.mu.Lock()
-	r.resolved++
 	r.mu.Unlock()
 	return nil
 }
@@ -520,7 +606,7 @@ func (b *concurrencyBuilder) Build(_ context.Context, _ Submission, _ map[string
 		}
 	}
 	<-b.hold
-	return BuildResult{}, nil
+	return BuildResult{Skip: true}, nil
 }
 
 func (b *concurrencyBuilder) inflightPeak() int {

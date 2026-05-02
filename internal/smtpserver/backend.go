@@ -52,8 +52,9 @@ type Backend struct {
 
 	// submitTimeout caps the synchronous outbox.Submit call. Mirrors
 	// the upstream SMTP write timeout — when it fires, the SMTP
-	// response is `451 4.4.7` and the outbox detaches the in-flight
-	// upstream call onto a background retry goroutine.
+	// response is `451 4.4.7 Submission timed out`. Recovery is the
+	// sender's MTA re-attempting the SMTP submission per RFC 5321;
+	// Reduit does NOT run a server-side retry loop.
 	//
 	// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
 	// Confirmation" — submission timeout is what bounds DATA latency.
@@ -91,11 +92,12 @@ const bcryptDummyCost = 12
 // NewBackend constructs a Backend. logger may be nil; the default
 // slog logger is used in that case. The Sessions registry is REQUIRED
 // — it is the public hook the suspension code path calls to drop
-// sessions for a freshly-suspended account. The outbox submitter is
-// optional at construction time so existing tests for auth / MAIL
-// FROM / RCPT TO continue to compile; a nil submitter wired into
-// session.Data falls back to the legacy stub that just discards the
-// body. Production callers MUST supply a non-nil submitter.
+// sessions for a freshly-suspended account. The OutboxSubmitter is
+// REQUIRED — a nil submitter previously fell through to a "log + 250
+// OK" stub which composes with NoopBuilder into a silent-success path
+// (the worst failure mode). Tests that exercise auth / MAIL FROM /
+// RCPT TO without a real Proton must wire a stub OutboxSubmitter
+// instead.
 //
 // Governing: SPEC-0004 REQ "Per-Session Authentication Lifetime",
 // SPEC-0004 REQ "Outbox Handoff and Synchronous Confirmation".
@@ -105,6 +107,14 @@ func NewBackend(accounts AccountLookup, sessions *Sessions, ob OutboxSubmitter, 
 	}
 	if sessions == nil {
 		return nil, errors.New("smtpserver: sessions registry is required")
+	}
+	if ob == nil {
+		// Fail-loud: a nil OutboxSubmitter wired into the DATA handler
+		// previously returned 250 OK with no message ever sent.
+		// Production wiring MUST supply a real submitter; tests MUST
+		// stub one. The constructor refuses to build a Backend that
+		// would silently fake a successful send.
+		return nil, errors.New("smtpserver: OutboxSubmitter is required (silent-success guard)")
 	}
 	if logger == nil {
 		logger = slog.Default()

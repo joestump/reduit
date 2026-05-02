@@ -1,8 +1,9 @@
-// PendingStore persists rows for submissions whose synchronous
-// timeout fired but whose background retry continued. The table gives
-// the operator a single place to audit timeout-detached sends from the
-// admin UI; richer retry policy (exponential backoff, dead-letter)
-// lands in #23.
+// PendingStore persists best-effort audit rows for submissions whose
+// synchronous timeout fired (Reduit returned 451 4.4.7 to the SMTP
+// client). The table gives the operator a single place to audit
+// timed-out sends from the admin UI. Reduit does NOT run a server-side
+// retry loop after a timeout — recovery is the sender's MTA re-
+// attempting the SMTP submission per RFC 5321.
 //
 // Two implementations:
 //
@@ -27,21 +28,21 @@ import (
 )
 
 // PendingStore is the persistence interface the worker uses to record
-// a timeout-detached submission. Methods are nil-safe: the
+// a timeout-abandoned submission. Methods are nil-safe: the
 // implementation is expected to swallow context-cancelled errors so
 // shutdown does not pollute logs.
+//
+// As of the Blocker-2 fix in this story, Reduit does NOT run a
+// Reduit-side retry loop after a synchronous timeout. The sender's MTA
+// retries the SMTP submission per RFC 5321; this table is purely an
+// operator-visible audit trail of "Reduit returned 451 to the client
+// because the upstream call did not complete in time".
 type PendingStore interface {
 	// RecordTimeout writes a row indicating the synchronous send
-	// returned 451 to the SMTP client and the upstream call eventually
-	// failed (cause).
+	// returned 451 to the SMTP client because the configured
+	// SubmitTimeout elapsed before the upstream call returned. cause
+	// is the timeout error (typically ErrSubmissionTimedOut).
 	RecordTimeout(ctx context.Context, sub Submission, cause error) error
-
-	// RecordTimeoutResolved writes a row indicating the synchronous
-	// send returned 451 to the SMTP client BUT the upstream call
-	// eventually succeeded. The operator's audit needs to distinguish
-	// "client thinks it failed, message was actually sent" from
-	// "client thinks it failed and we retried".
-	RecordTimeoutResolved(ctx context.Context, sub Submission) error
 }
 
 // DiscardPendingStore is a PendingStore that drops every record.
@@ -51,10 +52,6 @@ var DiscardPendingStore PendingStore = discardPendingStore{}
 type discardPendingStore struct{}
 
 func (discardPendingStore) RecordTimeout(_ context.Context, _ Submission, _ error) error {
-	return nil
-}
-
-func (discardPendingStore) RecordTimeoutResolved(_ context.Context, _ Submission) error {
 	return nil
 }
 
@@ -71,7 +68,9 @@ func NewSQLitePendingStore(db *sqlx.DB) *SQLitePendingStore {
 	return &SQLitePendingStore{DB: db}
 }
 
-// RecordTimeout writes a row with status=timeout_failed.
+// RecordTimeout writes a row with status=timeout_failed for an
+// audit-visible record of "Reduit returned 451 4.4.7 to the SMTP
+// client because the upstream call did not complete in time".
 func (s *SQLitePendingStore) RecordTimeout(ctx context.Context, sub Submission, cause error) error {
 	if s == nil || s.DB == nil {
 		return errors.New("outbox: SQLitePendingStore not initialised")
@@ -80,34 +79,16 @@ func (s *SQLitePendingStore) RecordTimeout(ctx context.Context, sub Submission, 
 	if err != nil {
 		return err
 	}
+	reason := ""
+	if cause != nil {
+		reason = cause.Error()
+	}
 	_, err = s.DB.ExecContext(ctx, `
 		INSERT INTO outbox_pending(id, account_id, mail_from, recipient_count, body_bytes, status, failure_reason, created_at)
 		VALUES (?, ?, ?, ?, ?, 'timeout_failed', ?, ?)
 	`,
 		id.String(), sub.AccountID, sub.MailFrom, len(sub.Recipients), len(sub.Body),
-		errString(cause), time.Now().UTC(),
-	)
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, sql.ErrConnDone) {
-		return err
-	}
-	return nil
-}
-
-// RecordTimeoutResolved writes a row with status=timeout_resolved.
-func (s *SQLitePendingStore) RecordTimeoutResolved(ctx context.Context, sub Submission) error {
-	if s == nil || s.DB == nil {
-		return errors.New("outbox: SQLitePendingStore not initialised")
-	}
-	id, err := uuid.NewV7()
-	if err != nil {
-		return err
-	}
-	_, err = s.DB.ExecContext(ctx, `
-		INSERT INTO outbox_pending(id, account_id, mail_from, recipient_count, body_bytes, status, failure_reason, created_at)
-		VALUES (?, ?, ?, ?, ?, 'timeout_resolved', NULL, ?)
-	`,
-		id.String(), sub.AccountID, sub.MailFrom, len(sub.Recipients), len(sub.Body),
-		time.Now().UTC(),
+		reason, time.Now().UTC(),
 	)
 	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, sql.ErrConnDone) {
 		return err

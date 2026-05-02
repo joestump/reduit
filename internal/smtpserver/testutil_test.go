@@ -199,6 +199,12 @@ func (s *testServer) disableRateLimit() {
 // startTestServer constructs a Backend wired to the supplied stub,
 // binds the listener on 127.0.0.1:0, and returns once the server is
 // accepting connections.
+//
+// A default no-op stubOutbox is wired in so tests that exercise auth /
+// MAIL FROM / RCPT TO without a real outbox still build a Backend
+// (NewBackend now refuses nil OutboxSubmitter as a silent-success
+// guard). Tests that need to assert on outbox interactions pass their
+// own via the opts func.
 func startTestServer(t *testing.T, accounts AccountLookup, sessions *Sessions, opts ...func(*Config)) *testServer {
 	t.Helper()
 	cert := generateTestCert(t)
@@ -210,6 +216,7 @@ func startTestServer(t *testing.T, accounts AccountLookup, sessions *Sessions, o
 		Accounts: accounts,
 		Sessions: sessions,
 		Logger:   logger,
+		Outbox:   &stubOutbox{},
 		GetCertificate: func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return &cert, nil
 		},

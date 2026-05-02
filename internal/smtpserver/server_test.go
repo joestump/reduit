@@ -159,7 +159,7 @@ func TestSASLPlainAuthFailuresAreIdentical(t *testing.T) {
 func TestNonPlainSASLRecordsRateLimitFailure(t *testing.T) {
 	t.Parallel()
 	stub := newStubAccounts()
-	backend, err := NewBackend(stub, NewSessions(), nil, nil)
+	backend, err := NewBackend(stub, NewSessions(), &stubOutbox{}, nil)
 	if err != nil {
 		t.Fatalf("NewBackend: %v", err)
 	}

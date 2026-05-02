@@ -92,8 +92,10 @@ func (m EncryptionMode) String() string {
 
 // ErrSubmissionTimedOut is returned by Submit when the configured
 // submission deadline elapses before the upstream Proton call returns.
-// The SMTP server maps this to `451 4.4.7`; the outbox detaches the
-// in-flight call onto a background retry goroutine.
+// The SMTP server maps this to `451 4.4.7`. Reduit does NOT run a
+// server-side retry loop after a timeout — the sender's MTA re-
+// attempting the SMTP submission per RFC 5321 is the canonical
+// recovery path.
 var ErrSubmissionTimedOut = errors.New("outbox: submission timed out")
 
 // ErrAccountClosed is returned when Submit is called for an account
