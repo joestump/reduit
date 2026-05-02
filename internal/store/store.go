@@ -41,9 +41,20 @@ import (
 // migrateMu serialises calls to goose.Up within a process. Goose's
 // package-level globals (SetBaseFS, SetDialect, SetTableName) are not
 // concurrency-safe, so two parallel callers of Migrate can race on
-// them even though their target databases are independent. Production
-// only ever migrates once at startup; this lock is essentially
-// test-infrastructure that costs nothing on the production path.
+// them even though their target databases are independent.
+//
+// Scope: process-local only. This lock is sufficient for the v0.x
+// single-process Reduit deployment described in ADR-0006 ("the relay
+// is single-host", "single-file deployment") and for parallel `go
+// test` runs that open many fresh stores. It does NOT generalise to
+// a multi-replica deployment: two Reduit processes pointed at the
+// same SQLite file calling goose.Up concurrently still race on
+// `goose_db_version` at the database level — one will hit a UNIQUE
+// constraint violation and the migration will fail. A future
+// multi-replica deployment MUST coordinate via a database-level
+// advisory lock (e.g. `BEGIN IMMEDIATE; SELECT version_id FROM
+// goose_db_version`); tracked separately so a single-host operator
+// is not paying that complexity today.
 var migrateMu sync.Mutex
 
 //go:embed all:migrations/*.sql
