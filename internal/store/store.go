@@ -30,12 +30,21 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"sync"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/pressly/goose/v3"
 
 	_ "modernc.org/sqlite" // sqlite driver, pure-Go, no CGO
 )
+
+// migrateMu serialises calls to goose.Up within a process. Goose's
+// package-level globals (SetBaseFS, SetDialect, SetTableName) are not
+// concurrency-safe, so two parallel callers of Migrate can race on
+// them even though their target databases are independent. Production
+// only ever migrates once at startup; this lock is essentially
+// test-infrastructure that costs nothing on the production path.
+var migrateMu sync.Mutex
 
 //go:embed all:migrations/*.sql
 var embeddedMigrations embed.FS
@@ -149,6 +158,8 @@ func (s *Store) Migrate(dirOverride string) error {
 	if s == nil || s.DB == nil {
 		return errors.New("store: not open")
 	}
+	migrateMu.Lock()
+	defer migrateMu.Unlock()
 	goose.SetBaseFS(nil)
 	goose.SetTableName("goose_db_version")
 	if err := goose.SetDialect("sqlite3"); err != nil {
