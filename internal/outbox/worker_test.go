@@ -11,6 +11,7 @@ package outbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -160,15 +161,19 @@ func TestSubmit_HappyPath(t *testing.T) {
 	}
 }
 
-// TestSubmit_ProtonAuthFailureMapsTo535: Proton returns 401 from
+// TestSubmit_ProtonKeyLookupErrorPropagates: Proton returns 401 from
 // /core/v4/keys (simulating revoked refresh token). The selector
 // fails closed with *ErrKeyLookup, but its CAUSE is a *proton.APIError
 // whose Status=401. The session-side mapper handles auth-vs-key
 // distinction; here we only verify the outbox surfaces the underlying
 // *proton.APIError.
+//
+// The rejecting client wraps a *proton.APIError via fmt.Errorf("%w")
+// — exactly the way upstream go-proton-api wraps. The errors.As target
+// is *proton.APIError (pointer); see B1 in the hostile review.
 func TestSubmit_ProtonKeyLookupErrorPropagates(t *testing.T) {
 	t.Parallel()
-	upstreamErr := proton.APIError{Status: 401, Message: "Refresh token revoked"}
+	upstreamErr := fmt.Errorf("upstream: %w", &proton.APIError{Status: 401, Message: "Refresh token revoked"})
 	mgr := newTestManager(t, Config{
 		Resolver: stubResolver{client: &rejectingClient{err: upstreamErr}},
 	})
@@ -181,12 +186,110 @@ func TestSubmit_ProtonKeyLookupErrorPropagates(t *testing.T) {
 	if !errors.As(res.Err, &keyErr) {
 		t.Fatalf("expected *ErrKeyLookup, got %T: %v", res.Err, res.Err)
 	}
-	var apiErr proton.APIError
-	if !errors.As(res.Err, &apiErr) {
-		t.Fatalf("expected proton.APIError in chain, got %v", res.Err)
+	var apiErr *proton.APIError
+	if !errors.As(res.Err, &apiErr) || apiErr == nil {
+		t.Fatalf("expected *proton.APIError in chain, got %v", res.Err)
 	}
 	if apiErr.Status != 401 {
 		t.Errorf("APIError.Status = %d, want 401", apiErr.Status)
+	}
+}
+
+// TestClassifySendDraftError_WrappedPointerAPIError covers the B1
+// regression: go-proton-api returns *APIError (pointer) wrapped via
+// fmt.Errorf("%w"), so classifySendDraftError MUST target *APIError —
+// not APIError value — or every documented status falls through to
+// *ErrProtonServer (451) and the SMTP code mapping the PR body
+// advertises is silently broken on the wire.
+//
+// Each case wraps a *proton.APIError exactly the way the upstream
+// library does and asserts the typed Reduit error (and therefore the
+// SMTP code mapping at the session layer) is correct.
+//
+// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+// Confirmation" — error code mapping must reflect Proton's wire status,
+// not collapse to a generic 451.
+func TestClassifySendDraftError_WrappedPointerAPIError(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name        string
+		status      int
+		message     string
+		wantTyped   func(error) bool
+		wantSMTPHi  int // hundreds digit of the SMTP code (5/4)
+		wantSMTPLow int // last two digits (35/21/50/51 etc.)
+	}{
+		{
+			name:    "401-revoked-token-535",
+			status:  401,
+			message: "Refresh token revoked",
+			wantTyped: func(err error) bool {
+				var auth *ErrProtonAuth
+				return errors.As(err, &auth)
+			},
+			wantSMTPHi:  535,
+			wantSMTPLow: 0,
+		},
+		{
+			name:    "403-forbidden-535",
+			status:  403,
+			message: "Forbidden",
+			wantTyped: func(err error) bool {
+				var auth *ErrProtonAuth
+				return errors.As(err, &auth)
+			},
+			wantSMTPHi:  535,
+			wantSMTPLow: 0,
+		},
+		{
+			name:    "429-rate-limit-421",
+			status:  429,
+			message: "Too many requests",
+			wantTyped: func(err error) bool {
+				var rate *ErrProtonRateLimit
+				return errors.As(err, &rate)
+			},
+			wantSMTPHi:  421,
+			wantSMTPLow: 0,
+		},
+		{
+			name:    "422-permanent-reject-550",
+			status:  422,
+			message: "Recipient invalid",
+			wantTyped: func(err error) bool {
+				var rej *ErrProtonReject
+				return errors.As(err, &rej)
+			},
+			wantSMTPHi:  550,
+			wantSMTPLow: 0,
+		},
+		{
+			name:    "502-server-error-451",
+			status:  502,
+			message: "Bad gateway",
+			wantTyped: func(err error) bool {
+				var srv *ErrProtonServer
+				return errors.As(err, &srv)
+			},
+			wantSMTPHi:  451,
+			wantSMTPLow: 0,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// Wrap exactly as go-proton-api does: a *APIError pointer
+			// inside a fmt.Errorf("%w") chain (see upstream
+			// response.go around line 110). A value-typed errors.As
+			// target on this chain silently misses, falling through
+			// to *ErrProtonServer.
+			upstream := fmt.Errorf("upstream: %w", &proton.APIError{Status: tc.status, Message: tc.message})
+			classified := classifySendDraftError(upstream)
+			if !tc.wantTyped(classified) {
+				t.Fatalf("classifySendDraftError(%d) = %T %v; expected typed match", tc.status, classified, classified)
+			}
+		})
 	}
 }
 

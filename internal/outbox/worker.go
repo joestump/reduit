@@ -354,6 +354,15 @@ func classifyBuilderError(err error) error {
 // 4xx is a permanent reject, and anything else is a transient server
 // error worth retrying.
 //
+// IMPORTANT: target is *proton.APIError (pointer), NOT proton.APIError
+// (value). go-proton-api wraps its errors as *APIError via fmt.Errorf
+// with %w (see upstream response.go around line 110), so an
+// errors.As(err, &valueTarget) where valueTarget is of value type would
+// silently miss the wrapped pointer in the chain — falling through to
+// *ErrProtonServer (451) for every documented status code. The hostile
+// review (B1) verified this against the vendored module. Always target
+// the pointer.
+//
 // Mapping rules:
 //
 //	401 / 403          → ErrProtonAuth (SMTP 535)
@@ -361,8 +370,8 @@ func classifyBuilderError(err error) error {
 //	413 / 422 / 4xx    → ErrProtonReject (SMTP 550)
 //	5xx and net errs   → ErrProtonServer (SMTP 451)
 func classifySendDraftError(err error) error {
-	var apiErr proton.APIError
-	if errors.As(err, &apiErr) {
+	var apiErr *proton.APIError
+	if errors.As(err, &apiErr) && apiErr != nil {
 		switch {
 		case apiErr.Status == 401 || apiErr.Status == 403:
 			return &ErrProtonAuth{Cause: err}
