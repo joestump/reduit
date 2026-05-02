@@ -21,8 +21,18 @@ import (
 // Source distinguishes the two valid bearer types — OIDC ID tokens
 // and Reduit-issued per-user MCP tokens — so handlers can log the
 // authentication mechanism without needing to re-classify.
+//
+// Subject is the OIDC `sub` of the underlying account, regardless of
+// the bearer mechanism. For PrincipalSourceOIDC it is read from the
+// validated ID token's `sub` claim. For PrincipalSourceMCPToken it
+// is resolved from `accounts.oidc_subject` via the
+// SubjectResolver callback supplied to NewBearerValidator. If the
+// resolver is nil, or returns an error, the field is left empty —
+// downstream handlers MUST therefore treat Subject as best-effort
+// audit metadata, not as a primary identity key. The primary
+// identity key for MCP-token bearers is AccountID.
 type Principal struct {
-	Subject    string // the OIDC sub, regardless of source
+	Subject    string // OIDC sub when known; empty when SubjectResolver is nil or fails
 	AccountID  string // empty for OIDC tokens; account resolution is the caller's job
 	Email      string
 	Source     PrincipalSource
@@ -80,6 +90,21 @@ func WithPrincipal(ctx context.Context, p *Principal) context.Context {
 type BearerValidator struct {
 	OIDC      *oidc.Client
 	MCPTokens *mcptoken.Repository
+	// SubjectResolver returns the OIDC `sub` for the given internal
+	// account ID. Used to populate Principal.Subject for MCP-token
+	// bearers so downstream handlers and audit logs see a consistent
+	// "authenticated as <sub>" identity regardless of the bearer
+	// mechanism. May be nil — when nil, MCP-token Principals carry an
+	// empty Subject and callers MUST fall back to AccountID for
+	// identity. Errors from the resolver are swallowed (not surfaced to
+	// the caller) because Subject is audit metadata, not an authz key
+	// — a transient DB hiccup MUST NOT 401 a request whose token is
+	// otherwise valid.
+	//
+	// Governing: SPEC-0006 REQ "Bearer Authentication Required" — the
+	// spec binds requests to the *account*; Subject is a convenience
+	// for log correlation across the two bearer types.
+	SubjectResolver func(ctx context.Context, accountID string) (string, error)
 	// Now defaults to time.Now; tests override.
 	Now func() time.Time
 }
@@ -88,8 +113,22 @@ type BearerValidator struct {
 // may be nil — a nil OIDC client makes JWT bearers fail; a nil MCP
 // repository makes MCP-token bearers fail. At least one MUST be set or
 // every request 401s.
+//
+// SubjectResolver is left unset by this constructor; wiring code (the
+// serve command) injects it after constructing the account.Service so
+// the auth package keeps a one-way dependency on account/. See
+// WithSubjectResolver.
 func NewBearerValidator(c *oidc.Client, repo *mcptoken.Repository) *BearerValidator {
 	return &BearerValidator{OIDC: c, MCPTokens: repo, Now: time.Now}
+}
+
+// WithSubjectResolver attaches the account-id-to-OIDC-sub resolver to
+// v and returns v for chaining. Calling this is OPTIONAL — without it,
+// Principal.Subject is empty for MCP-token bearers (still a valid
+// state per the field's docstring).
+func (v *BearerValidator) WithSubjectResolver(fn func(ctx context.Context, accountID string) (string, error)) *BearerValidator {
+	v.SubjectResolver = fn
+	return v
 }
 
 // Errors returned by Validate.
@@ -165,7 +204,17 @@ func (v *BearerValidator) validateMCPToken(ctx context.Context, bearer string) (
 	}
 	// MarkUsed best-effort; failures here MUST NOT 401 the caller.
 	_ = v.MCPTokens.MarkUsed(ctx, tok.ID)
+	// Best-effort Subject resolution: a nil resolver or a transient
+	// error leaves Subject empty, but neither failure mode 401s the
+	// request — Subject is audit metadata, AccountID is the authz key.
+	var sub string
+	if v.SubjectResolver != nil {
+		if resolved, rerr := v.SubjectResolver(ctx, tok.AccountID); rerr == nil {
+			sub = resolved
+		}
+	}
 	return &Principal{
+		Subject:    sub,
 		AccountID:  tok.AccountID,
 		Source:     PrincipalSourceMCPToken,
 		MCPTokenID: tok.ID,

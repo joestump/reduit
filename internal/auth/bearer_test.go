@@ -162,6 +162,72 @@ func TestBearerValidator_MCPToken_Valid(t *testing.T) {
 	}
 }
 
+// TestBearerValidator_MCPToken_SubjectResolver covers C3 from the
+// round-1 hostile review: Principal.Subject MUST be populated for
+// MCP-token bearers when a SubjectResolver is wired (it's the
+// account's OIDC sub), and MUST stay empty when none is wired (a
+// downstream consumer that branches on Subject != "" needs that
+// signal to be deterministic).
+//
+// Governing: SPEC-0006 REQ "Bearer Authentication Required".
+func TestBearerValidator_MCPToken_SubjectResolver(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	defer st.Close()
+	insertAccount(t, st, "acct-resolved")
+	repo := mcptoken.NewRepository(st.DB)
+
+	ctx := context.Background()
+	tok, err := repo.Issue(ctx, mcptoken.IssueParams{AccountID: "acct-resolved"})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	// Without a resolver: Subject is empty (documented contract).
+	v := auth.NewBearerValidator(nil, repo)
+	p, err := v.Validate(ctx, tok.Plaintext)
+	if err != nil {
+		t.Fatalf("Validate (no resolver): %v", err)
+	}
+	if p.Subject != "" {
+		t.Errorf("Subject = %q, want empty (no resolver wired)", p.Subject)
+	}
+	if p.AccountID != "acct-resolved" {
+		t.Errorf("AccountID = %q, want %q", p.AccountID, "acct-resolved")
+	}
+
+	// With a resolver: Subject reflects the account's OIDC sub.
+	v.WithSubjectResolver(func(ctx context.Context, accountID string) (string, error) {
+		if accountID != "acct-resolved" {
+			t.Errorf("resolver called with accountID=%q, want %q", accountID, "acct-resolved")
+		}
+		return "oidc-sub-9", nil
+	})
+	p, err = v.Validate(ctx, tok.Plaintext)
+	if err != nil {
+		t.Fatalf("Validate (with resolver): %v", err)
+	}
+	if p.Subject != "oidc-sub-9" {
+		t.Errorf("Subject = %q, want oidc-sub-9", p.Subject)
+	}
+
+	// Resolver error: Subject silently empty, request still authorises
+	// (Subject is audit metadata, not an authz key).
+	v.WithSubjectResolver(func(ctx context.Context, accountID string) (string, error) {
+		return "", errors.New("transient db error")
+	})
+	p, err = v.Validate(ctx, tok.Plaintext)
+	if err != nil {
+		t.Fatalf("Validate (resolver error): %v", err)
+	}
+	if p.Subject != "" {
+		t.Errorf("Subject = %q on resolver error, want empty", p.Subject)
+	}
+	if p.AccountID != "acct-resolved" {
+		t.Errorf("AccountID dropped on resolver error: %q", p.AccountID)
+	}
+}
+
 // TestBearerValidator_MCPToken_Revoked covers issue #13 acceptance:
 // "revoked MCP token returns 401 within 1s of revocation". We exercise
 // the validator end-to-end via RequireBearer to prove the 401 reaches
