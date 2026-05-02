@@ -16,6 +16,10 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/alexedwards/scs/v2"
+
+	"github.com/joestump/reduit/internal/auth"
+	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	"github.com/joestump/reduit/internal/store"
 )
 
@@ -26,6 +30,20 @@ type Deps struct {
 	GetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	Logger         *slog.Logger
 	Version        string // for /healthz response body
+	// SessionManager is the SCS-backed session store. Optional in v0.1
+	// (the only routes are health probes), but the gate middleware is
+	// wired so the moment a protected route is added it Just Works.
+	//
+	// Governing: ADR-0004, SPEC-0005 REQ "Authentication Gating".
+	SessionManager *scs.SessionManager
+	// OIDC is the configured Relying Party. Reserved for issue #23 —
+	// the login/callback handlers call into it. Server v0.1 holds the
+	// reference so a startup-time misconfiguration surfaces here, not
+	// on the first user click.
+	OIDC *authoidc.Client
+	// PreSessions is the in-memory store for PKCE pre-sessions, used
+	// by the future #23 callback handler.
+	PreSessions *authoidc.PreSessionStore
 }
 
 // Server holds an http.Server pre-configured with TLS and the
@@ -51,13 +69,35 @@ func New(addr string, deps Deps) *Server {
 	}
 	s.routes(mux)
 
+	// The handler chain is:
+	//
+	//   ServeMux
+	//     ↓
+	//   auth.RequireSession (302→/auth/login on miss; allowlist passes)
+	//     ↓
+	//   scs.LoadAndSave (loads/saves the cookie-bound session row)
+	//
+	// LoadAndSave wraps the OUTERMOST so RequireSession can read the
+	// session via scs.GetString from the request context. We compose
+	// in the order applied (the last call is the outermost wrapper).
+	//
+	// Governing: SPEC-0005 REQ "Authentication Gating".
+	var handler http.Handler = mux
+	if deps.SessionManager != nil {
+		handler = auth.RequireSession(auth.SessionGate{
+			Manager:   deps.SessionManager,
+			LoginPath: "/auth/login",
+		}, handler)
+		handler = deps.SessionManager.LoadAndSave(handler)
+	}
+
 	tlsCfg := &tls.Config{
 		GetCertificate: deps.GetCertificate,
 		MinVersion:     tls.VersionTLS12,
 	}
 	s.srv = &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           handler,
 		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,

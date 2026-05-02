@@ -14,6 +14,9 @@ toolchain go1.26.2
 require (
 	github.com/ProtonMail/go-proton-api v0.4.1-0.20260424150947-6bf7f5a61eb8
 	github.com/ProtonMail/gopenpgp/v2 v2.10.0-proton
+	github.com/alexedwards/scs/sqlite3store v0.0.0-20251002162104-209de6e426de
+	github.com/alexedwards/scs/v2 v2.9.0
+	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/emersion/go-smtp v0.24.0
@@ -26,6 +29,7 @@ require (
 	github.com/spf13/viper v1.21.0
 	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.50.0
+	golang.org/x/oauth2 v0.36.0
 	modernc.org/sqlite v1.50.0
 )
 
@@ -43,6 +47,7 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/emersion/go-message v0.18.2 // indirect
 	github.com/emersion/go-vcard v0.0.0-20230331202150-f3d26859ccd3 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mattn/go-isatty v0.0.21 // indirect

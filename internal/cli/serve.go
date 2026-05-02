@@ -12,6 +12,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	authoidc "github.com/joestump/reduit/internal/auth/oidc"
+	authsession "github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/cryptenv"
 	"github.com/joestump/reduit/internal/server"
 	"github.com/joestump/reduit/internal/store"
@@ -86,12 +88,56 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		}
 	}()
 
+	// Session manager — backed by the same SQLite handle as the rest
+	// of the store. The migration created the `sessions` table; the
+	// scs sweep goroutine owns expiry cleanup.
+	//
+	// Governing: ADR-0004 (OIDC sessions in SCS over SQLite),
+	// SPEC-0005 REQ "Authentication Gating".
+	scsMgr, sessionCleanup, err := authsession.New(st.DB.DB, authsession.Options{})
+	if err != nil {
+		return fmt.Errorf("session manager: %w", err)
+	}
+	defer sessionCleanup()
+	logger.Info("session manager ready",
+		slog.String("cookie", authsession.CookieName))
+
+	// OIDC client — only constructed when the HTTP listener is active.
+	// config.Validate already enforces issuer/client/redirect presence
+	// when http_addr is set, so a nil OIDC.Client here means "no HTTP
+	// server", not "misconfiguration".
+	//
+	// Governing: ADR-0004 (OIDC), SPEC-0005 REQ "OIDC Login Flow".
+	var (
+		oidcClient  *authoidc.Client
+		preSessions *authoidc.PreSessionStore
+	)
+	if cfg.Server.HTTPAddr != "" {
+		oidcClient, err = authoidc.New(ctx, authoidc.Config{
+			IssuerURL:    cfg.OIDC.IssuerURL,
+			ClientID:     cfg.OIDC.ClientID,
+			ClientSecret: cfg.OIDC.ClientSecret,
+			RedirectURL:  cfg.OIDC.RedirectURL,
+			Scopes:       cfg.OIDC.Scopes,
+		})
+		if err != nil {
+			return fmt.Errorf("oidc client: %w", err)
+		}
+		logger.Info("oidc client ready",
+			slog.String("issuer", cfg.OIDC.IssuerURL),
+			slog.String("client_id", cfg.OIDC.ClientID))
+		preSessions = authoidc.NewPreSessionStore(authoidc.DefaultPreSessionTTL)
+	}
+
 	// HTTP server.
 	srv := server.New(cfg.Server.HTTPAddr, server.Deps{
 		Store:          st,
 		GetCertificate: loader.GetCertificate,
 		Logger:         logger,
 		Version:        Version,
+		SessionManager: scsMgr,
+		OIDC:           oidcClient,
+		PreSessions:    preSessions,
 	})
 
 	errCh := make(chan error, 1)

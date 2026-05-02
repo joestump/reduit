@@ -30,12 +30,32 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"sync"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/pressly/goose/v3"
 
 	_ "modernc.org/sqlite" // sqlite driver, pure-Go, no CGO
 )
+
+// migrateMu serialises calls to goose.Up within a process. Goose's
+// package-level globals (SetBaseFS, SetDialect, SetTableName) are not
+// concurrency-safe, so two parallel callers of Migrate can race on
+// them even though their target databases are independent.
+//
+// Scope: process-local only. This lock is sufficient for the v0.x
+// single-process Reduit deployment described in ADR-0006 ("the relay
+// is single-host", "single-file deployment") and for parallel `go
+// test` runs that open many fresh stores. It does NOT generalise to
+// a multi-replica deployment: two Reduit processes pointed at the
+// same SQLite file calling goose.Up concurrently still race on
+// `goose_db_version` at the database level — one will hit a UNIQUE
+// constraint violation and the migration will fail. A future
+// multi-replica deployment MUST coordinate via a database-level
+// advisory lock (e.g. `BEGIN IMMEDIATE; SELECT version_id FROM
+// goose_db_version`); tracked separately so a single-host operator
+// is not paying that complexity today.
+var migrateMu sync.Mutex
 
 //go:embed all:migrations/*.sql
 var embeddedMigrations embed.FS
@@ -149,6 +169,8 @@ func (s *Store) Migrate(dirOverride string) error {
 	if s == nil || s.DB == nil {
 		return errors.New("store: not open")
 	}
+	migrateMu.Lock()
+	defer migrateMu.Unlock()
 	goose.SetBaseFS(nil)
 	goose.SetTableName("goose_db_version")
 	if err := goose.SetDialect("sqlite3"); err != nil {
