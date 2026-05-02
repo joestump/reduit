@@ -185,6 +185,9 @@ func (s *session) Subscribe(_ string) error {
 	// Subscriptions are not persisted; pretend success so clients that
 	// auto-subscribe on first SELECT (Apple Mail does this) do not
 	// surface a confusing error.
+	//
+	// TODO(#44): when APPEND lands, persist subscriptions so a client's
+	// "show only subscribed folders" view round-trips across sessions.
 	return nil
 }
 
@@ -343,11 +346,14 @@ func (s *session) Status(name string, options *imap.StatusOptions) (*imap.Status
 }
 
 func (s *session) Append(_ string, _ imap.LiteralReader, _ *imap.AppendOptions) (*imap.AppendData, error) {
-	// APPEND requires a roundtrip to Proton's draft API which lands in
-	// the SMTP outbox story. Reject for now with the read-only error so
-	// clients like Apple Mail (which APPENDs sent messages to Sent)
-	// fall back to "send via SMTP and let the server file it" via
-	// SPEC-0004's submission path.
+	// APPEND is the inbound write path: clients use it for save-to-
+	// Drafts, restore-from-backup (imapsync, offlineimap), and
+	// drag-to-folder workflows. It is independent from SMTP submission
+	// (#22, the *outbound* path) and lands in its own story.
+	//
+	// Tracking issue: #44 — IMAP APPEND support. While APPEND is
+	// unimplemented, Apple Mail's save-to-Drafts pops a "Could not save
+	// to Drafts" alert and `imapsync` migrations cannot complete.
 	return nil, errMailboxReadOnly
 }
 
@@ -572,6 +578,11 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 // labelled (additively) with the destination mailbox's Proton label.
 // Returns *imap.CopyData with the source/destination UID lists so a
 // well-behaved client can correlate the copy.
+//
+// Like Move, Copy pre-allocates destination UIDs for every match
+// before touching Proton. RFC 3501 COPY is atomic — partial COPYUID
+// responses are not allowed — so any AssignUID failure rolls back the
+// partial inserts and surfaces NO. The client retries the whole COPY.
 func (s *session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) {
 	if s.backend.mailboxes == nil {
 		return nil, errMailboxNotFound
@@ -609,49 +620,67 @@ func (s *session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) 
 		}
 	}
 
-	var (
-		protonIDs []string
-		srcUIDs   []uint32
-		toAssign  []*mailbox.MessageInMailbox
-	)
+	var matches []movePair
 	for i, m := range srcMsgs {
 		seqNum := uint32(i + 1)
 		if !numSetContains(numSet, seqNum, m.UID) {
 			continue
 		}
-		protonIDs = append(protonIDs, m.ProtonMessageID)
-		srcUIDs = append(srcUIDs, m.UID)
-		toAssign = append(toAssign, m)
+		matches = append(matches, movePair{
+			seqNum:    seqNum,
+			uid:       m.UID,
+			messageID: m.MessageID,
+			protonID:  m.ProtonMessageID,
+		})
 	}
-	if len(protonIDs) == 0 {
+	if len(matches) == 0 {
 		// Nothing matched. Return an empty CopyData; emersion will
 		// emit the tagged OK with no COPYUID.
 		return &imap.CopyData{UIDValidity: destMbox.UIDValidity}, nil
 	}
 
+	// Phase 1: pre-allocate destination UIDs for ALL matches. On
+	// failure, roll back partial assignments and surface NO so the
+	// client retries the whole COPY.
+	destUIDs := make([]uint32, 0, len(matches))
+	for i, m := range matches {
+		uid, err := s.backend.mailboxes.AssignUID(ctx, acctID, destMbox.ID, m.messageID)
+		if err != nil {
+			s.logger.LogAttrs(ctx, slog.LevelWarn, "imap copy uid assign failed",
+				slog.String("account_id", acctID),
+				slog.Int64("dest_mailbox_id", destMbox.ID),
+				slog.Int64("message_id", m.messageID),
+				slog.Int("succeeded", i),
+				slog.Int("total", len(matches)),
+				slog.String("err", err.Error()))
+			s.rollbackMoveAssignments(ctx, acctID, destMbox.ID, matches[:i])
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Text: "Mailbox temporarily unavailable",
+			}
+		}
+		destUIDs = append(destUIDs, uid)
+	}
+
+	// Phase 2: tell Proton about the new label. On failure, roll back
+	// the local assignments — Proton was untouched, so the rollback
+	// restores full consistency.
+	protonIDs := make([]string, 0, len(matches))
+	srcUIDs := make([]uint32, 0, len(matches))
+	for _, m := range matches {
+		protonIDs = append(protonIDs, m.protonID)
+		srcUIDs = append(srcUIDs, m.uid)
+	}
 	if err := cli.LabelMessages(ctx, protonIDs, destMbox.ProtonLabelID); err != nil {
 		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap copy label failed",
 			slog.String("account_id", acctID),
 			slog.String("dest_label", destMbox.ProtonLabelID),
 			slog.String("err", err.Error()))
+		s.rollbackMoveAssignments(ctx, acctID, destMbox.ID, matches)
 		return nil, &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Text: "Proton label operation failed",
 		}
-	}
-
-	destUIDs := make([]uint32, 0, len(toAssign))
-	for _, m := range toAssign {
-		uid, err := s.backend.mailboxes.AssignUID(ctx, acctID, destMbox.ID, m.MessageID)
-		if err != nil {
-			s.logger.LogAttrs(ctx, slog.LevelWarn, "imap copy uid assign failed",
-				slog.String("account_id", acctID),
-				slog.Int64("dest_mailbox_id", destMbox.ID),
-				slog.Int64("message_id", m.MessageID),
-				slog.String("err", err.Error()))
-			continue
-		}
-		destUIDs = append(destUIDs, uid)
 	}
 
 	return &imap.CopyData{
@@ -669,7 +698,8 @@ func (s *session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) 
 // The wire-shape (writing COPYUID + EXPUNGE responses) is delegated to
 // the writer; the spec-mandated state mutation lives in performMove so
 // unit tests can assert the Proton call sequence + local UID effects
-// without standing up an emersion Conn.
+// without standing up an emersion Conn. Wire-shape integration tests
+// land with #45 (alongside the IMAP4rev2 cap-set enable).
 //
 // Governing: SPEC-0003 REQ "Moving between system folders changes
 // Proton system flag", SPEC-0003 REQ "Moving between Labels/ folders
@@ -712,16 +742,40 @@ type moveResult struct {
 	srcSeqNums      []uint32
 }
 
+// movePair is the per-message snapshot performMove builds for each
+// match in numSet — the seqnum/uid for the source response and the
+// (messageID, protonID) for downstream Proton + DB calls.
+type movePair struct {
+	seqNum    uint32
+	uid       uint32
+	messageID int64
+	protonID  string
+}
+
 // performMove is the testable core of the Move handler. It runs the
 // Proton-side label mutation and the local UID assignment sequence
 // without writing to the IMAP wire; the caller wraps the result into
 // MoveWriter calls.
 //
-// The local UID assignment on the destination mailbox happens AFTER
-// the Proton operation succeeds so a network failure does not corrupt
-// local state. The source-mailbox link is removed AFTER the destination
-// assignment lands, making the IMAP-visible move atomic from the
-// client's perspective even if a future bug interrupts the chain.
+// RFC 6851 calls MOVE atomic from the client's perspective: either the
+// whole message set is moved, or nothing changes. The implementation
+// honours that by pre-allocating destination UIDs for EVERY matching
+// message BEFORE any Proton mutation happens. If any AssignUID call
+// fails, the entire MOVE aborts with `NO Mailbox temporarily
+// unavailable`, no Proton labels are touched, and no source links are
+// dropped — the client retries the whole operation.
+//
+// Order of operations:
+//  1. Resolve src + dest mailboxes, snapshot the matching message set.
+//  2. AssignUID in the destination for every match. On any failure,
+//     roll back the partial assignments and return NO; Proton state is
+//     untouched.
+//  3. LabelMessages(dest) at Proton. On failure, roll back local UID
+//     assignments and return NO.
+//  4. UnlabelMessages(src) at Proton. Failure here is logged but does
+//     NOT abort: the destination is durably labelled and the client
+//     sees the move from the IMAP side; the next sync round reconciles.
+//  5. Drop the source-mailbox links locally.
 func (s *session) performMove(numSet imap.NumSet, dest string) (*moveResult, error) {
 	if s.backend.mailboxes == nil {
 		return nil, errMailboxNotFound
@@ -759,19 +813,13 @@ func (s *session) performMove(numSet imap.NumSet, dest string) (*moveResult, err
 		return nil, errMailboxNotFound
 	}
 
-	type pair struct {
-		seqNum    uint32
-		uid       uint32
-		messageID int64
-		protonID  string
-	}
-	var matches []pair
+	var matches []movePair
 	for i, m := range srcMsgs {
 		seqNum := uint32(i + 1)
 		if !numSetContains(numSet, seqNum, m.UID) {
 			continue
 		}
-		matches = append(matches, pair{
+		matches = append(matches, movePair{
 			seqNum:    seqNum,
 			uid:       m.UID,
 			messageID: m.MessageID,
@@ -787,59 +835,65 @@ func (s *session) performMove(numSet imap.NumSet, dest string) (*moveResult, err
 		protonIDs = append(protonIDs, m.protonID)
 	}
 
-	// Phase 1: add the destination label. If this fails, no local
-	// mutation has happened — return NO and let the client retry.
-	if err := cli.LabelMessages(ctx, protonIDs, destMbox.ProtonLabelID); err != nil {
-		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap move add label failed",
-			slog.String("account_id", acctID),
-			slog.String("dest_label", destMbox.ProtonLabelID),
-			slog.String("err", err.Error()))
-		return nil, &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Text: "Proton label add failed",
-		}
-	}
-
-	// Phase 2: remove the source label. If this fails the message is
-	// in BOTH mailboxes — the Proton model treats that as legitimate
-	// (additive labels) so the client sees a stable state, just not the
-	// one it asked for. Log loudly; the next sync round will reconcile.
-	if err := cli.UnlabelMessages(ctx, protonIDs, src.ProtonLabelID); err != nil {
-		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap move remove label failed",
-			slog.String("account_id", acctID),
-			slog.String("src_label", src.ProtonLabelID),
-			slog.String("err", err.Error()))
-		// We deliberately do NOT abort here — Phase 1 already mutated
-		// Proton state, so the IMAP-side operation is durably half-
-		// done. Better to continue with the local mirror so the client
-		// sees the destination mailbox populated, and let the next
-		// sync round reconcile the source.
-	}
-
-	// Phase 3: local UID assignment for the destination. Per SPEC-0003
-	// REQ "UID assignment is monotonic" each match consumes one fresh
-	// UID from destMbox.uid_next.
+	// Phase 1: pre-allocate destination UIDs for ALL matches. RFC 6851
+	// requires MOVE to be atomic; partial success is not allowed. If any
+	// AssignUID fails, roll back the partial inserts so the destination
+	// mailbox is unchanged, and surface NO. The client retries the
+	// whole operation.
 	destUIDs := make([]uint32, 0, len(matches))
-	srcUIDs := make([]uint32, 0, len(matches))
-	srcSeqs := make([]uint32, 0, len(matches))
-	for _, m := range matches {
+	for i, m := range matches {
 		uid, err := s.backend.mailboxes.AssignUID(ctx, acctID, destMbox.ID, m.messageID)
 		if err != nil {
 			s.logger.LogAttrs(ctx, slog.LevelWarn, "imap move uid assign failed",
 				slog.String("account_id", acctID),
 				slog.Int64("dest_mailbox_id", destMbox.ID),
 				slog.Int64("message_id", m.messageID),
+				slog.Int("succeeded", i),
+				slog.Int("total", len(matches)),
 				slog.String("err", err.Error()))
-			continue
+			s.rollbackMoveAssignments(ctx, acctID, destMbox.ID, matches[:i])
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Text: "Mailbox temporarily unavailable",
+			}
 		}
 		destUIDs = append(destUIDs, uid)
-		srcUIDs = append(srcUIDs, m.uid)
-		srcSeqs = append(srcSeqs, m.seqNum)
 	}
 
-	// Phase 4: drop the source-mailbox links. We do this after Phase 3
-	// so that if AssignUID fails for any pair, the message is still
-	// reachable in the source mailbox via the existing link.
+	// Phase 2: add the destination label at Proton. If this fails, roll
+	// back the local UID assignments — Proton has not been touched, so
+	// undoing the local inserts restores full consistency.
+	if err := cli.LabelMessages(ctx, protonIDs, destMbox.ProtonLabelID); err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap move add label failed",
+			slog.String("account_id", acctID),
+			slog.String("dest_label", destMbox.ProtonLabelID),
+			slog.String("err", err.Error()))
+		s.rollbackMoveAssignments(ctx, acctID, destMbox.ID, matches)
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Proton label add failed",
+		}
+	}
+
+	// Phase 3: remove the source label at Proton. If this fails the
+	// message is in BOTH mailboxes — the Proton model treats that as
+	// legitimate (additive labels) so the client sees a stable state,
+	// just not the one it asked for. Log loudly; the sync worker (#46)
+	// will retry the unlabel and reconcile. We do NOT abort here because
+	// Phase 2 already committed Proton state, and the IMAP-visible move
+	// is durable on the destination side.
+	if err := cli.UnlabelMessages(ctx, protonIDs, src.ProtonLabelID); err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap move remove label failed",
+			slog.String("account_id", acctID),
+			slog.String("src_label", src.ProtonLabelID),
+			slog.String("err", err.Error()))
+	}
+
+	// Phase 4: drop the source-mailbox links for every successfully-
+	// assigned pair. Pre-allocation in Phase 1 means every match has a
+	// destination UID, so every match's source link should drop.
+	srcUIDs := make([]uint32, 0, len(matches))
+	srcSeqs := make([]uint32, 0, len(matches))
 	for _, m := range matches {
 		if _, err := s.backend.mailboxes.RemoveMessageFromMailbox(ctx, acctID, src.ID, m.messageID); err != nil {
 			s.logger.LogAttrs(ctx, slog.LevelWarn, "imap move source remove failed",
@@ -848,6 +902,8 @@ func (s *session) performMove(numSet imap.NumSet, dest string) (*moveResult, err
 				slog.Int64("message_id", m.messageID),
 				slog.String("err", err.Error()))
 		}
+		srcUIDs = append(srcUIDs, m.uid)
+		srcSeqs = append(srcSeqs, m.seqNum)
 	}
 
 	return &moveResult{
@@ -856,6 +912,27 @@ func (s *session) performMove(numSet imap.NumSet, dest string) (*moveResult, err
 		destUIDs:        destUIDs,
 		srcSeqNums:      srcSeqs,
 	}, nil
+}
+
+// rollbackMoveAssignments undoes a partial set of AssignUID inserts
+// performed during Phase 1 of performMove. Used when AssignUID fails
+// part-way through the pre-allocation, or when the subsequent Proton
+// LabelMessages call fails after the local pre-allocation succeeded.
+//
+// Each undo is best-effort: a failed remove is logged but does not
+// stop the rest. The caller's response to the user is already the
+// failure NO — the rollback is housekeeping to keep the destination
+// mailbox visually clean.
+func (s *session) rollbackMoveAssignments(ctx context.Context, accountID string, destMailboxID int64, assigned []movePair) {
+	for _, m := range assigned {
+		if _, err := s.backend.mailboxes.RemoveMessageFromMailbox(ctx, accountID, destMailboxID, m.messageID); err != nil {
+			s.logger.LogAttrs(ctx, slog.LevelWarn, "imap move rollback failed",
+				slog.String("account_id", accountID),
+				slog.Int64("dest_mailbox_id", destMailboxID),
+				slog.Int64("message_id", m.messageID),
+				slog.String("err", err.Error()))
+		}
+	}
 }
 
 // protonClient resolves the per-account Proton client. Returns an

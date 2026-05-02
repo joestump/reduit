@@ -266,8 +266,20 @@ func TestSessionSelectRefusesNonOwnedMailbox(t *testing.T) {
 	}
 
 	// SPEC requirement: "identical to a genuine not-found case". We
-	// assert exact error pointer equality (or at least byte-identical
-	// IMAP rendering): both must be errMailboxNotFound.
+	// assert pointer identity (both errors must be the SAME sentinel
+	// `errMailboxNotFound`, not just byte-identical structurally) AND
+	// the byte-shape of Type/Code/Text. The pointer check guards
+	// against a future refactor that constructs a per-call
+	// `&imap.Error{...}` with the same text — which would satisfy the
+	// byte check but not be the same sentinel and could drift in code.
+	if errGenuine != errMailboxNotFound {
+		t.Errorf("genuine miss did not return the errMailboxNotFound sentinel; got %v (%T)",
+			errGenuine, errGenuine)
+	}
+	if errCross != errMailboxNotFound {
+		t.Errorf("cross-account miss did not return the errMailboxNotFound sentinel; got %v (%T)",
+			errCross, errCross)
+	}
 	gErr, gOK := errGenuine.(*imap.Error)
 	cErr, cOK := errCross.(*imap.Error)
 	if !gOK || !cOK {
@@ -504,6 +516,112 @@ func TestSessionMoveBetweenUserLabelsAdjustsLabels(t *testing.T) {
 	}
 }
 
+// TestSessionMoveSystemToUserLabelAdjustsBothLabels covers the
+// cross-kind move path: INBOX (system) → Labels/Receipts (user). The
+// IMAP MOVE semantic is "remove from source, add to destination", so
+// even though Proton's label model is additive, MOVE issues both an
+// add (Labels/Receipts) AND a remove (INBOX) — anything else would
+// leave the message visible in BOTH mailboxes from the IMAP client's
+// perspective, contradicting RFC 6851.
+//
+// Governing: RFC 6851 (MOVE atomicity) + SPEC-0003 REQ "Folder
+// Hierarchy and Mapping" applied symmetrically across kinds.
+func TestSessionMoveSystemToUserLabelAdjustsBothLabels(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+
+	inbox, err := mboxes.EnsureMailbox(ctx, acct, "INBOX", mailbox.ProtonInboxLabelID, mailbox.KindSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mboxes.EnsureMailbox(ctx, acct, "Labels/Receipts", "user-receipts", mailbox.KindUserLabel); err != nil {
+		t.Fatal(err)
+	}
+
+	mid, err := mboxes.UpsertMessage(ctx, &mailbox.Message{
+		AccountID:       acct,
+		ProtonMessageID: "proton-msg-cross-1",
+		InternalDate:    time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mboxes.AssignUID(ctx, acct, inbox.ID, mid); err != nil {
+		t.Fatal(err)
+	}
+
+	fp := &fakeProton{}
+	sess := newAuthedSession(t, mboxes, fp, acct)
+	if _, err := sess.Select("INBOX", nil); err != nil {
+		t.Fatalf("Select INBOX: %v", err)
+	}
+	if _, err := sess.performMove(imap.SeqSet{{Start: 1, Stop: 1}}, "Labels/Receipts"); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+
+	calls := fp.snapshot()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 Proton calls, got %d: %+v", len(calls), calls)
+	}
+	if calls[0].op != "label" || calls[0].labelID != "user-receipts" {
+		t.Errorf("call 0: %+v, want label/user-receipts", calls[0])
+	}
+	if calls[1].op != "unlabel" || calls[1].labelID != mailbox.ProtonInboxLabelID {
+		t.Errorf("call 1: %+v, want unlabel/inbox", calls[1])
+	}
+}
+
+// TestSessionMoveUserLabelToSystemAdjustsBothLabels covers the other
+// cross-kind direction: Labels/Receipts (user) → Trash (system). Same
+// MOVE-is-atomic rationale — the user label is dropped and the system
+// label is added.
+func TestSessionMoveUserLabelToSystemAdjustsBothLabels(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+
+	src, err := mboxes.EnsureMailbox(ctx, acct, "Labels/Receipts", "user-receipts", mailbox.KindUserLabel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mboxes.EnsureMailbox(ctx, acct, "Trash", mailbox.ProtonTrashLabelID, mailbox.KindSystem); err != nil {
+		t.Fatal(err)
+	}
+
+	mid, err := mboxes.UpsertMessage(ctx, &mailbox.Message{
+		AccountID:       acct,
+		ProtonMessageID: "proton-msg-cross-2",
+		InternalDate:    time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mboxes.AssignUID(ctx, acct, src.ID, mid); err != nil {
+		t.Fatal(err)
+	}
+
+	fp := &fakeProton{}
+	sess := newAuthedSession(t, mboxes, fp, acct)
+	if _, err := sess.Select("Labels/Receipts", nil); err != nil {
+		t.Fatalf("Select Labels/Receipts: %v", err)
+	}
+	if _, err := sess.performMove(imap.SeqSet{{Start: 1, Stop: 1}}, "Trash"); err != nil {
+		t.Fatalf("Move: %v", err)
+	}
+
+	calls := fp.snapshot()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 Proton calls, got %d: %+v", len(calls), calls)
+	}
+	if calls[0].op != "label" || calls[0].labelID != mailbox.ProtonTrashLabelID {
+		t.Errorf("call 0: %+v, want label/trash", calls[0])
+	}
+	if calls[1].op != "unlabel" || calls[1].labelID != "user-receipts" {
+		t.Errorf("call 1: %+v, want unlabel/user-receipts", calls[1])
+	}
+}
+
 // TestSessionMoveProtonFailureLeavesLocalUntouched confirms that if
 // Phase 1 (LabelMessages) fails, the local mirror is unchanged: the
 // source UID is still present, the destination has not gained a row.
@@ -550,6 +668,165 @@ func TestSessionMoveProtonFailureLeavesLocalUntouched(t *testing.T) {
 	destMsgs, _ := mboxes.ListMessagesInMailbox(ctx, acct, dest.ID)
 	if len(destMsgs) != 0 {
 		t.Errorf("destination mailbox has %d msgs after failed move; want 0", len(destMsgs))
+	}
+}
+
+// failingMailboxService wraps a real mailbox.Service and forces
+// AssignUID to fail on the Nth call. Used by the atomic-MOVE test
+// to confirm that an AssignUID failure aborts the entire MOVE without
+// touching Proton or dropping source links.
+type failingMailboxService struct {
+	mailbox.Service
+	mu       sync.Mutex
+	calls    int
+	failAt   int // 1-indexed: failAt=3 means the 3rd AssignUID call fails
+	failErr  error
+	assigned []int64 // message IDs that received a successful UID
+}
+
+func (f *failingMailboxService) AssignUID(ctx context.Context, accountID string, mailboxID, messageID int64) (uint32, error) {
+	f.mu.Lock()
+	f.calls++
+	n := f.calls
+	f.mu.Unlock()
+	if n == f.failAt {
+		return 0, f.failErr
+	}
+	uid, err := f.Service.AssignUID(ctx, accountID, mailboxID, messageID)
+	if err == nil {
+		f.mu.Lock()
+		f.assigned = append(f.assigned, messageID)
+		f.mu.Unlock()
+	}
+	return uid, err
+}
+
+// TestMoveIsAtomicOnAssignUIDFailure exercises Blocker 1 from PR #43's
+// hostile review: when AssignUID fails partway through a MOVE, the
+// entire operation MUST abort with NO. No Proton labels are modified,
+// no source links are dropped, and the partial pre-allocation is
+// rolled back. RFC 6851 calls MOVE atomic; partial success is not
+// allowed.
+//
+// Setup: 5-message MOVE from INBOX → Archive. Inject AssignUID failure
+// on the 3rd call. Assert:
+//   - Move returns a NO error (not nil).
+//   - fakeProton.calls is empty (no LabelMessages or UnlabelMessages).
+//   - All 5 messages are still linked to INBOX.
+//   - Archive is empty.
+func TestMoveIsAtomicOnAssignUIDFailure(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+
+	inbox, err := mboxes.EnsureMailbox(ctx, acct, "INBOX", mailbox.ProtonInboxLabelID, mailbox.KindSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, err := mboxes.EnsureMailbox(ctx, acct, "Archive", mailbox.ProtonArchiveLabelID, mailbox.KindSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const N = 5
+	for i := 0; i < N; i++ {
+		mid, err := mboxes.UpsertMessage(ctx, &mailbox.Message{
+			AccountID:       acct,
+			ProtonMessageID: testProtonID(1000 + i),
+			InternalDate:    time.Now().UTC(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mboxes.AssignUID(ctx, acct, inbox.ID, mid); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wrap the real service with a failure-injecting service. Fail on
+	// the 3rd AssignUID inside performMove (the seed AssignUIDs above
+	// are already done; reset the counter to 0 here so they do not
+	// count toward the failAt threshold).
+	failer := &failingMailboxService{
+		Service: mboxes,
+		failAt:  3,
+		failErr: errors.New("simulated AssignUID failure"),
+	}
+
+	fp := &fakeProton{}
+	sess := newAuthedSessionWithSvc(t, failer, fp, acct)
+	if _, err := sess.Select("INBOX", nil); err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+
+	// Move all 5 messages. Expect failure on the 3rd AssignUID.
+	_, err = sess.performMove(imap.SeqSet{{Start: 1, Stop: uint32(N)}}, "Archive")
+	if err == nil {
+		t.Fatal("performMove succeeded; expected NO error")
+	}
+	imapErr, ok := err.(*imap.Error)
+	if !ok {
+		t.Fatalf("expected *imap.Error, got %T (%v)", err, err)
+	}
+	if imapErr.Type != imap.StatusResponseTypeNo {
+		t.Errorf("error type = %v, want NO", imapErr.Type)
+	}
+
+	// No Proton calls should have happened — pre-allocation runs first
+	// and aborted before Phase 2.
+	calls := fp.snapshot()
+	if len(calls) != 0 {
+		t.Errorf("expected 0 Proton calls on aborted MOVE, got %d: %+v", len(calls), calls)
+	}
+
+	// Source mailbox still has all 5 messages — no source link was
+	// dropped.
+	srcMsgs, err := mboxes.ListMessagesInMailbox(ctx, acct, inbox.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(srcMsgs) != N {
+		t.Errorf("source mailbox lost messages after aborted MOVE: have %d, want %d",
+			len(srcMsgs), N)
+	}
+
+	// Destination mailbox is empty — the rollback removed the partial
+	// pre-allocation.
+	destMsgs, err := mboxes.ListMessagesInMailbox(ctx, acct, archive.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(destMsgs) != 0 {
+		t.Errorf("destination has %d msgs after aborted MOVE; want 0 (rollback failed)", len(destMsgs))
+	}
+}
+
+// newAuthedSessionWithSvc is a variant of newAuthedSession that takes
+// an arbitrary MailboxService (e.g. a failure-injecting wrapper)
+// instead of a concrete mailbox.Service. Used by the atomic-MOVE test.
+func newAuthedSessionWithSvc(t *testing.T, mboxes MailboxService, p ProtonClientLookup, accountID string) *session {
+	t.Helper()
+	stub := newStubAccounts()
+	stub.addAccount(accountID, "user@reduit.example", "pw", testActive)
+
+	backendOpts := []BackendOption{}
+	if mboxes != nil {
+		backendOpts = append(backendOpts, WithMailboxes(mboxes))
+	}
+	if p != nil {
+		backendOpts = append(backendOpts, WithProton(p))
+	}
+	b, err := NewBackend(stub, NewSessions(), nil, backendOpts...)
+	if err != nil {
+		t.Fatalf("NewBackend: %v", err)
+	}
+	return &session{
+		backend:   b,
+		conn:      nil,
+		remote:    "127.0.0.1:0",
+		rateKey:   "127.0.0.1",
+		logger:    b.logger,
+		accountID: accountID,
 	}
 }
 
