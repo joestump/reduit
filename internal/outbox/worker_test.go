@@ -81,7 +81,7 @@ func (b *recordingBuilder) callCount() int {
 type alwaysInternalClient struct{ fakeProtonClient }
 
 func (alwaysInternalClient) GetPublicKeys(_ context.Context, _ string) (proton.PublicKeys, proton.RecipientType, error) {
-	return proton.PublicKeys{{Flags: proton.KeyStateActive, PublicKey: "PGP"}}, proton.RecipientTypeInternal, nil
+	return proton.PublicKeys{{Flags: proton.KeyStateActive | proton.KeyStateTrusted, PublicKey: "PGP"}}, proton.RecipientTypeInternal, nil
 }
 
 // hangingClient blocks GetPublicKeys until ctx is cancelled. Used by

@@ -84,11 +84,17 @@ func SelectMode(ctx context.Context, client proton.Client, recipients []string) 
 // can be unit-tested without any HTTP plumbing.
 func classify(addr string, keys proton.PublicKeys, recipientType proton.RecipientType) (EncryptionMode, error) {
 	hasActive := false
+	// Governing: SPEC-0004 REQ "Encryption Pipeline" — fail-closed on
+	// compromised-but-still-active Proton keys; require both Active AND
+	// Trusted bits. KeyStateActive=2 means "still in use", KeyStateTrusted=1
+	// means "not compromised". A key with Active set but Trusted clear is a
+	// compromised-but-not-yet-obsolete key — Proton has marked it
+	// untrustworthy but kept it Active for an active migration window.
+	// Encrypting to such a key would leak user mail to a key Proton has
+	// already disavowed. The fix is to require BOTH bits.
+	const usable = proton.KeyStateActive | proton.KeyStateTrusted
 	for _, k := range keys {
-		// Flags is a bitfield: KeyStateActive (2) means the key is
-		// non-obsolete and may be used for encryption. KeyStateTrusted
-		// (1) is signature-trust state and is not enough on its own.
-		if k.Flags&proton.KeyStateActive != 0 {
+		if k.Flags&usable == usable {
 			hasActive = true
 			break
 		}

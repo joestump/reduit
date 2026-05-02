@@ -128,7 +128,7 @@ func TestSelectMode_ExternalWithKeyGetsExternalE2E(t *testing.T) {
 		err      error
 	}{
 		"carol@external.tld": {
-			keys:     proton.PublicKeys{{Flags: proton.KeyStateActive, PublicKey: "PGP-WKD"}},
+			keys:     proton.PublicKeys{{Flags: proton.KeyStateActive | proton.KeyStateTrusted, PublicKey: "PGP-WKD"}},
 			rcptType: proton.RecipientTypeExternal,
 		},
 	}}
@@ -203,6 +203,113 @@ func TestSelectMode_InternalWithoutActiveKeysFailsClosed(t *testing.T) {
 	}
 }
 
+// TestSelectModeRejectsCompromisedKey covers the security-critical
+// "Active but NOT Trusted" scenario. Per upstream
+// go-proton-api keys_types.go, KeyStateActive means "still in use" and
+// KeyStateTrusted means "not compromised". A key with Active set but
+// Trusted clear is a compromised-but-still-active key — Proton has
+// disavowed it but kept it in rotation during a migration window.
+// Encrypting user mail to such a key would leak content to a
+// repudiated key. The selector MUST require BOTH bits and fail closed
+// when only Active is present.
+//
+// Governing: SPEC-0004 REQ "Encryption Pipeline" — fail-closed on
+// compromised-but-still-active Proton keys.
+func TestSelectModeRejectsCompromisedKey(t *testing.T) {
+	t.Parallel()
+	t.Run("internal-active-not-trusted", func(t *testing.T) {
+		t.Parallel()
+		fc := &fakeProtonClient{keys: map[string]struct {
+			keys     proton.PublicKeys
+			rcptType proton.RecipientType
+			err      error
+		}{
+			// Active=2, Trusted=0 → compromised-but-still-active.
+			"alice@proton.me": {
+				keys:     proton.PublicKeys{{Flags: proton.KeyStateActive, PublicKey: "COMPROMISED"}},
+				rcptType: proton.RecipientTypeInternal,
+			},
+		}}
+		mode, err := classify("alice@proton.me",
+			fc.keys["alice@proton.me"].keys,
+			fc.keys["alice@proton.me"].rcptType)
+		if err == nil {
+			t.Fatalf("classify accepted compromised key; got mode=%v", mode)
+		}
+		if mode == ModeProtonE2E || mode == ModeExternalE2E {
+			t.Errorf("classify returned encrypted mode %v for compromised key", mode)
+		}
+		var keyErr *ErrKeyLookup
+		if !errors.As(err, &keyErr) {
+			t.Fatalf("expected *ErrKeyLookup, got %T: %v", err, err)
+		}
+
+		// Round-trip through SelectMode for parity with the production
+		// call site; same expectation.
+		_, err = SelectMode(context.Background(), fc, []string{"alice@proton.me"})
+		if err == nil {
+			t.Fatal("SelectMode accepted compromised internal key; expected fail-closed")
+		}
+		if !errors.As(err, &keyErr) {
+			t.Fatalf("SelectMode: expected *ErrKeyLookup, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("external-active-not-trusted-falls-back-to-cleartext", func(t *testing.T) {
+		t.Parallel()
+		// For an external recipient an Active-but-not-Trusted key is
+		// equivalent to "no usable key" — the selector falls through to
+		// ModeCleartext rather than encrypting to a disavowed key. This
+		// is the "no usable key returned" branch; cleartext relay via
+		// Proton's outbound MTA is the spec-mandated default.
+		fc := &fakeProtonClient{keys: map[string]struct {
+			keys     proton.PublicKeys
+			rcptType proton.RecipientType
+			err      error
+		}{
+			"bob@external.tld": {
+				keys:     proton.PublicKeys{{Flags: proton.KeyStateActive, PublicKey: "COMPROMISED-WKD"}},
+				rcptType: proton.RecipientTypeExternal,
+			},
+		}}
+		modes, err := SelectMode(context.Background(), fc, []string{"bob@external.tld"})
+		if err != nil {
+			t.Fatalf("SelectMode: %v", err)
+		}
+		if got := modes["bob@external.tld"]; got == ModeExternalE2E {
+			t.Errorf("external recipient with compromised key returned ModeExternalE2E; want ModeCleartext or fail-closed")
+		}
+	})
+
+	t.Run("trusted-but-not-active-fails-closed", func(t *testing.T) {
+		t.Parallel()
+		// Trusted=1, Active=0 → key is no longer in use even though it
+		// was never compromised. Same fail-closed as
+		// TestSelectMode_InternalWithoutActiveKeysFailsClosed but stated
+		// as a security-symmetric companion to the Active-but-not-Trusted
+		// case above so a future reader sees both halves of the
+		// "require both bits" invariant.
+		fc := &fakeProtonClient{keys: map[string]struct {
+			keys     proton.PublicKeys
+			rcptType proton.RecipientType
+			err      error
+		}{
+			"alice@proton.me": {
+				keys:     proton.PublicKeys{{Flags: proton.KeyStateTrusted, PublicKey: "RETIRED"}},
+				rcptType: proton.RecipientTypeInternal,
+			},
+		}}
+		_, err := SelectMode(context.Background(), fc, []string{"alice@proton.me"})
+		if err == nil {
+			t.Fatal("SelectMode accepted retired (Trusted-only) key; expected fail-closed")
+		}
+		var keyErr *ErrKeyLookup
+		if !errors.As(err, &keyErr) {
+			t.Fatalf("expected *ErrKeyLookup, got %T: %v", err, err)
+		}
+	})
+}
+
 // TestSelectMode_PerRecipientDecisionIsIndependent feeds a mix of
 // Proton-internal + external-no-key recipients. The result map MUST
 // reflect the per-recipient decision (one E2E, one cleartext) rather
@@ -215,7 +322,7 @@ func TestSelectMode_PerRecipientDecisionIsIndependent(t *testing.T) {
 		err      error
 	}{
 		"alice@proton.me": {
-			keys:     proton.PublicKeys{{Flags: proton.KeyStateActive, PublicKey: "PGP-INTERNAL"}},
+			keys:     proton.PublicKeys{{Flags: proton.KeyStateActive | proton.KeyStateTrusted, PublicKey: "PGP-INTERNAL"}},
 			rcptType: proton.RecipientTypeInternal,
 		},
 		"bob@external.tld": {
@@ -248,7 +355,7 @@ func TestSelectMode_NormalisesAddressBeforeLookup(t *testing.T) {
 		err      error
 	}{
 		"alice@proton.me": {
-			keys:     proton.PublicKeys{{Flags: proton.KeyStateActive, PublicKey: "PGP-INTERNAL"}},
+			keys:     proton.PublicKeys{{Flags: proton.KeyStateActive | proton.KeyStateTrusted, PublicKey: "PGP-INTERNAL"}},
 			rcptType: proton.RecipientTypeInternal,
 		},
 	}}
@@ -272,7 +379,7 @@ func TestSelectMode_UnknownRecipientTypeFailsClosed(t *testing.T) {
 		err      error
 	}{
 		"alice@proton.me": {
-			keys:     proton.PublicKeys{{Flags: proton.KeyStateActive, PublicKey: "PGP"}},
+			keys:     proton.PublicKeys{{Flags: proton.KeyStateActive | proton.KeyStateTrusted, PublicKey: "PGP"}},
 			rcptType: proton.RecipientType(99), // future Proton type
 		},
 	}}
