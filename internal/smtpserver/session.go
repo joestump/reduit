@@ -7,6 +7,7 @@
 package smtpserver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -19,6 +20,7 @@ import (
 	smtp "github.com/emersion/go-smtp"
 
 	"github.com/joestump/reduit/internal/account"
+	"github.com/joestump/reduit/internal/outbox"
 )
 
 // loginTimeout bounds the database lookup + bcrypt verify. bcrypt
@@ -245,28 +247,34 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	return nil
 }
 
-// Data implements smtp.Session.Data. STUB: this story stops at
-// accepting the message body. The real outbox handoff (encryption +
-// Proton submission via the per-account worker) lands in story #22.
+// Data implements smtp.Session.Data. The handler reads the body
+// (streamed, size-capped), assembles an outbox.Submission, and blocks
+// on the per-account outbox worker until the Proton submission either
+// succeeds (`250 OK`), fails with a typed error (mapped to 4xx/5xx),
+// or the submission deadline elapses (`451 4.4.7`).
 //
-// We still fully consume the reader so the upstream library can write
-// a clean response, AND we propagate any read error (notably
-// smtp.ErrDataTooLarge from the size-limited dataReader) so a 1 GiB
-// attempt fails fast at the size limit rather than buffering 1 GiB
-// before rejection.
+// Body buffering: we read the entire body into memory before handing
+// to the outbox. The streamed size cap (DefaultMaxMessageBytes, 25 MiB)
+// caps the in-memory cost. A future optimisation could stream into a
+// disk-backed buffer, but at 25 MiB per concurrent send and a per-
+// account cap of 4 the worst case is 100 MiB resident per account —
+// fine for the v0.1 deployment shape.
 //
-// Governing: SPEC-0004 REQ "Recipient and Message Size Limits", and
-// SPEC-0004 REQ "Outbox Handoff and Synchronous Confirmation"
-// (deferred to #22).
+// Encryption-mode selection happens INSIDE outbox.Submit (see
+// outbox.SelectMode); the SMTP layer is intentionally agnostic of
+// encryption decisions so the security boundary lives in one place.
+//
+// Governing: SPEC-0004 REQ "Recipient and Message Size Limits",
+// SPEC-0004 REQ "Outbox Handoff and Synchronous Confirmation",
+// SPEC-0004 REQ "Encryption Pipeline".
 func (s *session) Data(r io.Reader) error {
-	// TODO(#22): hand to per-account outbox worker. For now, count the
-	// bytes, log the envelope + size, and drop the body.
-	n, err := io.Copy(io.Discard, r)
+	// Buffer the body. The upstream library wraps r in a size-limited
+	// reader so io.ReadAll cannot exceed MaxMessageBytes — a 1 GiB
+	// attempt is rejected mid-stream with smtp.ErrDataTooLarge before
+	// any allocation balloon.
+	var buf bytes.Buffer
+	n, err := io.Copy(&buf, r)
 	if err != nil {
-		// Streaming size cap (smtp.ErrDataTooLarge) and any other
-		// read error are returned verbatim. The upstream library maps
-		// *smtp.SMTPError to its code/message; non-SMTP errors map to
-		// the 554 fallback in dataErrorToStatus.
 		s.logger.Info("smtp data error",
 			slog.String("event", "smtp_data_error"),
 			slog.String("remote", s.remote),
@@ -282,14 +290,170 @@ func (s *session) Data(r io.Reader) error {
 	acct := s.accountID
 	s.mu.Unlock()
 
-	s.logger.Info("smtp data accepted",
-		slog.String("event", "smtp_data_accepted_stub"),
+	// Defence in depth: an authenticated session that never issued a
+	// MAIL FROM should never reach Data (the upstream library enforces
+	// the order), but guard the outbox call anyway so a malformed
+	// envelope produces a 503 instead of an outbox panic.
+	if acct == "" || from == "" || len(rcpt) == 0 {
+		return &smtp.SMTPError{
+			Code:         503,
+			EnhancedCode: smtp.EnhancedCode{5, 5, 1},
+			Message:      "Bad sequence of commands",
+		}
+	}
+
+	// Synchronous outbox call. The worker enforces its own deadline
+	// (REDUIT_SMTP_SUBMIT_TIMEOUT, default 60s); we pass a parent
+	// ctx so a forced server shutdown can short-circuit the wait.
+	timeout := s.backend.submitTimeout
+	if timeout <= 0 {
+		timeout = DefaultSubmitTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
+	defer cancel()
+
+	submitStart := time.Now()
+	res := s.backend.outbox.Submit(ctx, outbox.Submission{
+		AccountID:  acct,
+		MailFrom:   from,
+		Recipients: rcpt,
+		Body:       buf.Bytes(),
+	})
+	elapsed := time.Since(submitStart)
+
+	if res.Err == nil {
+		s.logger.Info("smtp data accepted",
+			slog.String("event", "smtp_data_accepted"),
+			slog.String("remote", s.remote),
+			slog.String("account_id", acct),
+			slog.String("from", from),
+			slog.Int("recipients", len(rcpt)),
+			slog.Int64("bytes", n),
+			slog.Duration("elapsed", elapsed))
+		return nil
+	}
+
+	// Map the typed outbox error to an SMTP code per SPEC-0004's
+	// "outbox returns failure → appropriate 4xx or 5xx" requirement.
+	smtpErr := mapOutboxError(res.Err)
+	s.logger.Info("smtp data rejected",
+		slog.String("event", "smtp_data_rejected"),
 		slog.String("remote", s.remote),
 		slog.String("account_id", acct),
 		slog.String("from", from),
 		slog.Int("recipients", len(rcpt)),
-		slog.Int64("bytes", n))
-	return nil
+		slog.Int64("bytes", n),
+		slog.Duration("elapsed", elapsed),
+		slog.Int("smtp_code", smtpErr.Code),
+		slog.String("err", res.Err.Error()))
+	return smtpErr
+}
+
+// mapOutboxError translates the outbox's typed error vocabulary to
+// the SMTP reply code SPEC-0004 mandates. The mapping is intentionally
+// conservative: anything we don't recognise becomes 451 (transient,
+// retry) so a flaky upstream doesn't manifest as permanent rejections.
+//
+// Reduit does NOT run a server-side retry loop after a synchronous
+// timeout. The 451 4.4.7 text deliberately does not promise retry;
+// recovery is the sender's MTA re-attempting the SMTP submission per
+// RFC 5321, which is the canonical SMTP-level retry mechanism.
+//
+// Mapping:
+//
+//	ErrSubmissionTimedOut  → 451 4.4.7  Submission timed out
+//	ErrAccountClosed       → 421 4.7.0  Account no longer authorised
+//	ErrSubmissionEnvelope  → 503 5.5.1  Bad sequence of commands
+//	*ErrKeyLookup          → 451 4.4.4  Key lookup failed (transient)
+//	*ErrProtonAuth         → 535 5.7.8  Authentication credentials revoked
+//	*ErrProtonRateLimit    → 421 4.7.0  Throttled by upstream, retry later
+//	*ErrProtonReject       → 550 5.6.0  Message rejected by upstream
+//	*ErrProtonServer       → 451 4.5.0  Upstream server error, retry
+//	context cancelled      → 451 4.4.5  Connection terminating
+//	default                → 451 4.0.0  Transient unspecified failure
+//
+// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous Confirmation".
+func mapOutboxError(err error) *smtp.SMTPError {
+	if err == nil {
+		// Should be unreachable; defence in depth.
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 0, 0},
+			Message:      "Transient failure",
+		}
+	}
+	switch {
+	case errors.Is(err, outbox.ErrSubmissionTimedOut):
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 4, 7},
+			Message:      "Submission timed out",
+		}
+	case errors.Is(err, outbox.ErrAccountClosed):
+		return &smtp.SMTPError{
+			Code:         421,
+			EnhancedCode: smtp.EnhancedCode{4, 7, 0},
+			Message:      "Account no longer authorised",
+		}
+	case errors.Is(err, outbox.ErrSubmissionEnvelope):
+		return &smtp.SMTPError{
+			Code:         503,
+			EnhancedCode: smtp.EnhancedCode{5, 5, 1},
+			Message:      "Bad sequence of commands",
+		}
+	}
+	var keyErr *outbox.ErrKeyLookup
+	if errors.As(err, &keyErr) {
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 4, 4},
+			Message:      "Key lookup failed",
+		}
+	}
+	var authErr *outbox.ErrProtonAuth
+	if errors.As(err, &authErr) {
+		return &smtp.SMTPError{
+			Code:         535,
+			EnhancedCode: smtp.EnhancedCode{5, 7, 8},
+			Message:      "Authentication credentials revoked",
+		}
+	}
+	var rateErr *outbox.ErrProtonRateLimit
+	if errors.As(err, &rateErr) {
+		return &smtp.SMTPError{
+			Code:         421,
+			EnhancedCode: smtp.EnhancedCode{4, 7, 0},
+			Message:      "Upstream rate limit, retry later",
+		}
+	}
+	var rejectErr *outbox.ErrProtonReject
+	if errors.As(err, &rejectErr) {
+		return &smtp.SMTPError{
+			Code:         550,
+			EnhancedCode: smtp.EnhancedCode{5, 6, 0},
+			Message:      "Message rejected by upstream",
+		}
+	}
+	var srvErr *outbox.ErrProtonServer
+	if errors.As(err, &srvErr) {
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 5, 0},
+			Message:      "Upstream server error, message will be retried",
+		}
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
+			Message:      "Connection terminating",
+		}
+	}
+	return &smtp.SMTPError{
+		Code:         451,
+		EnhancedCode: smtp.EnhancedCode{4, 0, 0},
+		Message:      "Transient failure",
+	}
 }
 
 // Reset implements smtp.Session.Reset. Clear per-message state but

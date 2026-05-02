@@ -78,6 +78,20 @@ func (f *fakeProtonClient) GetAttachment(context.Context, string) ([]byte, error
 }
 func (f *fakeProtonClient) Logout(context.Context) error { return nil }
 
+// Methods added to proton.Client by the SPEC-0004 outbox work
+// (GetPublicKeys) and the SPEC-0003 IMAP MOVE/COPY work
+// (LabelMessages/UnlabelMessages). Sync tests do not exercise these
+// surfaces, so they panic on unexpected calls.
+func (f *fakeProtonClient) GetPublicKeys(context.Context, string) (proton.PublicKeys, proton.RecipientType, error) {
+	panic("GetPublicKeys: unexpected call")
+}
+func (f *fakeProtonClient) LabelMessages(context.Context, []string, string) error {
+	panic("LabelMessages: unexpected call")
+}
+func (f *fakeProtonClient) UnlabelMessages(context.Context, []string, string) error {
+	panic("UnlabelMessages: unexpected call")
+}
+
 func (f *fakeProtonClient) cursorsCalled() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()

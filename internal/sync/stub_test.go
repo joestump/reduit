@@ -70,6 +70,20 @@ func (stubClient) GetAttachment(context.Context, string) ([]byte, error) {
 }
 func (stubClient) Logout(context.Context) error { return nil }
 
+// Methods added to proton.Client by SPEC-0003 (LabelMessages /
+// UnlabelMessages) and SPEC-0004 (GetPublicKeys). The lifecycle worker
+// does not exercise any of these; panic so a regression that does is
+// loud.
+func (stubClient) GetPublicKeys(context.Context, string) (proton.PublicKeys, proton.RecipientType, error) {
+	panic("stubClient.GetPublicKeys: lifecycle tests must not reach Proton")
+}
+func (stubClient) LabelMessages(context.Context, []string, string) error {
+	panic("stubClient.LabelMessages: lifecycle tests must not reach Proton")
+}
+func (stubClient) UnlabelMessages(context.Context, []string, string) error {
+	panic("stubClient.UnlabelMessages: lifecycle tests must not reach Proton")
+}
+
 // StubClientFactory is a ClientFactory that returns a stubClient for
 // any account ID. It satisfies New()'s "non-nil ClientFactory" guard
 // in lifecycle tests without forcing each test to wire a fake Proton

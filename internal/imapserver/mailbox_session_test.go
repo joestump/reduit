@@ -182,6 +182,17 @@ func (c *fakeProtonClient) UnlabelMessages(_ context.Context, msgIDs []string, l
 }
 func (c *fakeProtonClient) Logout(context.Context) error { return nil }
 
+// Methods added to proton.Client by SPEC-0002 (GetLatestEventID) and
+// SPEC-0004 (GetPublicKeys). IMAP mailbox tests do not exercise these
+// surfaces; they return zero values so a mailbox-session test that
+// somehow reaches them does not panic the whole package.
+func (c *fakeProtonClient) GetLatestEventID(context.Context) (string, error) {
+	return "", nil
+}
+func (c *fakeProtonClient) GetPublicKeys(context.Context, string) (proton.PublicKeys, proton.RecipientType, error) {
+	return nil, proton.RecipientTypeExternal, nil
+}
+
 // We deliberately do NOT exercise the wire shape of LIST in unit
 // tests. emersion's ListWriter is a thin pass-through to its internal
 // *Conn (which cannot be constructed without a live TCP connection),
@@ -893,6 +904,16 @@ func (c *erroringProtonClient) UnlabelMessages(ctx context.Context, msgIDs []str
 	return c.wrapped.UnlabelMessages(ctx, msgIDs, labelID)
 }
 func (c *erroringProtonClient) Logout(ctx context.Context) error { return c.wrapped.Logout(ctx) }
+
+// Forward the SPEC-0002 / SPEC-0004 surface to the wrapped client so
+// erroringProtonClient stays interface-complete after the proton.Client
+// interface gained GetLatestEventID and GetPublicKeys.
+func (c *erroringProtonClient) GetLatestEventID(ctx context.Context) (string, error) {
+	return c.wrapped.GetLatestEventID(ctx)
+}
+func (c *erroringProtonClient) GetPublicKeys(ctx context.Context, address string) (proton.PublicKeys, proton.RecipientType, error) {
+	return c.wrapped.GetPublicKeys(ctx, address)
+}
 
 // TestSessionConcurrentSelectIsolation confirms that two sessions for
 // the SAME account each have an isolated `selected` view: a SELECT in

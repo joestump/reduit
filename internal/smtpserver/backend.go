@@ -13,11 +13,13 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"time"
 
 	smtp "github.com/emersion/go-smtp"
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/joestump/reduit/internal/account"
+	"github.com/joestump/reduit/internal/outbox"
 )
 
 // AccountLookup is the slice of `account.Service` the SMTP backend
@@ -29,14 +31,34 @@ type AccountLookup interface {
 	VerifyIMAPPassword(ctx context.Context, accountID string, candidate []byte) error
 }
 
+// OutboxSubmitter is the slice of outbox.Manager the SMTP backend
+// needs. Decoupling lets unit tests stub the outbox without spinning
+// up real Proton plumbing.
+//
+// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous Confirmation".
+type OutboxSubmitter interface {
+	Submit(ctx context.Context, sub outbox.Submission) outbox.Result
+}
+
 // Backend implements emersion/go-smtp's `Backend` interface. One
 // Backend instance is shared across every connection; per-connection
 // state lives on session.
 type Backend struct {
 	accounts  AccountLookup
 	sessions  *Sessions
+	outbox    OutboxSubmitter
 	logger    *slog.Logger
 	rateLimit *authRateLimiter
+
+	// submitTimeout caps the synchronous outbox.Submit call. Mirrors
+	// the upstream SMTP write timeout — when it fires, the SMTP
+	// response is `451 4.4.7 Submission timed out`. Recovery is the
+	// sender's MTA re-attempting the SMTP submission per RFC 5321;
+	// Reduit does NOT run a server-side retry loop.
+	//
+	// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+	// Confirmation" — submission timeout is what bounds DATA latency.
+	submitTimeout time.Duration
 
 	// dummyBcryptHash is a fixed bcrypt hash generated at construction
 	// time and reused on every auth failure branch that does NOT reach
@@ -70,15 +92,29 @@ const bcryptDummyCost = 12
 // NewBackend constructs a Backend. logger may be nil; the default
 // slog logger is used in that case. The Sessions registry is REQUIRED
 // — it is the public hook the suspension code path calls to drop
-// sessions for a freshly-suspended account.
+// sessions for a freshly-suspended account. The OutboxSubmitter is
+// REQUIRED — a nil submitter previously fell through to a "log + 250
+// OK" stub which composes with NoopBuilder into a silent-success path
+// (the worst failure mode). Tests that exercise auth / MAIL FROM /
+// RCPT TO without a real Proton must wire a stub OutboxSubmitter
+// instead.
 //
-// Governing: SPEC-0004 REQ "Per-Session Authentication Lifetime".
-func NewBackend(accounts AccountLookup, sessions *Sessions, logger *slog.Logger) (*Backend, error) {
+// Governing: SPEC-0004 REQ "Per-Session Authentication Lifetime",
+// SPEC-0004 REQ "Outbox Handoff and Synchronous Confirmation".
+func NewBackend(accounts AccountLookup, sessions *Sessions, ob OutboxSubmitter, logger *slog.Logger) (*Backend, error) {
 	if accounts == nil {
 		return nil, errors.New("smtpserver: accounts is required")
 	}
 	if sessions == nil {
 		return nil, errors.New("smtpserver: sessions registry is required")
+	}
+	if ob == nil {
+		// Fail-loud: a nil OutboxSubmitter wired into the DATA handler
+		// previously returned 250 OK with no message ever sent.
+		// Production wiring MUST supply a real submitter; tests MUST
+		// stub one. The constructor refuses to build a Backend that
+		// would silently fake a successful send.
+		return nil, errors.New("smtpserver: OutboxSubmitter is required (silent-success guard)")
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -90,9 +126,11 @@ func NewBackend(accounts AccountLookup, sessions *Sessions, logger *slog.Logger)
 	return &Backend{
 		accounts:        accounts,
 		sessions:        sessions,
+		outbox:          ob,
 		logger:          logger,
 		rateLimit:       newAuthRateLimiter(),
 		dummyBcryptHash: dummyHash,
+		submitTimeout:   DefaultSubmitTimeout,
 	}, nil
 }
 

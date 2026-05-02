@@ -109,9 +109,34 @@ notification.
 | Recipient over limit | `452 4.5.3` | Email client retries later (or splits) |
 | Message too large | `552 5.3.4` | Email client surfaces error |
 | Proton 5xx (transient) | `451 4.7.0` | Email client retries later |
-| Proton key lookup fails on Proton recipient | `554 5.7.5` | Email client surfaces error to user |
+| Proton key lookup fails on Proton recipient | `451 4.4.4` | Email client retries; sender's MTA backs off until Proton's key endpoint recovers |
 | Submission timeout | `451 4.4.7` | Outbox keeps retrying in background; appears in Sent eventually |
 | HV / CAPTCHA required | `554 5.7.0 Human verification required` | User must clear HV via web UI; deferred to v0.3 with a richer flow |
+
+### Rationale: 451 4.4.4 (transient) for Proton-recipient key lookup
+
+Earlier drafts of this design specified `554 5.7.5` (permanent) for the
+"Proton key lookup fails on Proton recipient" case. Implementation
+experience and the SPEC-0004 hostile review (B3) reversed this choice:
+
+- Key-lookup failures observed in practice are dominated by transient
+  `/core/v4/keys` outages (a Proton API hiccup, partial Cloudflare
+  edge issue, or rate-limit blip), not genuinely missing keys for a
+  real Proton account. A real Proton account always has at least one
+  active address key.
+- `451 4.4.4` invites the sender's MTA to retry, which recovers
+  cleanly when the upstream returns. A `554` permanent rejection
+  would force the user to re-send manually for a server-side hiccup
+  that resolves on its own — the worst UX outcome for the most likely
+  cause.
+- The implementation MUST still log a structured event
+  (`outbox_encryption_decision` with `ok=false` and the wrapped
+  upstream cause) so operators can distinguish recurring lookup
+  failures from one-off blips. A persistent failure should surface
+  via the operator UI, not via permanent SMTP rejections to the user.
+
+Cross-reference: SPEC-0004 REQ "Encryption Pipeline" (fail-closed on
+key-lookup error; do NOT silently downgrade to cleartext).
 
 ## Why synchronous submission
 

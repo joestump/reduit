@@ -104,6 +104,15 @@ type Config struct {
 	// transitions to Suspended or SoftDeleted.
 	Sessions *Sessions
 
+	// Outbox is the per-account submission engine the DATA handler
+	// hands accepted messages to. Optional at config time so tests
+	// that exercise auth / MAIL FROM / RCPT TO without a real Proton
+	// can pass nil and rely on the legacy "log + 250 OK" stub. Production
+	// callers MUST supply a non-nil Outbox.
+	//
+	// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous Confirmation".
+	Outbox OutboxSubmitter
+
 	// Logger is the slog.Logger used for connection-level events.
 	// nil falls back to slog.Default().
 	Logger *slog.Logger
@@ -200,10 +209,14 @@ func New(cfg Config) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	backend, err := NewBackend(cfg.Accounts, cfg.Sessions, logger)
+	backend, err := NewBackend(cfg.Accounts, cfg.Sessions, cfg.Outbox, logger)
 	if err != nil {
 		return nil, err
 	}
+	// Wire the configured submission timeout through to the Backend
+	// so the session.Data handler bounds its outbox.Submit call by
+	// the same value the upstream library uses for write deadlines.
+	backend.submitTimeout = cfg.resolveSubmitTimeout()
 
 	smtpSrv := smtp.NewServer(backend)
 	smtpSrv.Domain = cfg.resolveDomain()
@@ -212,7 +225,21 @@ func New(cfg Config) (*Server, error) {
 	// ReadTimeout / WriteTimeout bound a slow client. Submit timeout
 	// applies per-DATA write; the value is generous so legitimate
 	// large attachments can flow.
-	smtpSrv.WriteTimeout = cfg.resolveSubmitTimeout()
+	//
+	// WriteTimeout MUST be strictly larger than SubmitTimeout (Concern
+	// C3 in the hostile review). The DATA handler blocks on
+	// outbox.Submit for up to SubmitTimeout, then writes the 451 reply.
+	// If WriteTimeout == SubmitTimeout the underlying socket write
+	// deadline can race the response write — the client sees a
+	// connection reset instead of the proper 451 4.4.7. We add the
+	// same 5s headroom the DATA handler uses for its parent ctx so
+	// the entire round trip — synchronous wait + reply write — fits
+	// inside the wire-level deadline.
+	//
+	// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+	// Confirmation" — the 451 reply MUST reach the client.
+	const writeHeadroom = 5 * time.Second
+	smtpSrv.WriteTimeout = cfg.resolveSubmitTimeout() + writeHeadroom
 	smtpSrv.ReadTimeout = cfg.resolveSubmitTimeout()
 	// AllowInsecureAuth is set true ON PURPOSE: we wrap every accepted
 	// *tls.Conn in a *lockedConn (see lockedconn.go) to serialise
