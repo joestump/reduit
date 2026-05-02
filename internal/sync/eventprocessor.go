@@ -8,6 +8,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net/http"
+
+	gpa "github.com/ProtonMail/go-proton-api"
 
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/proton"
@@ -127,9 +130,45 @@ func newEventProcessor(ctx context.Context, accountID string, svc account.Servic
 // indicator stays current. The cursor value itself is unchanged in
 // that case, so this is idempotent: two consecutive empty polls leave
 // the cursor at the same string but bump last_synced_at twice.
+//
+// Stale-cursor recovery: Proton retains events for ~24h. If the
+// worker resumes from a cursor older than that, GetEvent returns a
+// 422 + Code=InvalidValue. Rather than spinning forever on the dead
+// cursor, we transparently fall back to GetLatestEventID and resume
+// from "now" — the cost is a one-time gap (events between the dead
+// cursor and now are unrecoverable anyway, since Proton has purged
+// them) and the recovery is logged at WARN so operators can correlate
+// the gap with the cursor reset.
 func (p *eventProcessor) processOnce(ctx context.Context) (bool, error) {
 	events, more, err := p.client.GetEvent(ctx, p.cursor)
 	if err != nil {
+		// Stale-cursor recovery. The bookmark we have is older than
+		// Proton's retention window; the only correct response is to
+		// reset to "now" and let #19's mailbox/UID materialisation
+		// reconcile against the gap. Returning the GetLatestEventID
+		// failure (if any) bubbles a real network error up to the
+		// worker for retry on the next tick.
+		if isStaleCursorError(err) {
+			latest, lerr := p.client.GetLatestEventID(ctx)
+			if lerr != nil {
+				return false, lerr
+			}
+			p.logger.LogAttrs(ctx, slog.LevelWarn,
+				"sync: stale cursor reset; events between previous and now are lost (Proton retention)",
+				slog.String("stale_cursor", p.cursor),
+				slog.String("new_cursor", latest),
+			)
+			// Persist the recovery cursor immediately so a subsequent
+			// crash doesn't replay the same dead cursor on restart.
+			if err := p.svc.SetSyncState(ctx, p.accountID, latest, nil); err != nil {
+				return false, err
+			}
+			p.cursor = latest
+			// Yield to the next tick so the operator sees the recovery
+			// log before the next GetEvent. There is no backlog to
+			// drain here by definition (we just reset to "now").
+			return false, nil
+		}
 		return false, err
 	}
 
@@ -141,9 +180,24 @@ func (p *eventProcessor) processOnce(ctx context.Context) (bool, error) {
 	// batch is empty (nothing new since the previous cursor) we keep
 	// the old cursor — the SetSyncState call still runs to bump
 	// last_synced_at for observability.
+	//
+	// Empty-EventID defense: if the last event's ID is the empty
+	// string, persisting it would make the next GetEvent call ask
+	// Proton for "everything" (the upstream API treats "" specially).
+	// We treat this as a malformed batch: keep the old cursor, log at
+	// ERROR, and let the next tick retry from the same place.
 	nextCursor := p.cursor
 	if n := len(events); n > 0 {
-		nextCursor = events[n-1].EventID
+		last := events[n-1].EventID
+		if last == "" {
+			p.logger.LogAttrs(ctx, slog.LevelError,
+				"sync: dropping batch with empty trailing EventID; cursor unchanged",
+				slog.Int("batch_size", n),
+				slog.String("retained_cursor", p.cursor),
+			)
+			return false, nil
+		}
+		nextCursor = last
 	}
 
 	for _, e := range events {
@@ -168,16 +222,38 @@ func (p *eventProcessor) processOnce(ctx context.Context) (bool, error) {
 		)
 	}
 
-	// Atomic cursor commit. txWork is omitted (the variadic accepts
-	// zero callbacks) so SetSyncState writes only the cursor row;
-	// #19 will pass a non-nil callback that materialises mailbox/UID
-	// state in the same transaction.
+	// Atomic cursor commit. The strict-arity SetSyncState API takes a
+	// single nilable txWork callback; #16 plumbing has no derived state
+	// so we pass nil. #19 will replace this with a non-nil callback
+	// that materialises mailbox/UID state in the same transaction.
 	//
 	// Governing: SPEC-0002 REQ "Event Cursor Persistence" — atomic
 	// commit of cursor and state changes derived from the same batch.
-	if err := p.svc.SetSyncState(ctx, p.accountID, nextCursor); err != nil {
+	if err := p.svc.SetSyncState(ctx, p.accountID, nextCursor, nil); err != nil {
 		return false, err
 	}
 	p.cursor = nextCursor
 	return more, nil
+}
+
+// isStaleCursorError reports whether err indicates the cursor we
+// passed to GetEvent has aged past Proton's event retention window
+// (~24h). Proton signals this with HTTP 422 + Code=InvalidValue (the
+// generic "request param is no longer accepted" code). Other 422s
+// (e.g. malformed UID) also surface as InvalidValue, but those are
+// programmer bugs that retrying-from-latest cannot harm — falling
+// back to GetLatestEventID still produces a valid cursor and the
+// real bug surfaces in the gap analysis.
+//
+// We deliberately do NOT match by HTTP status alone: a transient 422
+// from a hostile proxy without a real APIError body would otherwise
+// trigger a destructive cursor reset. Requiring both Status==422 and
+// Code==InvalidValue scopes the recovery to the actual upstream
+// signal.
+func isStaleCursorError(err error) bool {
+	var apiErr *gpa.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Status == http.StatusUnprocessableEntity && apiErr.Code == gpa.InvalidValue
 }

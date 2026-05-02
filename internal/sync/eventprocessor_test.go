@@ -6,11 +6,16 @@ package sync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	gpa "github.com/ProtonMail/go-proton-api"
 
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/proton"
@@ -138,7 +143,7 @@ func TestEventProcessorResumesFromPersistedCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := svc.SetSyncState(ctx, a.ID, "evt-persisted"); err != nil {
+	if err := svc.SetSyncState(ctx, a.ID, "evt-persisted", nil); err != nil {
 		t.Fatalf("seed cursor: %v", err)
 	}
 
@@ -235,7 +240,7 @@ func TestEventProcessorEmptyBatchKeepsCursor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := svc.SetSyncState(ctx, a.ID, "evt-stable"); err != nil {
+	if err := svc.SetSyncState(ctx, a.ID, "evt-stable", nil); err != nil {
 		t.Fatalf("seed cursor: %v", err)
 	}
 
@@ -351,7 +356,7 @@ func TestEventProcessorPropagatesGetEventError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := svc.SetSyncState(ctx, a.ID, "evt-stuck"); err != nil {
+	if err := svc.SetSyncState(ctx, a.ID, "evt-stuck", nil); err != nil {
 		t.Fatalf("seed cursor: %v", err)
 	}
 
@@ -450,7 +455,10 @@ func TestWorkerTickHonoursMaxConsecutiveTicks(t *testing.T) {
 		// forever inside one tick().
 		getEventFn: func(cursor string) ([]proton.Event, bool, error) {
 			n := atomic.AddInt32(&calls, 1)
-			return []proton.Event{{EventID: "evt-burst-" + string(rune('0'+n))}}, true, nil
+			// fmt.Sprintf instead of `string(rune('0'+n))` so a future
+			// bump to MaxConsecutiveTicks > 9 doesn't synthesize
+			// non-printable EventIDs (PR #41 nit).
+			return []proton.Event{{EventID: fmt.Sprintf("evt-burst-%d", n)}}, true, nil
 		},
 	}
 
@@ -486,6 +494,118 @@ func TestWorkerTickHonoursMaxConsecutiveTicks(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if got := atomic.LoadInt32(&calls); got != 5 {
 		t.Errorf("GetEvent call count = %d, want exactly 5 (the burst cap); long PollInterval should prevent a second tick", got)
+	}
+}
+
+// TestEventProcessorRecoversFromStaleCursor pins the stale-cursor
+// recovery path added in PR #41's hostile-review fix: when GetEvent
+// returns 422 + Code=InvalidValue (Proton's signal that the cursor
+// has aged past retention), the processor MUST fall back to
+// GetLatestEventID, persist the new cursor, and yield to the next
+// tick. Pre-fix the worker spun forever on the dead cursor.
+func TestEventProcessorRecoversFromStaleCursor(t *testing.T) {
+	t.Parallel()
+	svc := newTestAccountService(t)
+	ctx := context.Background()
+
+	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-stale"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := svc.SetSyncState(ctx, a.ID, "evt-too-old", nil); err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+
+	staleErr := &gpa.APIError{
+		Status:  http.StatusUnprocessableEntity,
+		Code:    gpa.InvalidValue,
+		Message: "EventID is too old",
+	}
+	fc := &fakeProtonClient{
+		latest: "evt-recovered",
+		getEventFn: func(cursor string) ([]proton.Event, bool, error) {
+			if cursor != "evt-too-old" {
+				t.Errorf("GetEvent cursor = %q, want evt-too-old", cursor)
+			}
+			return nil, false, staleErr
+		},
+	}
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger())
+	if err != nil {
+		t.Fatalf("newEventProcessor: %v", err)
+	}
+
+	more, err := proc.processOnce(ctx)
+	if err != nil {
+		t.Fatalf("processOnce: %v (expected recovery, not error)", err)
+	}
+	if more {
+		t.Errorf("processOnce reported more=true; recovery should yield to next tick")
+	}
+	if proc.cursor != "evt-recovered" {
+		t.Errorf("in-memory cursor = %q, want evt-recovered (from GetLatestEventID)", proc.cursor)
+	}
+	state, err := svc.GetSyncState(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("GetSyncState: %v", err)
+	}
+	if state.LastEventID != "evt-recovered" {
+		t.Errorf("persisted cursor = %q, want evt-recovered", state.LastEventID)
+	}
+	if got := atomic.LoadInt32(&fc.latestCalls); got != 1 {
+		t.Errorf("GetLatestEventID call count = %d, want 1 (the recovery)", got)
+	}
+}
+
+// TestEventProcessorRejectsEmptyTrailingEventID pins the empty-EventID
+// defense added in PR #41's hostile-review fix: a batch whose last
+// event has EventID == "" must NOT advance the cursor (otherwise the
+// next GetEvent call would ask Proton for "everything", which the
+// upstream API treats as a special "give me history" request).
+// Behaviour: keep the prior cursor, return more=false + nil error so
+// the worker waits for the next ticker fire.
+func TestEventProcessorRejectsEmptyTrailingEventID(t *testing.T) {
+	t.Parallel()
+	svc := newTestAccountService(t)
+	ctx := context.Background()
+
+	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-empty-id"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := svc.SetSyncState(ctx, a.ID, "evt-good", nil); err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+
+	fc := &fakeProtonClient{
+		getEventFn: func(cursor string) ([]proton.Event, bool, error) {
+			return []proton.Event{
+				{EventID: "evt-trail-1"},
+				{EventID: ""}, // malformed batch
+			}, false, nil
+		},
+	}
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger())
+	if err != nil {
+		t.Fatalf("newEventProcessor: %v", err)
+	}
+
+	more, err := proc.processOnce(ctx)
+	if err != nil {
+		t.Fatalf("processOnce: %v", err)
+	}
+	if more {
+		t.Errorf("processOnce reported more=true; malformed batch should yield")
+	}
+	if proc.cursor != "evt-good" {
+		t.Errorf("in-memory cursor = %q, want evt-good (unchanged)", proc.cursor)
+	}
+	state, err := svc.GetSyncState(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("GetSyncState: %v", err)
+	}
+	if state.LastEventID != "evt-good" {
+		t.Errorf("persisted cursor = %q, want evt-good (unchanged)", state.LastEventID)
 	}
 }
 
@@ -551,6 +671,140 @@ func TestWorkerStartReportsBootstrapFailure(t *testing.T) {
 	// alive, and removeWorker fires from bootstrapFailed().
 	if !waitFor(t, time.Second, func() bool { return sup.activeWorkerCount() == 0 }) {
 		t.Fatalf("bootstrap failure did not remove worker; count=%d", sup.activeWorkerCount())
+	}
+}
+
+// TestWorkerTickReleasesSlotBetweenBurstIterations pins PR #41's
+// burst-loop fairness fix: holding the global Proton slot across all
+// MaxConsecutiveTicks iterations starved sibling work behind up to
+// cap×N round-trips. The fix releases between iterations so a
+// contender can interleave.
+//
+// Strategy: cap=1. Spawn a contender goroutine that loops calling
+// AcquireProtonSlot+release as fast as it can, counting successful
+// acquires. With the per-iteration release, the contender gets a
+// turn between every worker iteration — so its acquire count
+// scales with the worker's burst length. Pre-fix (slot held across
+// the entire burst) the contender's count would be 0 or 1 (one
+// acquire either before the worker started or after it finished).
+//
+// We don't insist on exact counts because Go's channel scheduler
+// doesn't guarantee strict alternation, but a contender that can
+// acquire AT ALL while the worker is mid-burst is the deterministic
+// behavioural change we're pinning. A counter ≥ 2 guarantees the
+// contender ran during the burst (one acquire might race the start;
+// two acquires can't both be pre-burst because cap=1).
+func TestWorkerTickReleasesSlotBetweenBurstIterations(t *testing.T) {
+	t.Parallel()
+	svc := newTestAccountService(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-fairness"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Worker iter pacing: each iteration blocks until the test sends
+	// on `proceed`, so the test deterministically holds the worker
+	// inside the burst while the contender races for slots.
+	var calls int32
+	iterStarted := make(chan int, 8)
+	proceed := make(chan struct{})
+	fc := &fakeProtonClient{
+		latest: "evt-fair-bootstrap",
+		getEventFn: func(cursor string) ([]proton.Event, bool, error) {
+			n := atomic.AddInt32(&calls, 1)
+			select {
+			case iterStarted <- int(n):
+			case <-ctx.Done():
+				return nil, false, ctx.Err()
+			}
+			select {
+			case <-proceed:
+			case <-ctx.Done():
+				return nil, false, ctx.Err()
+			}
+			more := n < 3
+			return []proton.Event{{EventID: fmt.Sprintf("evt-fair-%d", n)}}, more, nil
+		},
+	}
+
+	cfg := fastConfig()
+	cfg.ConcurrencyCap = 1
+	cfg.PollInterval = time.Hour
+	cfg.MaxConsecutiveTicks = 5
+	cfg.ClientFactory = func(context.Context, string) (proton.Client, error) {
+		return fc, nil
+	}
+	sup := New(svc, cfg)
+	if err := sup.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Stop() })
+
+	if _, err := svc.Transition(ctx, a.ID, account.StateActive); err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+
+	// Contender: loop acquiring + releasing. Each successful acquire
+	// (after the first, which can race the worker's startup) PROVES
+	// the worker was not holding the slot at that moment.
+	stopContender := make(chan struct{})
+	var contenderAcquires int32
+	contenderDone := make(chan struct{})
+	go func() {
+		defer close(contenderDone)
+		for {
+			select {
+			case <-stopContender:
+				return
+			default:
+			}
+			acqCtx, cancelAcq := context.WithTimeout(ctx, 100*time.Millisecond)
+			rel, err := sup.AcquireProtonSlot(acqCtx)
+			cancelAcq()
+			if err != nil {
+				continue
+			}
+			atomic.AddInt32(&contenderAcquires, 1)
+			rel()
+			// Yield so the worker has a chance to acquire too,
+			// otherwise this tight loop would dominate the slot.
+			runtime.Gosched()
+		}
+	}()
+
+	// Pace the worker through 3 iterations. Between each, give the
+	// contender ample time to acquire.
+	for i := 1; i <= 3; i++ {
+		select {
+		case n := <-iterStarted:
+			if n != i {
+				t.Errorf("iter %d: got start signal for %d", i, n)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("worker never reached iter %d", i)
+		}
+		// The worker is INSIDE getEventFn (slot held). Confirm the
+		// contender can't acquire RIGHT NOW (sanity check: cap=1).
+		// Then unblock the iter so the worker releases.
+		proceed <- struct{}{}
+		// Brief settle window for the contender to grab the freed
+		// slot before the worker re-acquires.
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	close(stopContender)
+	<-contenderDone
+
+	// With per-iteration release, the contender slipped in between
+	// iters 1+2 and 2+3 at minimum. Allow some slack for scheduler
+	// jitter, but require at least 2 acquires to PROVE the contender
+	// ran while the worker was mid-burst (cap=1 so two acquires
+	// cannot both be pre-burst).
+	if got := atomic.LoadInt32(&contenderAcquires); got < 2 {
+		t.Errorf("contender acquired slot only %d times; per-iteration release is broken (worker held slot across burst)", got)
 	}
 }
 

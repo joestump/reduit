@@ -46,7 +46,7 @@ func TestSetSyncStateRoundTrip(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 
-	if err := svc.SetSyncState(ctx, a.ID, "evt-1"); err != nil {
+	if err := svc.SetSyncState(ctx, a.ID, "evt-1", nil); err != nil {
 		t.Fatalf("SetSyncState 1: %v", err)
 	}
 	got, err := svc.GetSyncState(ctx, a.ID)
@@ -64,7 +64,7 @@ func TestSetSyncStateRoundTrip(t *testing.T) {
 	}
 
 	// Overwrite — no second row, just an update.
-	if err := svc.SetSyncState(ctx, a.ID, "evt-2"); err != nil {
+	if err := svc.SetSyncState(ctx, a.ID, "evt-2", nil); err != nil {
 		t.Fatalf("SetSyncState 2: %v", err)
 	}
 	got, err = svc.GetSyncState(ctx, a.ID)
@@ -93,7 +93,7 @@ func TestSetSyncStateAtomicityRollsBackOnTxWorkFailure(t *testing.T) {
 
 	// Seed a baseline cursor so we can prove a failed advance does
 	// NOT clobber the prior value.
-	if err := svc.SetSyncState(ctx, a.ID, "evt-baseline"); err != nil {
+	if err := svc.SetSyncState(ctx, a.ID, "evt-baseline", nil); err != nil {
 		t.Fatalf("SetSyncState baseline: %v", err)
 	}
 
@@ -171,35 +171,6 @@ func TestSetSyncStateCommitsTxWorkAlongsideCursor(t *testing.T) {
 	}
 }
 
-// TestSetSyncStateRejectsMultipleTxWork pins the variadic-cardinality
-// guard. Passing >1 callback is a programmer error; we panic loudly
-// so the bug surfaces at first invocation rather than silently
-// dropping the second callback's work.
-func TestSetSyncStateRejectsMultipleTxWork(t *testing.T) {
-	t.Parallel()
-	svc, _ := newTestService(t)
-	ctx := context.Background()
-
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-tx-multi"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatal("expected panic on multiple txWork args")
-		}
-		msg, ok := r.(string)
-		if !ok || !strings.Contains(msg, "at most one") {
-			t.Errorf("panic value = %v, want string containing 'at most one'", r)
-		}
-	}()
-
-	noop := func(*sqlx.Tx) error { return nil }
-	_ = svc.SetSyncState(ctx, a.ID, "evt", noop, noop)
-}
-
 // TestSetSyncStateLogsRollbackFailure pins PR #41's hostile-review
 // fix for Blocker 1: when txWork returns an error AND the deferred
 // Rollback then also fails, the previous code dropped the rollback
@@ -232,6 +203,11 @@ func TestSetSyncStateLogsRollbackFailure(t *testing.T) {
 	var logBuf rollbackLogSink
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
+	// Force a rollback failure by issuing a manual ROLLBACK inside
+	// the txWork: the driver's tx-state machine then thinks the tx
+	// is over, but sqlx's Go-side state still expects the deferred
+	// Rollback to do real work — which the driver rejects with a
+	// non-ErrTxDone error. This reliably surfaces the logging path.
 	wantTxErr := errors.New("simulated derived-state failure")
 	err = svc.SetSyncState(ctx, a.ID, "evt-rollback-log", func(tx *sqlx.Tx) error {
 		if _, rbErr := tx.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
@@ -289,7 +265,7 @@ func TestSetSyncStateAccountCascade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := svc.SetSyncState(ctx, a.ID, "evt-pre-delete"); err != nil {
+	if err := svc.SetSyncState(ctx, a.ID, "evt-pre-delete", nil); err != nil {
 		t.Fatalf("SetSyncState: %v", err)
 	}
 
@@ -333,7 +309,7 @@ func TestSetSyncStateConcurrentWritesPickOne(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			if err := svc.SetSyncState(ctx, a.ID, cur); err != nil {
+			if err := svc.SetSyncState(ctx, a.ID, cur, nil); err != nil {
 				t.Errorf("writer %d (%s): %v", i, cur, err)
 			}
 		}()
