@@ -27,6 +27,7 @@ package auth
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -99,6 +100,11 @@ type SessionGate struct {
 	// this in production binds the gate to account lifecycle per
 	// SPEC-0005 REQ "Admin Account Management".
 	//
+	// When wired, a session that has Subject set but AccountID empty
+	// (a malformed shape currently unreachable through PutIdentity but
+	// possible via future caller wiring bugs) is treated as no session:
+	// destroyed + denied + a structured warning is logged.
+	//
 	// Governing: SPEC-0005 REQ "Authentication Gating" (Scenario
 	// "Authenticated request proceeds" — "active session for an
 	// account"); SPEC-0005 REQ "Admin Account Management" (suspend /
@@ -140,22 +146,43 @@ func RequireSession(gate SessionGate, next http.Handler) http.Handler {
 			// is the gap C6 closes.
 			if gate.AccountActive != nil {
 				id := session.GetIdentity(r.Context(), gate.Manager)
-				if id.AccountID != "" {
-					ok, err := gate.AccountActive(r.Context(), id.AccountID)
-					if err != nil {
-						// DB outage: fail closed. A 503 is louder than a
-						// silent allow on a possibly-suspended user.
-						http.Error(w, "auth-state check unavailable", http.StatusServiceUnavailable)
-						return
-					}
-					if !ok {
-						// Account no longer authorised. Destroy the
-						// session token (best-effort; failures here MUST
-						// NOT block the response) and force re-login.
-						_ = gate.Manager.Destroy(r.Context())
-						denySessionMissing(w, r, loginPath)
-						return
-					}
+				if id.AccountID == "" {
+					// Subject is set (we are past IsAuthenticated) but
+					// AccountID is empty — a malformed session shape.
+					// PutIdentity always sets both, so this is currently
+					// unreachable through the foundation API; a future
+					// wiring bug in any caller would otherwise let a
+					// session bypass the suspend/soft-delete gate.
+					// Fail closed: destroy the session, log a structured
+					// warning so operators can spot the wiring bug, and
+					// deny as if no cookie were present.
+					//
+					// Governing: SPEC-0005 REQ "Authentication Gating"
+					// (auth code MUST fail closed on unexpected shapes);
+					// hostile-R2 finding C6-N1.
+					slog.Default().LogAttrs(r.Context(), slog.LevelWarn,
+						"RequireSession: session has Subject but empty AccountID; failing closed",
+						slog.String("subject", id.Subject),
+						slog.String("path", r.URL.Path),
+					)
+					_ = gate.Manager.Destroy(r.Context())
+					denySessionMissing(w, r, loginPath)
+					return
+				}
+				ok, err := gate.AccountActive(r.Context(), id.AccountID)
+				if err != nil {
+					// DB outage: fail closed. A 503 is louder than a
+					// silent allow on a possibly-suspended user.
+					http.Error(w, "auth-state check unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				if !ok {
+					// Account no longer authorised. Destroy the
+					// session token (best-effort; failures here MUST
+					// NOT block the response) and force re-login.
+					_ = gate.Manager.Destroy(r.Context())
+					denySessionMissing(w, r, loginPath)
+					return
 				}
 			}
 			next.ServeHTTP(w, r)

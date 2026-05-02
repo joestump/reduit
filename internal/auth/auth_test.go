@@ -1,8 +1,10 @@
 package auth_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -357,6 +359,144 @@ func TestRequireSession_AccountStateRecheck(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("suspended POST status = %d, want 401", resp.StatusCode)
 	}
+}
+
+// TestRequireSession_MalformedSessionFailsClosed pins the C6-N1
+// hostile-R2 fix. When the gate has AccountActive wired and the
+// session ends up with Subject set but AccountID empty (a shape
+// currently unreachable through PutIdentity but easy to introduce
+// via a future caller wiring bug), the gate MUST fail closed:
+// destroy the session, deny the request as if no cookie were
+// present, and log a structured warning so operators can spot the
+// wiring bug.
+//
+// Governing: SPEC-0005 REQ "Authentication Gating" (auth code MUST
+// fail closed on unexpected identity shapes); hostile-R2 finding
+// C6-N1.
+func TestRequireSession_MalformedSessionFailsClosed(t *testing.T) {
+	// Not parallel — captures slog.Default which is process-global.
+	st := openTempStore(t)
+	defer st.Close()
+	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
+	if err != nil {
+		t.Fatalf("session.New: %v", err)
+	}
+	defer cleanup()
+
+	// Capture slog output. Restore the default at test exit so
+	// sibling tests are not poisoned.
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	var logBuf safeLogBuf
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	checker := func(ctx context.Context, accountID string) (bool, error) {
+		t.Errorf("AccountActive checker MUST NOT be called on a malformed session; got accountID=%q", accountID)
+		return true, nil
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		// Construct the malformed shape directly: Subject set,
+		// AccountID empty. PutIdentity naturally produces this when
+		// AccountID is the zero value (it Put()s an empty string for
+		// the account key) — bypassing the helper would also work, but
+		// this is the simplest reproducer.
+		_ = session.PutIdentity(r.Context(), mgr, session.Identity{Subject: "joe"})
+		_, _ = w.Write([]byte("logged in (malformed)"))
+	})
+	mux.HandleFunc("/protected", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("protected handler MUST NOT run on a malformed session")
+		_, _ = w.Write([]byte("welcome"))
+	})
+	gate := auth.SessionGate{
+		Manager:       mgr,
+		LoginPath:     "/auth/login",
+		AccountActive: checker,
+	}
+	handler := mgr.LoadAndSave(auth.RequireSession(gate, mux))
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	jar, _ := cookiejar.New(nil)
+	c := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Establish the malformed session.
+	if _, err := c.Get(srv.URL + "/auth/login"); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+
+	// GET → 302 to /auth/login (matching the missing-cookie branch).
+	resp, err := c.Get(srv.URL + "/protected")
+	if err != nil {
+		t.Fatalf("/protected (malformed GET): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("malformed GET status = %d, want 302", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "/auth/login") {
+		t.Errorf("Location = %q, want /auth/login...", loc)
+	}
+
+	// Even with the checker still wired and the cookie still on the
+	// jar, a follow-up request finds the session destroyed (302).
+	resp, err = c.Get(srv.URL + "/protected")
+	if err != nil {
+		t.Fatalf("/protected (post-destroy): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("post-destroy status = %d, want 302 (cookie destroyed)", resp.StatusCode)
+	}
+
+	// POST on a fresh malformed session → 401 (non-GET branch).
+	if _, err := c.Get(srv.URL + "/auth/login"); err != nil {
+		t.Fatalf("re-login (post): %v", err)
+	}
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/protected", nil)
+	resp, err = c.Do(req)
+	if err != nil {
+		t.Fatalf("POST /protected (malformed): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("malformed POST status = %d, want 401", resp.StatusCode)
+	}
+
+	// The structured warning fired at least once.
+	if !logBuf.contains("session has Subject but empty AccountID") {
+		t.Errorf("expected slog.Warn for malformed session; got logs:\n%s", logBuf.String())
+	}
+}
+
+// safeLogBuf is a tiny io.Writer that captures slog output for
+// assertion. We cannot use bytes.Buffer directly because slog calls
+// Write concurrently in some configurations.
+type safeLogBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *safeLogBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *safeLogBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func (s *safeLogBuf) contains(needle string) bool {
+	return strings.Contains(s.String(), needle)
 }
 
 // TestRequireSession_NoCheckerSkipsRecheck confirms the foundation
