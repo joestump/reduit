@@ -8,11 +8,12 @@
 //     a fresh UIDVALIDITY (microsecond Unix timestamp) on first call.
 //   - AssignUID: atomic per-mailbox monotonic counter that issues one
 //     UID per (mailbox, Proton message) pair. Concurrent racers
-//     serialize through SQLite's BEGIN IMMEDIATE write lock; reused
-//     Proton message IDs (re-added after expunge) get a fresh UID,
-//     never the prior one — the (mailbox_id, uid) UNIQUE index plus the
-//     monotonic increment proves the SPEC-0003 "UIDs never reuse"
-//     property.
+//     serialize through the store's single-conn writer pool (see
+//     internal/store), so contention queues at the database/sql layer
+//     instead of the SQLite file lock. Reused Proton message IDs
+//     (re-added after expunge) get a fresh UID, never the prior one —
+//     the (mailbox_id, uid) UNIQUE index plus the monotonic increment
+//     proves the SPEC-0003 "UIDs never reuse" property.
 //   - ResolveSystemFolder/ParseUserLabel: hard-coded IMAP↔Proton system
 //     folder mapping (INBOX↔Inbox, Sent↔Sent, etc.) and the additive
 //     `Labels/<name>` user-label namespace.

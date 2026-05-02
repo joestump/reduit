@@ -74,12 +74,25 @@ type service struct {
 }
 
 // New constructs a Service backed by the supplied store.
+//
+// Reads use the store's default multi-conn pool (`s.DB`). Writes go
+// through the single-conn writer pool (`s.WriterDB()`) so contended
+// callers (assignUID is the canonical hot path) serialise at the
+// database/sql layer instead of through driver-level SQLITE_BUSY
+// retries.
 func New(s *store.Store) Service {
 	if s == nil || s.DB == nil {
 		panic("mailbox: New called with nil store")
 	}
+	writes := s.WriterDB()
+	if writes == nil {
+		// Older callers that constructed a Store manually without the
+		// writer pool fall back to the read pool. Production code
+		// always goes through store.Open which sets both up.
+		writes = s.DB
+	}
 	return &service{
-		repo: &repository{db: s.DB},
+		repo: &repository{reads: s.DB, writes: writes},
 		now:  time.Now,
 	}
 }
@@ -91,11 +104,14 @@ func New(s *store.Store) Service {
 // "UIDVALIDITY assigned at first sync".
 //
 // We coerce time.Now().UnixMicro() to uint32 by truncation. The wrap
-// happens roughly every 71 minutes (2^32 microseconds), which is fine
-// for our use: the only invariant UIDVALIDITY must satisfy is
-// monotonicity within a single mailbox's lifetime, and a single mailbox
-// is only assigned UIDVALIDITY once. Two distinct mailboxes can collide
-// without issue — UIDVALIDITY is per-mailbox, not globally unique.
+// happens roughly every 71 minutes (2^32 microseconds). The only
+// invariant RFC 9051 §2.3.1.1 requires is that UIDVALIDITY for "the
+// same mailbox" must change if UIDs ever recycle — and we guarantee
+// that structurally via the (mailbox_id, uid) PK plus monotonic
+// uid_next, so a single mailbox in fact never recycles its UIDs and
+// its UIDVALIDITY is assigned once at insert time and never updated
+// thereafter. The 71-minute wrap is irrelevant: we never re-derive
+// UIDVALIDITY for an existing mailbox.
 //
 // Governing: SPEC-0003 REQ "UIDVALIDITY assigned at first sync".
 func (s *service) uidValidity() uint32 {
