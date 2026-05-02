@@ -38,9 +38,10 @@ type worker struct {
 	// into a single cancel.
 	stopOnce sync.Once
 
-	// proc is the lazily-constructed event processor. Built on the
-	// first tick that successfully resolves a proton.Client via the
-	// supervisor's ClientFactory; nil until then. Single-goroutine
+	// proc is the event processor for this worker. Constructed
+	// synchronously by start() before the run goroutine spawns; nil
+	// only if start() failed (in which case the worker exits via
+	// bootstrapFailed without ever entering run()). Single-goroutine
 	// (only the run loop touches it), so no lock.
 	proc *eventProcessor
 
@@ -73,14 +74,59 @@ func newWorker(parent context.Context, id string, sup *Supervisor) *worker {
 // per worker (the supervisor's startWorker enforces this via the
 // dedup map).
 //
+// Bootstrap (ClientFactory + newEventProcessor) runs synchronously
+// here, BEFORE the goroutine is spawned. A failure logs at ERROR,
+// closes w.done so waitDone() returns immediately, and the worker
+// is removed from the supervisor's live map. We chose this over the
+// previous "lazy bootstrap inside tick()" because the lazy path
+// only retried until proc became non-nil — once cached, a stale
+// processor would never be rebuilt, so a transient ClientFactory
+// error at the FIRST tick masked itself but every subsequent tick
+// hit the same cached processor anyway. Moving bootstrap here makes
+// the configuration error loud at activation time, which pairs with
+// New()'s nil-ClientFactory rejection: both paths fail fast with an
+// operator-visible signal rather than producing a worker that
+// silently never syncs anything.
+//
 // Governing: SPEC-0002 REQ "One Worker Per Active Account" — the
 // worker must be running within 1 second of the activation
-// transition. We achieve this by spawning the goroutine
-// synchronously here; the goroutine itself begins its first tick
-// immediately on entry rather than waiting for the first ticker fire.
+// transition. Synchronous bootstrap adds at most one Proton round-
+// trip (GetLatestEventID on first boot; cursor-only DB read on
+// resume) which is well inside that budget.
 func (w *worker) start() {
 	w.logger.LogAttrs(w.ctx, slog.LevelInfo, "sync: worker starting")
+
+	client, err := w.sup.cfg.ClientFactory(w.ctx, w.id)
+	if err != nil {
+		w.logger.LogAttrs(w.ctx, slog.LevelError,
+			"sync: client factory failed at startup; worker will not run",
+			slog.Any("err", err),
+		)
+		w.bootstrapFailed()
+		return
+	}
+	proc, err := newEventProcessor(w.ctx, w.id, w.sup.svc, client, w.logger)
+	if err != nil {
+		w.logger.LogAttrs(w.ctx, slog.LevelError,
+			"sync: event processor bootstrap failed; worker will not run",
+			slog.Any("err", err),
+		)
+		w.bootstrapFailed()
+		return
+	}
+	w.proc = proc
+
 	go w.run()
+}
+
+// bootstrapFailed cleans up after a synchronous bootstrap failure in
+// start(): close done so waitDone() returns immediately, and remove
+// ourselves from the supervisor's live map so a subsequent
+// startWorker for the same account spawns a fresh worker rather than
+// no-op'ing on the stale entry.
+func (w *worker) bootstrapFailed() {
+	close(w.done)
+	w.sup.removeWorker(w.id)
 }
 
 // signalStop requests cooperative shutdown. Idempotent: subsequent
@@ -199,38 +245,15 @@ func (w *worker) tick() {
 		w.panicker()
 	}
 
-	// "No-Proton" mode: ClientFactory was nil at supervisor
-	// construction. The worker still runs (so lifecycle tests don't
-	// need a stub Proton client) but emits no Proton calls.
-	if w.sup.cfg.ClientFactory == nil {
-		w.logger.LogAttrs(w.ctx, slog.LevelDebug, "sync: worker tick (no-Proton mode)")
-		return
-	}
-
-	// Lazy bootstrap of the per-worker event processor. We do this in
-	// tick() rather than at start() so a transient ClientFactory
-	// failure (e.g. account secrets briefly missing right after
-	// activation) does not permanently disable the worker — the next
-	// tick will retry. A persistent failure manifests as a steady
-	// stream of ERROR logs, which is the observable signal we want.
+	// The processor was constructed by start() before this goroutine
+	// began ticking. If start() failed to bootstrap, the worker would
+	// have logged + exited there, so reaching tick() with proc==nil
+	// is an internal invariant violation, not an expected runtime
+	// state.
 	if w.proc == nil {
-		client, err := w.sup.cfg.ClientFactory(w.ctx, w.id)
-		if err != nil {
-			w.logger.LogAttrs(w.ctx, slog.LevelError,
-				"sync: client factory failed; will retry next tick",
-				slog.Any("err", err),
-			)
-			return
-		}
-		proc, err := newEventProcessor(w.ctx, w.id, w.sup.svc, client, w.logger)
-		if err != nil {
-			w.logger.LogAttrs(w.ctx, slog.LevelError,
-				"sync: event processor bootstrap failed; will retry next tick",
-				slog.Any("err", err),
-			)
-			return
-		}
-		w.proc = proc
+		w.logger.LogAttrs(w.ctx, slog.LevelError,
+			"sync: tick reached with nil processor; worker should have exited at bootstrap")
+		return
 	}
 
 	// Drain the backlog. SPEC-0002's "Tick the loop ASAP after a

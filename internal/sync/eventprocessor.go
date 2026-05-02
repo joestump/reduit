@@ -14,17 +14,31 @@ import (
 )
 
 // eventProcessor owns one worker's interaction with Proton's event
-// stream. It is constructed lazily inside the worker on the first
-// tick that successfully resolves a proton.Client via the configured
-// ClientFactory; resolving the client per-worker (instead of per-tick)
-// means a refresh-token rotation that lands between ticks is picked
-// up by the next tick without us paying the WithAccount cost on every
-// poll.
+// stream. It is constructed by worker.start() (synchronously, before
+// the goroutine spins up) — a previous version did the bootstrap
+// lazily inside tick(), but PR #41's hostile review pointed out that
+// the lazy path only retried until proc became non-nil and offered
+// no recovery story for steady-state Proton failures. Moving
+// bootstrap to start() trades the (questionable) "transient
+// ClientFactory error survives the first tick" benefit for loud
+// failure at activation time, which is what an operator can act on.
+//
+// Refresh-token rotations are handled INSIDE go-proton-api's auth
+// handler (see internal/proton/client.go installRefreshHandler) —
+// they are NOT a function of when newEventProcessor runs. Re-running
+// ClientFactory between ticks would not pick up a token rotation
+// any faster than the upstream auth handler already does.
+//
+// Steady-state Proton failure (refresh token revoked server-side,
+// account blocked, etc.) is deferred to story #17, which will add
+// classification + state transition; for #16 the worker logs at
+// ERROR each tick and the next tick retries the same dead processor.
 //
 // The processor caches the current cursor in-process so the per-tick
 // path is one Proton round-trip plus one DB write, not a Proton
-// round-trip plus two DB writes. The persisted cursor is the source of
-// truth on restart; the in-process copy is a hot-path optimisation.
+// round-trip plus two DB writes. The persisted cursor is the source
+// of truth on restart; the in-process copy is a hot-path
+// optimisation.
 //
 // Governing: SPEC-0002 REQ "Event Cursor Persistence".
 type eventProcessor struct {

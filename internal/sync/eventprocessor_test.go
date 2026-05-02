@@ -489,6 +489,71 @@ func TestWorkerTickHonoursMaxConsecutiveTicks(t *testing.T) {
 	}
 }
 
+// TestNewRejectsNilClientFactory pins PR #41's hostile-review fix
+// for Blocker 2: the previous build accepted a nil ClientFactory and
+// silently degraded to "no-Proton mode" with no operator-visible
+// signal. New() now panics so a misconfigured production deploy
+// fails loudly at boot.
+func TestNewRejectsNilClientFactory(t *testing.T) {
+	t.Parallel()
+	svc := newTestAccountService(t)
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic for nil ClientFactory")
+		}
+		msg, ok := r.(string)
+		if !ok || msg == "" {
+			t.Errorf("panic value = %v, want non-empty string", r)
+		}
+	}()
+
+	cfg := fastConfig()
+	cfg.ClientFactory = nil
+	_ = New(svc, cfg)
+}
+
+// TestWorkerStartReportsBootstrapFailure pins the lazy-bootstrap fix
+// in PR #41: a ClientFactory error at the FIRST tick used to be
+// silently retried on every subsequent tick (with the cached
+// processor never reconstructed). start() now performs bootstrap
+// synchronously, logs at ERROR, and removes the worker so a
+// misconfigured deploy surfaces the error at activation time rather
+// than producing a worker that never syncs.
+func TestWorkerStartReportsBootstrapFailure(t *testing.T) {
+	t.Parallel()
+	svc := newTestAccountService(t)
+	ctx := context.Background()
+
+	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-boot-fail"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	wantErr := errors.New("simulated factory failure")
+	cfg := fastConfig()
+	cfg.ClientFactory = func(context.Context, string) (proton.Client, error) {
+		return nil, wantErr
+	}
+	sup := New(svc, cfg)
+	if err := sup.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Stop() })
+
+	if _, err := svc.Transition(ctx, a.ID, account.StateActive); err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+
+	// The worker MUST be removed from the live map within a tick or
+	// two — bootstrap failed, so there is no goroutine to keep it
+	// alive, and removeWorker fires from bootstrapFailed().
+	if !waitFor(t, time.Second, func() bool { return sup.activeWorkerCount() == 0 }) {
+		t.Fatalf("bootstrap failure did not remove worker; count=%d", sup.activeWorkerCount())
+	}
+}
+
 // Compile-time assertion that fakeProtonClient still satisfies the
 // proton.Client interface as that interface evolves. Catches breakages
 // in CI rather than at first use.

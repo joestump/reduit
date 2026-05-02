@@ -64,12 +64,18 @@ func newTestAccountService(t *testing.T) account.Service {
 // fastConfig returns a Config that ticks every millisecond so the
 // "worker started within 1s" assertions don't actually need a full
 // second of sleep.
+//
+// ClientFactory is wired to StubClientFactory so the Config satisfies
+// New()'s "non-nil factory required" precondition out of the box;
+// tests that need to assert real Proton interactions override the
+// field after this returns (see TestWorkerTickInvokesEventProcessor).
 func fastConfig() Config {
 	return Config{
 		ConcurrencyCap:   8,
 		PollInterval:     10 * time.Millisecond,
 		GracefulShutdown: 500 * time.Millisecond,
 		HardShutdown:     2 * time.Second,
+		ClientFactory:    StubClientFactory,
 	}
 }
 
