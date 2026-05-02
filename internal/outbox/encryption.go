@@ -57,6 +57,26 @@ func SelectMode(ctx context.Context, client proton.Client, recipients []string) 
 	}
 	out := make(map[string]EncryptionMode, len(recipients))
 	for _, raw := range recipients {
+		// Pre-loop ctx check (Concern C1 in the hostile review). With
+		// sequential GetPublicKeys calls a multi-recipient submission
+		// can exhaust the per-Submit deadline mid-loop. The next
+		// GetPublicKeys would return ctx.DeadlineExceeded, which the
+		// fail-closed branch below would wrap as *ErrKeyLookup — and
+		// the SMTP mapper would pick 451 4.4.4 (key-lookup) instead
+		// of 451 4.4.7 (timeout). The sender's MTA tracks these
+		// separately. Promote the ctx-deadline case to
+		// ErrSubmissionTimedOut here so the mapper picks the correct
+		// timeout code.
+		//
+		// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+		// Confirmation" — code mapping reflects the actual cause.
+		if err := ctx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, ErrSubmissionTimedOut
+			}
+			return nil, err
+		}
+
 		addr := normaliseRecipient(raw)
 		if addr == "" {
 			return nil, &ErrKeyLookup{
@@ -67,7 +87,13 @@ func SelectMode(ctx context.Context, client proton.Client, recipients []string) 
 
 		keys, recipientType, err := client.GetPublicKeys(ctx, addr)
 		if err != nil {
-			// Fail closed. See top-of-function rationale.
+			// If the failure was the ctx deadline elapsing during the
+			// upstream call, surface it as a timeout (same rationale
+			// as the pre-loop check above). Otherwise fail closed
+			// with *ErrKeyLookup — see top-of-function rationale.
+			if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(ctxErr, context.DeadlineExceeded) {
+				return nil, ErrSubmissionTimedOut
+			}
 			return nil, &ErrKeyLookup{Recipient: addr, Cause: err}
 		}
 

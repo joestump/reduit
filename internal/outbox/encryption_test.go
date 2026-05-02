@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/joestump/reduit/internal/proton"
 )
@@ -390,5 +391,88 @@ func TestSelectMode_UnknownRecipientTypeFailsClosed(t *testing.T) {
 	var keyErr *ErrKeyLookup
 	if !errors.As(err, &keyErr) {
 		t.Errorf("expected *ErrKeyLookup, got %T: %v", err, err)
+	}
+}
+
+// slowKeyClient simulates an upstream /core/v4/keys that takes longer
+// than the ctx allows for. Each GetPublicKeys call sleeps for `delay`
+// (or until ctx fires, whichever first), then returns the configured
+// keys. Used by the multi-recipient timeout test below.
+type slowKeyClient struct {
+	fakeProtonClient
+	delay time.Duration
+}
+
+func (s *slowKeyClient) GetPublicKeys(ctx context.Context, _ string) (proton.PublicKeys, proton.RecipientType, error) {
+	select {
+	case <-time.After(s.delay):
+		return proton.PublicKeys{{Flags: proton.KeyStateActive | proton.KeyStateTrusted, PublicKey: "PGP"}},
+			proton.RecipientTypeInternal, nil
+	case <-ctx.Done():
+		return nil, proton.RecipientTypeExternal, ctx.Err()
+	}
+}
+
+// TestSelectMode_MultiRecipientTimeoutMapsToTimedOut covers Concern C1
+// from the hostile review: a multi-recipient submission whose ctx
+// deadline fires mid-loop (because each GetPublicKeys ate enough of the
+// budget to leave nothing for the next iteration) MUST surface as
+// ErrSubmissionTimedOut, not *ErrKeyLookup. The SMTP code mapping for
+// 451 4.4.7 (timeout) is distinct from 451 4.4.4 (key-lookup); a
+// sender's MTA may track these separately and a mis-classification
+// misleads it.
+//
+// Setup: ctx has 80ms; per-recipient delay is 60ms; two recipients.
+// First lookup completes; second is cancelled by the deadline.
+//
+// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+// Confirmation" — code reflects actual cause.
+func TestSelectMode_MultiRecipientTimeoutMapsToTimedOut(t *testing.T) {
+	t.Parallel()
+	fc := &slowKeyClient{delay: 60 * time.Millisecond}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+
+	_, err := SelectMode(ctx, fc, []string{
+		"alice@proton.me",
+		"bob@proton.me",
+	})
+	if err == nil {
+		t.Fatal("SelectMode succeeded under ctx deadline; expected timeout")
+	}
+	if !errors.Is(err, ErrSubmissionTimedOut) {
+		var keyErr *ErrKeyLookup
+		if errors.As(err, &keyErr) {
+			t.Fatalf("err = *ErrKeyLookup (would map to 451 4.4.4); want ErrSubmissionTimedOut (451 4.4.7). cause: %v", err)
+		}
+		t.Fatalf("err = %T %v; want ErrSubmissionTimedOut", err, err)
+	}
+}
+
+// TestSelectMode_PreLoopTimeoutMapsToTimedOut covers the corner case
+// where the ctx is already past its deadline before the first
+// GetPublicKeys call. The pre-loop ctx.Err() check picks this up.
+func TestSelectMode_PreLoopTimeoutMapsToTimedOut(t *testing.T) {
+	t.Parallel()
+	fc := &fakeProtonClient{keys: map[string]struct {
+		keys     proton.PublicKeys
+		rcptType proton.RecipientType
+		err      error
+	}{
+		"alice@proton.me": {
+			keys:     proton.PublicKeys{{Flags: proton.KeyStateActive | proton.KeyStateTrusted, PublicKey: "PGP"}},
+			rcptType: proton.RecipientTypeInternal,
+		},
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
+	defer cancel()
+	// Sleep past the deadline so the first iteration sees ctx.Err().
+	time.Sleep(5 * time.Millisecond)
+
+	_, err := SelectMode(ctx, fc, []string{"alice@proton.me"})
+	if !errors.Is(err, ErrSubmissionTimedOut) {
+		t.Fatalf("err = %T %v; want ErrSubmissionTimedOut", err, err)
 	}
 }

@@ -169,14 +169,43 @@ func (w *worker) Submit(ctx context.Context, sub Submission) Result {
 		// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
 		// Confirmation" — synchronous-first, no Reduit-side retry.
 		if errors.Is(subCtx.Err(), context.DeadlineExceeded) {
-			// Fire-and-forget the audit row; PendingStore writes are
-			// best-effort and the worker should not block returning
-			// the 451 on a SQLite write.
-			w.recordTimeout(sub, ErrSubmissionTimedOut)
+			// Fire-and-forget the audit row off the synchronous
+			// response path. recordTimeout is bounded by its own
+			// 5-second ctx; running it inline would add up to 5s of
+			// SMTP-visible latency to the timeout reply, and on a
+			// busy host the DATA-handler's parent ctx (submitTimeout
+			// + 5s headroom) could fire mid-write — cancelling the
+			// audit row we are trying to persist.
+			//
+			// Concern C2 (hostile review): move the audit off the
+			// synchronous critical path so the 451 reply latency
+			// equals the SubmitTimeout, not SubmitTimeout +
+			// audit-write.
+			w.fireAuditRow(sub, ErrSubmissionTimedOut)
 			return Result{Err: ErrSubmissionTimedOut}
 		}
 		return Result{Err: subCtx.Err()}
 	}
+}
+
+// fireAuditRow runs recordTimeout on a tracked goroutine so the
+// synchronous Submit returns immediately. The goroutine is added to
+// inflight so Manager.Shutdown waits for it; without that, goleak
+// (TestMain in main_test.go) flags it as a leak.
+//
+// We do NOT wait on the goroutine — that would defeat the purpose.
+// On shutdown, audit rows in flight beyond ctx are abandoned by
+// design; the audit table is operator-visible context, not a delivery
+// guarantee.
+//
+// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+// Confirmation" — audit must not gate the 451 reply latency.
+func (w *worker) fireAuditRow(sub Submission, cause error) {
+	w.inflight.Add(1)
+	go func() {
+		defer w.inflight.Done()
+		w.recordTimeout(sub, cause)
+	}()
 }
 
 // recordTimeout writes a best-effort audit row for the timeout-

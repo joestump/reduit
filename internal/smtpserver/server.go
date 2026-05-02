@@ -225,7 +225,21 @@ func New(cfg Config) (*Server, error) {
 	// ReadTimeout / WriteTimeout bound a slow client. Submit timeout
 	// applies per-DATA write; the value is generous so legitimate
 	// large attachments can flow.
-	smtpSrv.WriteTimeout = cfg.resolveSubmitTimeout()
+	//
+	// WriteTimeout MUST be strictly larger than SubmitTimeout (Concern
+	// C3 in the hostile review). The DATA handler blocks on
+	// outbox.Submit for up to SubmitTimeout, then writes the 451 reply.
+	// If WriteTimeout == SubmitTimeout the underlying socket write
+	// deadline can race the response write — the client sees a
+	// connection reset instead of the proper 451 4.4.7. We add the
+	// same 5s headroom the DATA handler uses for its parent ctx so
+	// the entire round trip — synchronous wait + reply write — fits
+	// inside the wire-level deadline.
+	//
+	// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+	// Confirmation" — the 451 reply MUST reach the client.
+	const writeHeadroom = 5 * time.Second
+	smtpSrv.WriteTimeout = cfg.resolveSubmitTimeout() + writeHeadroom
 	smtpSrv.ReadTimeout = cfg.resolveSubmitTimeout()
 	// AllowInsecureAuth is set true ON PURPOSE: we wrap every accepted
 	// *tls.Conn in a *lockedConn (see lockedconn.go) to serialise
