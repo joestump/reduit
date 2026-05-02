@@ -100,13 +100,16 @@ type Config struct {
 	Now func() time.Time
 
 	// ClientFactory is invoked once per worker startup to obtain a
-	// session-bearing proton.Client. nil means workers run in
-	// "no-Proton" mode: they do not call GetEvent, do not touch the
-	// cursor, and emit a single DEBUG log per tick. This degraded
-	// mode exists so the supervisor still behaves correctly in tests
-	// that exercise lifecycle (start/stop/panic) without needing a
-	// fake Proton client. Production callers MUST supply a non-nil
-	// factory.
+	// session-bearing proton.Client. MUST be non-nil — New() rejects
+	// a nil factory so a production deploy that forgets to wire it
+	// fails loudly at boot rather than silently logging "no-Proton
+	// mode" forever.
+	//
+	// Tests that exercise lifecycle (start/stop/panic) without
+	// needing a real Proton client construct a no-op factory via
+	// StubClientFactory. The previous "nil means no-Proton mode"
+	// behaviour was removed after PR #41's hostile review flagged
+	// the silent-broken-state risk.
 	//
 	// Governing: SPEC-0002 REQ "Event Cursor Persistence" — the
 	// factory is the only path through which a worker reaches Proton.
@@ -249,9 +252,21 @@ type Supervisor struct {
 //
 // The supervisor is created in the stopped state. Call Start to
 // activate it.
+//
+// Both `svc` and `cfg.ClientFactory` MUST be non-nil. A nil factory
+// previously triggered a "no-Proton mode" code path that was silent
+// at WARN/ERROR level; PR #41's hostile review pointed out that a
+// production deploy that forgot to wire the factory would never sync
+// anything and produce no operator-visible signal. New() now rejects
+// it at boot so the misconfiguration is loud and immediate. Tests
+// that need a Supervisor without a real Proton client construct one
+// via StubClientFactory.
 func New(svc account.Service, cfg Config) *Supervisor {
 	if svc == nil {
 		panic("sync: New called with nil account.Service")
+	}
+	if cfg.ClientFactory == nil {
+		panic("sync: New called with nil Config.ClientFactory; production callers MUST wire one, tests should use StubClientFactory")
 	}
 	resolved := cfg.resolved()
 	return &Supervisor{
