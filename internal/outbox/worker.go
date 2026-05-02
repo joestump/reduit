@@ -157,6 +157,13 @@ func (w *worker) Submit(ctx context.Context, sub Submission) Result {
 	case r := <-resultCh:
 		return r
 	case <-subCtx.Done():
+		// TODO(#50): if the child's SendDraft succeeded the instant
+		// subCtx fired, both arms of this select are ready and Go may
+		// pick this one — the upstream send landed but we report
+		// ErrSubmissionTimedOut, the sender's MTA retries, and Proton
+		// receives a duplicate. The dedup-keyed retry design in #50 is
+		// the canonical fix.
+		//
 		// Synchronous waiter abandons the in-flight call. The child
 		// goroutine above will observe subCtx.Done() on its next
 		// ctx-aware call (GetPublicKeys / SendDraft), drop its result
@@ -399,6 +406,16 @@ func classifyBuilderError(err error) error {
 //	413 / 422 / 4xx    → ErrProtonReject (SMTP 550)
 //	5xx and net errs   → ErrProtonServer (SMTP 451)
 func classifySendDraftError(err error) error {
+	// When the parent select races between resultCh and subCtx.Done()
+	// on simultaneous readiness, Go's pseudo-random pick can deliver
+	// the SendDraft error path even though the deadline has fired. A
+	// wrapped context.DeadlineExceeded must surface as a timeout
+	// (451 4.4.7) — falling through to *ErrProtonServer would mis-map
+	// it to 451 4.5.0 and hide timeout patterns from sender MTAs that
+	// track those distinctly. Mirrors the C1 fix in SelectMode.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ErrSubmissionTimedOut
+	}
 	var apiErr *proton.APIError
 	if errors.As(err, &apiErr) && apiErr != nil {
 		switch {

@@ -293,6 +293,48 @@ func TestClassifySendDraftError_WrappedPointerAPIError(t *testing.T) {
 	}
 }
 
+// TestClassifySendDraftError_DetectsDeadlineExceeded verifies that a
+// wrapped context.DeadlineExceeded surfaces as ErrSubmissionTimedOut so
+// the SMTP layer maps it to 451 4.4.7 (timeout) instead of falling
+// through to *ErrProtonServer (451 4.5.0). When the parent select
+// races between resultCh and subCtx.Done() on simultaneous readiness,
+// Go's pseudo-random pick can deliver the SendDraft branch with a
+// ctx-deadline error in the chain — sender MTAs track 4.4.7 vs 4.5.0
+// distinctly, so mis-classifying as 4.5.0 hides timeout patterns from
+// operators. This is the same shape of fix C1 applied to SelectMode.
+//
+// context.Canceled is intentionally NOT remapped: a parent-ctx cancel
+// (client disconnect) is not a timeout, and the Submit-level select
+// (worker.go:111) already returns subCtx.Err() verbatim for that case.
+//
+// Governing: SPEC-0004 REQ "Outbox Handoff and Synchronous
+// Confirmation" — error code mapping must reflect the actual failure
+// class on the wire.
+func TestClassifySendDraftError_DetectsDeadlineExceeded(t *testing.T) {
+	t.Parallel()
+	t.Run("wrapped-deadline-exceeded-maps-to-timeout", func(t *testing.T) {
+		t.Parallel()
+		wrapped := fmt.Errorf("send draft: %w", context.DeadlineExceeded)
+		classified := classifySendDraftError(wrapped)
+		if !errors.Is(classified, ErrSubmissionTimedOut) {
+			t.Fatalf("classifySendDraftError(deadline) = %T %v; want ErrSubmissionTimedOut", classified, classified)
+		}
+	})
+	t.Run("wrapped-context-canceled-does-not-remap", func(t *testing.T) {
+		t.Parallel()
+		// Parent-ctx cancel is a different class than deadline-exceeded:
+		// the client disconnected, the SMTP layer already has nowhere
+		// to write a reply, and no timeout actually fired. Falling
+		// through to *ErrProtonServer is acceptable here; what matters
+		// is we do NOT mis-claim a timeout.
+		wrapped := fmt.Errorf("send draft: %w", context.Canceled)
+		classified := classifySendDraftError(wrapped)
+		if errors.Is(classified, ErrSubmissionTimedOut) {
+			t.Fatalf("classifySendDraftError(canceled) = %v; must not remap to ErrSubmissionTimedOut", classified)
+		}
+	})
+}
+
 // TestSubmit_BuilderFailureMapsToReject: a Builder that returns an
 // error surfaces as *ErrProtonReject. The session-side mapper then
 // turns that into a 550.
