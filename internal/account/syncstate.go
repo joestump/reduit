@@ -23,6 +23,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -169,14 +170,24 @@ func (s *service) SetSyncState(ctx context.Context, accountID, cursor string, tx
 			// Mirror the pattern in repository.transitionState: a failed
 			// rollback after a failed (or panicked) txWork is not
 			// actionable from the caller's perspective, but we want it
-			// in the logs so a wedged connection can be correlated with
-			// downstream errors.
+			// in the logs so a wedged SQLite connection can be
+			// correlated with downstream errors. sql.ErrTxDone is the
+			// benign "tx already finished normally" case and is
+			// filtered out so a normally-committed call does not log
+			// spurious warnings.
 			//
-			// We use slog.Default rather than threading a logger through
-			// because Service does not currently carry one and adding
-			// one solely for this defer would balloon this PR. The
-			// supervisor's logger surfaces the wrapping error from the
-			// caller side anyway, which is the action-relevant signal.
+			// We use slog.Default() rather than threading a logger
+			// through Service because Service does not currently carry
+			// one and adding one solely for this defer would balloon
+			// the surface area. Hostile-review fix on PR #41: the
+			// previous version's body was empty (comment-only), so a
+			// wedged connection during rollback failure was invisible
+			// to operators.
+			slog.Default().LogAttrs(ctx, slog.LevelWarn,
+				"account: SetSyncState rollback failed",
+				slog.String("account_id", accountID),
+				slog.Any("error", rbErr),
+			)
 		}
 	}()
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -197,6 +198,79 @@ func TestSetSyncStateRejectsMultipleTxWork(t *testing.T) {
 
 	noop := func(*sqlx.Tx) error { return nil }
 	_ = svc.SetSyncState(ctx, a.ID, "evt", noop, noop)
+}
+
+// TestSetSyncStateLogsRollbackFailure pins PR #41's hostile-review
+// fix for Blocker 1: when txWork returns an error AND the deferred
+// Rollback then also fails, the previous code dropped the rollback
+// error silently (the if-block body was a comment claiming "logs to
+// slog.Default"). The fix issues a real slog.Warn so a wedged SQLite
+// connection during rollback failure can be correlated with
+// downstream errors.
+//
+// We force the rollback failure by issuing a manual `ROLLBACK` SQL
+// statement inside the txWork. The driver layer accepts the SQL but
+// sqlx's Go-side tx state machine still expects the deferred
+// Rollback to do real work — when it runs, the driver rejects it
+// with a non-ErrTxDone error, exactly the failure mode the WARN
+// line exists to surface.
+func TestSetSyncStateLogsRollbackFailure(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-rollback-log"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Capture slog.Default output. Restore the original handler at
+	// test exit so we don't poison sibling tests in the same package.
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	var logBuf rollbackLogSink
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	wantTxErr := errors.New("simulated derived-state failure")
+	err = svc.SetSyncState(ctx, a.ID, "evt-rollback-log", func(tx *sqlx.Tx) error {
+		if _, rbErr := tx.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
+			return fmt.Errorf("manual rollback: %w", rbErr)
+		}
+		return wantTxErr
+	})
+	if !errors.Is(err, wantTxErr) {
+		t.Fatalf("SetSyncState err = %v, want wraps %v", err, wantTxErr)
+	}
+
+	if !logBuf.contains("SetSyncState rollback failed") {
+		t.Errorf("expected slog.Warn for rollback failure; got logs:\n%s", logBuf.String())
+	}
+}
+
+// rollbackLogSink is a tiny io.Writer that captures slog output for
+// assertion. We can't use bytes.Buffer directly because slog calls
+// Write concurrently in some configurations.
+type rollbackLogSink struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+func (s *rollbackLogSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf = append(s.buf, p...)
+	return len(p), nil
+}
+
+func (s *rollbackLogSink) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return string(s.buf)
+}
+
+func (s *rollbackLogSink) contains(needle string) bool {
+	return strings.Contains(s.String(), needle)
 }
 
 // TestSetSyncStateAccountCascade locks in the SPEC-0001 REQ
