@@ -113,6 +113,20 @@ type Client interface {
 	// GetAttachment downloads the decrypted bytes of one attachment.
 	GetAttachment(ctx context.Context, attachmentID string) ([]byte, error)
 
+	// LabelMessages adds the given Proton label ID to each message in
+	// messageIDs. Used by the IMAP MOVE / COPY handlers to translate
+	// per-mailbox membership into Proton's additive label model.
+	//
+	// Governing: SPEC-0003 REQ "Folder Hierarchy and Mapping" — moves
+	// between system folders or between Labels/* mailboxes are
+	// implemented as a remove-old + add-new pair on the Proton side.
+	LabelMessages(ctx context.Context, messageIDs []string, labelID string) error
+
+	// UnlabelMessages is the inverse: removes the given Proton label
+	// from each message. Paired with LabelMessages by the IMAP MOVE
+	// handler to materialise the additive model.
+	UnlabelMessages(ctx context.Context, messageIDs []string, labelID string) error
+
 	// Logout revokes the session via /auth/v4 DELETE and releases
 	// the underlying upstream client. Idempotent; safe to call on a
 	// pre-auth client (returns nil).
@@ -294,6 +308,26 @@ func (c *clientImpl) GetAttachment(ctx context.Context, attachmentID string) ([]
 	}
 	defer release()
 	return up.GetAttachment(ctx, attachmentID)
+}
+
+// LabelMessages forwards to the upstream client.
+func (c *clientImpl) LabelMessages(ctx context.Context, messageIDs []string, labelID string) error {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return up.LabelMessages(ctx, messageIDs, labelID)
+}
+
+// UnlabelMessages forwards to the upstream client.
+func (c *clientImpl) UnlabelMessages(ctx context.Context, messageIDs []string, labelID string) error {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return up.UnlabelMessages(ctx, messageIDs, labelID)
 }
 
 // Logout revokes the session and tears down the upstream client.
