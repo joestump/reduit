@@ -4,12 +4,14 @@
 
 The Reduit **admin UI** is the HTTP control plane: OIDC-gated web
 surface for first-time setup, Proton-account configuration, ongoing
-management, sync-status visibility, and per-user IMAP/SMTP credential
-rotation. It is server-rendered HTML using HTMX for interactions and
-SSE for live updates per ADR-0005.
+management, sync-status visibility, and per-account IMAP/SMTP
+credential rotation. It is server-rendered HTML using HTMX for
+interactions and SSE for live updates per ADR-0005. A user (one OIDC
+identity) MAY own zero or more accounts (Proton mailboxes) per
+ADR-0010 / SPEC-0001.
 
-Governing: ADR-0004 (OIDC), ADR-0005 (frontend stack), SPEC-0001
-(Account Model).
+Governing: ADR-0004 (OIDC), ADR-0005 (frontend stack), ADR-0010
+(multi-Proton-account per user), SPEC-0001 (Account Model).
 
 ## Requirements
 
@@ -29,9 +31,12 @@ redirect to the OIDC login flow.
 #### Scenario: Authenticated request proceeds
 
 - **WHEN** the request carries a valid `reduit_session` cookie that
-  resolves to an active session for an account
+  resolves to an active session bound to an OIDC subject
 - **THEN** the request SHALL proceed to the route handler with the
-  account in context
+  user identity (`Principal.Subject`) in context. Routes that
+  require an account in scope SHALL resolve the account from the
+  request path or query and SHALL verify the authenticated user
+  owns it (or is admin) per SPEC-0001
 
 #### Scenario: Allowlist bypasses auth
 
@@ -61,14 +66,25 @@ The login flow MUST follow OIDC authorization-code with PKCE.
   token's signature, issuer, audience, and nonce, and create a
   Reduit session bound to the OIDC `sub` claim
 
-#### Scenario: First-time login auto-creates account
+#### Scenario: First-time login establishes user identity only
 
-- **WHEN** the OIDC `sub` claim has no existing account record AND
-  `OIDC_AUTO_CREATE` is true
-- **THEN** the server SHALL create a new account record in state
-  `pending_proton_setup` and bind the session to it. If
-  `OIDC_AUTO_CREATE` is false, the server SHALL respond `403
-  Forbidden — contact your administrator`
+- **WHEN** the OIDC `sub` claim has not been seen before AND the
+  configured login policy permits the user (admin allowlist or an
+  equivalent gate; `OIDC_AUTO_CREATE` semantics now apply to user
+  admittance, not account creation)
+- **THEN** the server SHALL create a session bound to the OIDC
+  `sub` claim and SHALL NOT create an `accounts` row. Account
+  creation is a separate, deliberate action via the add-account
+  wizard. If the login policy denies the user, the server SHALL
+  respond `403 Forbidden — contact your administrator`
+
+#### Scenario: Post-login routing depends on account ownership
+
+- **WHEN** OIDC login succeeds
+- **THEN** the server SHALL redirect to `?return_to` if present and
+  authorized; otherwise to `/accounts`. If the authenticated user
+  owns zero accounts, `/accounts` SHALL render the empty-state
+  variant defined under "Account Dashboard"
 
 #### Scenario: Logout clears local session
 
@@ -80,9 +96,35 @@ The login flow MUST follow OIDC authorization-code with PKCE.
 
 ### Requirement: Add-Proton-Account Wizard
 
-A multi-step HTMX wizard MUST guide a user through Proton account
-configuration: email, password, optional 2FA, mailbox passphrase.
-Each step renders as a partial swapped into the wizard container.
+A multi-step HTMX wizard MUST guide a user through adding a Proton
+account: email, password, optional 2FA, mailbox passphrase. Each step
+renders as a partial swapped into the wizard container. The wizard
+MUST be repeatable: a user MAY run it any number of times to add
+additional Proton accounts they own (per SPEC-0001 ownership rules).
+The wizard prose MUST be neutral about ownership ("Add a Proton
+account", not "Add your Proton account") so that the second-and-later
+runs read naturally.
+
+#### Scenario: Wizard creates the account on entry, owned by the authenticated user
+
+- **WHEN** an authenticated user begins the wizard at
+  `/accounts/setup`
+- **THEN** the server SHALL create a new account row in state
+  `pending_proton_setup` with `owner_oidc_sub` set to the
+  authenticated user's OIDC subject. The wizard SHALL operate on
+  that row for the remainder of the flow
+
+#### Scenario: Wizard is repeatable
+
+- **WHEN** an authenticated user who already owns one or more
+  accounts initiates the wizard again
+- **THEN** the server SHALL accept the request and SHALL NOT block
+  on grounds that the user already owns an account. The server
+  SHALL reject only the specific case where the resulting Proton
+  account would duplicate one the user already owns (per SPEC-0001
+  uniqueness on `(owner_oidc_sub, proton_user_id)`); that rejection
+  SHALL render an inline "you already added that Proton account"
+  error
 
 #### Scenario: Step 1 — Proton email and password
 
@@ -128,21 +170,35 @@ Each step renders as a partial swapped into the wizard container.
 ### Requirement: Account Dashboard
 
 An authenticated user MUST see a dashboard at `/accounts` that lists
-their account(s) and current state.
+the accounts they own and their current state. A user MAY own zero,
+one, or many accounts.
 
-#### Scenario: User sees only their own account
+#### Scenario: User sees only the accounts they own
 
 - **WHEN** a non-admin user visits `/accounts`
-- **THEN** the page SHALL render exactly one account card (theirs)
-  showing state, last sync time, and per-user IMAP/SMTP host
-  configuration
+- **THEN** the page SHALL render one card per account where
+  `owner_oidc_sub` equals the authenticated user's OIDC subject,
+  each showing state, last sync time, and per-account IMAP/SMTP
+  host configuration. The page SHALL also include an "Add another
+  Proton account" call-to-action that links to the wizard
 
-#### Scenario: Admin sees all accounts
+#### Scenario: User with zero accounts lands on the wizard or empty state
 
-- **WHEN** an admin user visits `/accounts`
-- **THEN** the page SHALL render all account cards. Admin actions
-  (suspend, delete) SHALL be visible only on this view, not on the
-  non-admin view
+- **WHEN** an authenticated user who owns zero accounts visits
+  `/accounts`
+- **THEN** the server SHALL render an explicit empty state with a
+  primary "Add a Proton account" call-to-action linking to
+  `/accounts/setup`. The server MAY redirect directly to
+  `/accounts/setup` instead, at the implementation's discretion
+
+#### Scenario: Admin sees all accounts grouped by owner
+
+- **WHEN** an admin user visits `/accounts` (or the admin
+  all-accounts view at `/admin/accounts`)
+- **THEN** the page SHALL render all account cards, grouped by
+  `owner_oidc_sub`. Admin actions (suspend, delete) SHALL be
+  visible only on the admin view. The admin's own accounts SHALL
+  be presented in their own group like any other owner's
 
 ### Requirement: Sync Status via SSE
 
@@ -169,35 +225,41 @@ The account dashboard MUST push live sync status updates via SSE.
   `Cache-Control: no-cache`, and SHALL emit comment-only heartbeats
   every 15 seconds to keep idle proxies from closing the connection
 
-### Requirement: Per-User IMAP/SMTP Credentials
+### Requirement: Per-Account IMAP/SMTP Credentials
 
-A user MUST be able to view their relay IMAP/SMTP host, port,
-username, and rotate their password from the admin UI. The plaintext
-password MUST be displayed exactly once at rotation.
+A user MUST be able to view the relay IMAP/SMTP host, port, username,
+and rotate the password for any account they own from the admin UI.
+Relay credentials are per-account; a user with multiple accounts has
+distinct credentials for each. The plaintext password MUST be
+displayed exactly once at rotation.
 
-#### Scenario: Credentials view shows host and username
+#### Scenario: Credentials view shows host and username for an owned account
 
-- **WHEN** a user visits `/accounts/me/credentials`
+- **WHEN** a user visits the credentials view for an account they
+  own (e.g., `/accounts/{id}/credentials`)
 - **THEN** the page SHALL display IMAP host, IMAP port (993),
-  SMTP host, SMTP port (465), and username (`user@host`). The
-  password SHALL NOT be shown — only the rotation button
+  SMTP host, SMTP port (465), and the per-account username
+  (`user@host`). The password SHALL NOT be shown — only the
+  rotation button. If the user does not own the referenced account
+  (and is not admin), the server SHALL respond `403 Forbidden`
 
 #### Scenario: Rotation generates new password and shows once
 
-- **WHEN** a user clicks the rotation button
+- **WHEN** a user clicks the rotation button on an owned account
 - **THEN** the server SHALL generate a new random password (32+
   bytes of entropy, encoded as a 24-char base32 string for
   email-client friendliness), update both the encrypted ciphertext
-  and the bcrypt/Argon2id hash, and render the new password in a
-  one-time-display modal with a copy-to-clipboard button. After
-  modal close the password MUST NOT be retrievable
+  and the bcrypt/Argon2id hash for that account, and render the
+  new password in a one-time-display modal with a copy-to-clipboard
+  button. After modal close the password MUST NOT be retrievable
 
 #### Scenario: Rotation invalidates existing IMAP/SMTP sessions
 
-- **WHEN** a password is rotated
+- **WHEN** a password is rotated for an account
 - **THEN** all existing IMAP/SMTP sessions for that account SHALL be
   closed within 1 second per SPEC-0003 / SPEC-0004 session-lifetime
-  rules (the new password hash invalidates SASL on next reconnect)
+  rules (the new password hash invalidates SASL on next reconnect).
+  Sessions for the user's other accounts SHALL be unaffected
 
 ### Requirement: Admin Account Management
 
@@ -227,16 +289,22 @@ accounts.
 
 ### Requirement: First-Run Bootstrap
 
-The very first OIDC login on a fresh deployment MUST become the
-initial admin, regardless of `OIDC_ADMIN_SUBS` configuration.
+The very first OIDC login on a fresh deployment MUST establish the
+authenticating user as the initial admin user, regardless of whether
+`OIDC_ADMIN_SUBS` is configured.
 
-#### Scenario: Empty database creates first admin
+#### Scenario: First OIDC login becomes the initial admin user
 
-- **WHEN** the accounts table is empty and the first OIDC login
-  arrives
-- **THEN** the system SHALL auto-create an account with `is_admin =
-  true` and persist the OIDC `sub` to the in-memory admin allowlist.
-  Subsequent admins MUST be configured via env
+- **WHEN** no users have ever authenticated against this Reduit
+  deployment (no rows in `accounts`, no admin allowlist entry has
+  yet matched a real login) and the first OIDC login arrives
+- **THEN** the system SHALL accept the login, establish a session
+  bound to the OIDC `sub` claim, and add that subject to the
+  in-memory admin set so the user is treated as admin for this and
+  subsequent requests. The system MUST NOT create an `accounts`
+  row as a side effect of bootstrap; the user is then routed to
+  the add-account wizard per the dashboard empty-state rule.
+  Subsequent admins MUST be configured via `OIDC_ADMIN_SUBS`
 
 ## Out of Scope
 

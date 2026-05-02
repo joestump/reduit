@@ -44,11 +44,11 @@ flowchart TD
 | POST | `/accounts/setup/auth` | Wizard step 1 submit (email + password) |
 | POST | `/accounts/setup/2fa` | Wizard step 2 submit (TOTP/FIDO2) |
 | POST | `/accounts/setup/unlock` | Wizard step 3 submit (mailbox passphrase) |
-| GET | `/accounts/me/credentials` | View IMAP/SMTP host + rotate password |
-| POST | `/accounts/me/credentials/rotate` | Rotate password; render once-only modal |
-| GET | `/accounts/me/mcp-tokens` | List MCP tokens |
-| POST | `/accounts/me/mcp-tokens` | Issue new MCP token |
-| POST | `/accounts/me/mcp-tokens/{id}/revoke` | Revoke a token |
+| GET | `/accounts/{id}/credentials` | View IMAP/SMTP host + rotate password (owner-only) |
+| POST | `/accounts/{id}/credentials/rotate` | Rotate password; render once-only modal |
+| GET | `/accounts/{id}/mcp-tokens` | List MCP tokens for an owned account |
+| POST | `/accounts/{id}/mcp-tokens` | Issue new MCP token for an owned account |
+| POST | `/accounts/{id}/mcp-tokens/{token_id}/revoke` | Revoke a token |
 | GET | `/sse/accounts/{id}/status` | SSE sync-status stream |
 | GET | `/admin/accounts` | Admin: all accounts |
 | POST | `/admin/accounts/{id}/suspend` | Admin: suspend |
@@ -121,11 +121,15 @@ on every `sync_progress` event).
 
 ## First-run bootstrap
 
-The first OIDC login on an empty database becomes the initial admin.
-Implementation: in the OIDC callback handler, if `SELECT COUNT(*)
-FROM accounts = 0`, the new account is created with `is_admin =
-true` and the OIDC `sub` is added to the in-memory admin set for
-the session. Subsequent logins follow the configured allowlist.
+The first OIDC login on a fresh deployment becomes the initial admin
+user. Implementation: in the OIDC callback handler, if no admin has
+ever authenticated (no allowlist entry has matched a real login and
+no first-run flag has been recorded), the OIDC `sub` is added to
+the in-memory admin set and a sentinel is persisted so subsequent
+logins fall through to the configured allowlist. No `accounts` row
+is created at bootstrap; the user is routed into the add-account
+wizard via the dashboard empty-state rule, and ownership of any
+accounts they create is recorded in `owner_oidc_sub`.
 
 This is documented prominently — the operator MUST log in first
 before exposing Reduit publicly, otherwise an attacker who reaches
@@ -156,5 +160,6 @@ the OIDC redirect could become admin.
 
 - ADR-0004 (OIDC)
 - ADR-0005 (frontend stack)
+- ADR-0010 (multi-Proton-account per user)
 - SPEC-0001 (Account Model)
 - SPEC-0002 (Sync Worker — SSE source)
