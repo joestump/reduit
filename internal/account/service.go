@@ -215,7 +215,7 @@ func newUUIDv7() (string, error) {
 //
 // Governing: SPEC-0001 REQ "Account Identity",
 // SPEC-0001 REQ "Per-Account Data Key" (fresh data key, sealed envelope),
-// SPEC-0001 REQ "Admin Status" (is_admin set from allowlist at create time).
+// SPEC-0001 REQ "Admin Status" (admin computed at session-bind time per ADR-0010; not persisted).
 func (s *service) Create(ctx context.Context, params CreateParams) (*Account, error) {
 	// Defensive trim so a sub pasted with a leading/trailing space
 	// matches the in-memory allowlist (which is configured by an
