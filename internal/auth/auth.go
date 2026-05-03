@@ -49,6 +49,12 @@ var Allowlist = []string{
 	"/metrics",
 	"/auth/login",
 	"/auth/callback",
+	// /auth/logout is allowlisted so it is idempotent for an
+	// unauthenticated visit. The handler always destroys the
+	// session (a no-op when there isn't one) and redirects to "/"
+	// or the IdP's end_session_endpoint. Without allowlisting, a
+	// stale browser tab would redirect-loop through /auth/login.
+	"/auth/logout",
 	"/static/*",
 }
 

@@ -33,13 +33,18 @@ func TestIsAllowlisted(t *testing.T) {
 		{"/metrics", true},
 		{"/auth/login", true},
 		{"/auth/callback", true},
+		// /auth/logout is allowlisted per #23 so a stale browser tab
+		// can hit it without redirect-looping through /auth/login.
+		// The handler always destroys the session (no-op when there
+		// isn't one) and redirects to "/" or the IdP's
+		// end_session_endpoint.
+		{"/auth/logout", true},
 		{"/static/app.js", true},
 		{"/static/img/logo.svg", true},
 		{"/static", true},
 		{"/static/", true}, // edge: bare prefix with slash
 		{"/", false},
 		{"/accounts", false},
-		{"/auth/logout", false},
 		{"/healthz.json", false},  // exact match required for non-prefix entries
 		{"/healthz/extra", false}, // ditto
 		{"/staticky", false},      // not a prefix match
