@@ -78,7 +78,7 @@ type Account struct {
 // Comparison is exact and case-sensitive — Pocket ID and most OIDC
 // providers issue opaque subjects so case-insensitivity would be unsafe.
 //
-// Governing: SPEC-0001 REQ "Admin Flag".
+// Governing: SPEC-0001 REQ "Admin Status".
 func (a Account) AdminBy(adminSubs []string) bool {
 	if a.OIDCSubject == "" {
 		return false

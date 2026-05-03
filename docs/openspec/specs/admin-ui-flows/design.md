@@ -44,11 +44,11 @@ flowchart TD
 | POST | `/accounts/setup/auth` | Wizard step 1 submit (email + password) |
 | POST | `/accounts/setup/2fa` | Wizard step 2 submit (TOTP/FIDO2) |
 | POST | `/accounts/setup/unlock` | Wizard step 3 submit (mailbox passphrase) |
-| GET | `/accounts/me/credentials` | View IMAP/SMTP host + rotate password |
-| POST | `/accounts/me/credentials/rotate` | Rotate password; render once-only modal |
-| GET | `/accounts/me/mcp-tokens` | List MCP tokens |
-| POST | `/accounts/me/mcp-tokens` | Issue new MCP token |
-| POST | `/accounts/me/mcp-tokens/{id}/revoke` | Revoke a token |
+| GET | `/accounts/{id}/credentials` | View IMAP/SMTP host + rotate password (owner-only) |
+| POST | `/accounts/{id}/credentials/rotate` | Rotate password; render once-only modal |
+| GET | `/accounts/{id}/mcp-tokens` | List MCP tokens for an owned account |
+| POST | `/accounts/{id}/mcp-tokens` | Issue new MCP token for an owned account |
+| POST | `/accounts/{id}/mcp-tokens/{token_id}/revoke` | Revoke a token |
 | GET | `/sse/accounts/{id}/status` | SSE sync-status stream |
 | GET | `/admin/accounts` | Admin: all accounts |
 | POST | `/admin/accounts/{id}/suspend` | Admin: suspend |
@@ -121,15 +121,27 @@ on every `sync_progress` event).
 
 ## First-run bootstrap
 
-The first OIDC login on an empty database becomes the initial admin.
-Implementation: in the OIDC callback handler, if `SELECT COUNT(*)
-FROM accounts = 0`, the new account is created with `is_admin =
-true` and the OIDC `sub` is added to the in-memory admin set for
-the session. Subsequent logins follow the configured allowlist.
+The first OIDC login on a fresh deployment creates a regular user.
+There is no auto-promotion to admin. Implementation: in the OIDC
+callback handler, the system upserts a `users` row keyed by the
+authenticating `oidc_subject` and binds a session whose `is_admin`
+tag is computed from `OIDC_ADMIN_SUBS` only. No `accounts` row is
+created at bootstrap; the user is routed into the add-account wizard
+via the dashboard empty-state rule.
 
-This is documented prominently — the operator MUST log in first
-before exposing Reduit publicly, otherwise an attacker who reaches
-the OIDC redirect could become admin.
+If the operator has not yet configured `OIDC_ADMIN_SUBS`, the
+dashboard renders an explicit operator-configuration warning banner
+(per SPEC-0005 First-Run Bootstrap REQ). The system never elevates
+anyone in the absence of allowlist configuration — the safe default
+is "no admin" rather than "first authenticator wins". This removes
+the previous race where an attacker reaching the OIDC redirect
+before the operator could become the de-facto admin.
+
+The warning banner is conservative — it shows whenever the system
+has zero admin-tagged sessions in living memory AND the allowlist
+is empty. It is not a security boundary on its own; the boundary is
+"admin actions require a session whose `is_admin` tag is true, and
+no session can be admin-tagged without an allowlist match."
 
 ## Content security and CSRF
 
@@ -156,5 +168,6 @@ the OIDC redirect could become admin.
 
 - ADR-0004 (OIDC)
 - ADR-0005 (frontend stack)
+- ADR-0010 (multi-Proton-account per user)
 - SPEC-0001 (Account Model)
 - SPEC-0002 (Sync Worker — SSE source)

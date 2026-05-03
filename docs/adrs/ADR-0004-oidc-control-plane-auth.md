@@ -1,8 +1,22 @@
 # ADR-0004: OIDC for control-plane authentication
 
-- **Status:** accepted
+- **Status:** accepted (refined by ADR-0010, 2026-05-03)
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
+
+> **Refined by [ADR-0010](ADR-0010-multi-account-per-user.md) (2026-05-03).**
+> Two clauses in this ADR's Decision Outcome are no longer current:
+> (1) "every authenticated session maps 1:1 to a Reduit account record
+> via the OIDC `sub` claim" — sessions now bind to a `users` row, and
+> a user MAY own zero or more accounts (1:N); (2) "first login auto-
+> creates the account record (configurable: `OIDC_AUTO_CREATE`)" —
+> first login establishes user identity only; account creation is a
+> separate, deliberate action via the add-Proton-account wizard. The
+> rest of this ADR (OIDC as the chosen auth scheme, PKCE auth-code
+> flow, SCS sessions, admin allowlist via `OIDC_ADMIN_SUBS`, no
+> in-Reduit password store) stands. See ADR-0010 for the current
+> users/accounts shape and SPEC-0001 / SPEC-0005 for the current
+> first-login and dashboard contracts.
 
 ## Context and Problem Statement
 
@@ -54,6 +68,10 @@ Pocket ID.**
 - Authorization model: every authenticated session maps 1:1 to a
   Reduit account record via the OIDC `sub` claim. First login auto-
   creates the account record (configurable: `OIDC_AUTO_CREATE`).
+  *(Refined by ADR-0010: sessions bind to a `users` row; users own
+  0..N accounts; first login establishes user identity only and
+  does NOT create an account row — `OIDC_AUTO_CREATE` semantics
+  apply only to user admittance under the current model.)*
 - Admin role: a configurable list of OIDC `sub` claims (or an
   `admin` group claim) gets admin-only routes (manage other users,
   view system logs).
@@ -134,19 +152,26 @@ sequenceDiagram
     R->>I: POST /token (code + code_verifier)
     I-->>R: id_token + access_token
     R->>R: validate signature · iss · aud · nonce
-    R->>R: find account by sub (or auto-create)
-    R->>R: create session in scs store
+    R->>R: upsert users row by sub (per ADR-0010)
+    R->>R: create session in scs store bound to users.id
     R-->>B: Set-Cookie reduit_session; 302 → /accounts
 ```
 
 OIDC authorization-code with PKCE. Reduit never sees the user's
 password. Pocket ID handles password reset, MFA, WebAuthn, and audit;
 Reduit just consumes the resulting `sub` claim and binds it to a
-local account row.
+local `users` row (per ADR-0010 — the original "binds to an account
+row" wording is superseded).
 
 ## References
 
 - ADR-0002 (multi-tenant) — per-user identity required.
+- ADR-0010 (multi-Proton-account per user) — refines the
+  authorization model in this ADR: sessions bind to `users`, not
+  to an account row; first login does not auto-create an account.
+- SPEC-0001 (Account Model) — current users + accounts shape and
+  the "Admin Status" REQ governing session-bind-time admin
+  computation.
 - SPEC-0005 (Admin UI flows) — first-time setup, account list,
   add-Proton-account flow.
 - [Pocket ID](https://github.com/pocket-id/pocket-id)

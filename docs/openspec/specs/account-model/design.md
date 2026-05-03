@@ -2,26 +2,40 @@
 
 ## Architecture
 
-The account model is the top of the multi-tenant data hierarchy.
-Every other piece of state in Reduit (mailbox UID maps, sync cursors,
-sessions, MCP tokens, message metadata) hangs off an `account_id`
-foreign key.
+The account model has two top-level entities — `users` (sourced from
+OIDC) and `accounts` (sourced from Proton, FK to users 1:N) — and a
+single derived attribute (admin status, computed at session-bind time
+from the OIDC subjects allowlist; never persisted).
+
+Every per-account piece of state in Reduit (mailbox UID maps, sync
+cursors, sessions, MCP tokens, message metadata) hangs off an
+`account_id` foreign key. Every per-user lookup uses `users(id)`
+either directly (e.g., session lookup) or transitively via
+`accounts.user_id`.
 
 ```mermaid
 erDiagram
+    users ||--o{ accounts : "owns"
     accounts ||--|{ mailboxes : "owns"
     accounts ||--|{ sync_state : "has"
     accounts ||--o{ sessions : "has"
     accounts ||--o{ mcp_tokens : "issues"
     mailboxes ||--|{ messages : "contains"
     mailboxes ||--|{ uid_assignments : "assigns"
-    accounts {
+    users {
         text id PK
         text oidc_subject UK
+        text email
+        text display_name
+        timestamp created_at
+        timestamp last_login_at
+    }
+    accounts {
+        text id PK
+        text user_id FK
         text proton_user_id
         text email
         text state
-        bool is_admin
         blob key_envelope
         blob refresh_token_ciphertext
         blob mailbox_passphrase_ciphertext
@@ -32,6 +46,26 @@ erDiagram
         timestamp deleted_at
     }
 ```
+
+`users.oidc_subject` is `UNIQUE NOT NULL`. `accounts.user_id` is
+`NOT NULL` and references `users(id)` with `ON DELETE CASCADE`. The
+account-level uniqueness constraint is `(user_id, proton_user_id)` —
+a given user MUST NOT add the same Proton account twice, but two
+distinct users MAY in principle each have a row referencing the same
+`proton_user_id` (access control lives at the per-account relay
+credentials and MCP tokens). An index on `accounts(user_id)` is
+created for the hot "list my accounts" path.
+
+Admin status is **not** a column. It is computed at session-bind
+time by checking `Principal.Subject ∈ OIDC_ADMIN_SUBS` and stored
+on the in-memory session record. The allowlist is read from env at
+startup; any future hot-reload path re-derives the contract at that
+time.
+
+The `accounts` table never carried an `oidc_subject` or `is_admin`
+column in the rewritten migrations — those columns are removed
+greenfield, not dropped via ALTER, because the project has not
+shipped (per ADR-0010 migration approach).
 
 ## Key data structures
 
@@ -98,19 +132,21 @@ the algorithm and key generation; the migration command lands in v0.5.
 
 ## Open questions
 
-- **Identity model nuance**: a single OIDC subject = a single Reduit
-  account = a single Proton account. What happens if a user has TWO
-  Proton accounts (e.g., personal + family)? v0.1 says "create two
-  Reduit accounts via different OIDC users" (e.g., `joe-personal` and
-  `joe-family` Pocket ID identities). Multi-Proton-per-OIDC-subject
-  is deferred.
 - **Audit trail granularity**: state transitions are logged but not
   retained as queryable rows. v0.5 may add an `audit_events` table.
+- **Multi-OIDC-subject linking**: orthogonal feature deferred. The
+  `users` table is a precondition; the linking semantics (primary vs.
+  secondary, IdP trust model, identity-merge UX) are out of scope for
+  this ADR.
+- **User-row removal UX**: v0.1 has no admin UI for deleting users;
+  it is an operator-tool action. The `ON DELETE CASCADE` from `users`
+  to `accounts` is the safety primitive when it does happen.
 
 ## References
 
 - ADR-0002 (multi-tenant)
 - ADR-0003 (encryption-at-rest)
 - ADR-0006 (SQLite store)
+- ADR-0010 (multi-Proton-account per user)
 - SPEC-0002 (sync worker — reads `last_event_id` from the account row)
 - SPEC-0003 (IMAP server — reads `imap_password_hash` for SASL)

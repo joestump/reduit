@@ -220,7 +220,7 @@ func denySessionMissing(w http.ResponseWriter, r *http.Request, loginPath string
 // not as a redirect.
 //
 // Governing: SPEC-0005 REQ "Admin Account Management" (admin-only
-// routes), SPEC-0001 REQ "Admin Flag".
+// routes), SPEC-0001 REQ "Admin Status".
 func RequireAdmin(mgr *scs.SessionManager, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := session.GetIdentity(r.Context(), mgr)

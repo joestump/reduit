@@ -4,7 +4,7 @@
 // SHA-256 hash hits the database. Lookup at request time is O(1) on
 // the unique index over `token_hash`.
 //
-// Issuance UI (POST /accounts/me/mcp-tokens) and revocation UI come
+// Issuance UI (POST /accounts/{id}/mcp-tokens) and revocation UI come
 // in a later story; this package owns the storage primitive and the
 // hash-lookup validator the bearer middleware (issue #13) consumes.
 //
