@@ -20,7 +20,9 @@ import (
 	"embed"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"net/http"
+	"strings"
 	"unicode"
 
 	"github.com/joestump/reduit/internal/auth/session"
@@ -29,15 +31,54 @@ import (
 //go:embed templates/*.html
 var templateFS embed.FS
 
-// loadTemplates parses every .html file under templates/ as a single
-// template tree. The base layout's {{template "content" .}} slot is
-// filled by whichever page-specific template defines `content`.
-func loadTemplates() (*template.Template, error) {
-	tmpl, err := template.New("").ParseFS(templateFS, "templates/*.html")
-	if err != nil {
-		return nil, fmt.Errorf("server: parse templates: %w", err)
+// templateSet holds one parsed *template.Template per page. Each tree
+// contains base.html plus one page-specific file, so each page's
+// {{define "content"}} block is the only one in its tree -- we don't
+// have to fight Go's "last-define-wins" semantics when more than one
+// page wants its own content slot.
+//
+// Lookup is by page name (the bare filename, sans .html). renderPage
+// takes the page name explicitly so a typo surfaces as a 500 with a
+// log line, not as the wrong page rendering silently.
+type templateSet struct {
+	pages map[string]*template.Template
+}
+
+func (ts *templateSet) get(name string) (*template.Template, bool) {
+	if ts == nil {
+		return nil, false
 	}
-	return tmpl, nil
+	t, ok := ts.pages[name]
+	return t, ok
+}
+
+// loadTemplates discovers every page-* file under templates/ and parses
+// each one alongside base.html into its own tree. Files that are
+// shared partials (currently only base.html) are NOT parsed as pages;
+// the convention is "every templates/*.html file other than base.html
+// is a page".
+func loadTemplates() (*templateSet, error) {
+	entries, err := fs.ReadDir(templateFS, "templates")
+	if err != nil {
+		return nil, fmt.Errorf("server: read templates dir: %w", err)
+	}
+	ts := &templateSet{pages: make(map[string]*template.Template)}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".html") || name == "base.html" {
+			continue
+		}
+		page := strings.TrimSuffix(name, ".html")
+		t, err := template.New("").ParseFS(templateFS, "templates/base.html", "templates/"+name)
+		if err != nil {
+			return nil, fmt.Errorf("server: parse template %s: %w", name, err)
+		}
+		ts.pages[page] = t
+	}
+	return ts, nil
 }
 
 // pageData is the common shape every page template consumes.
@@ -113,13 +154,19 @@ func initialsFor(s string) string {
 // renderPage executes the named page template wrapped in the base
 // layout. Errors flow as 500s with the operator detail in the log;
 // the user sees an opaque "internal error".
-func (s *Server) renderPage(w http.ResponseWriter, r *http.Request, data any) {
+func (s *Server) renderPage(w http.ResponseWriter, r *http.Request, page string, data any) {
 	if s.tmpl == nil {
 		http.Error(w, "templates not loaded", http.StatusInternalServerError)
 		return
 	}
+	t, ok := s.tmpl.get(page)
+	if !ok {
+		s.deps.Logger.Error("template not found", "page", page)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	var buf bytes.Buffer
-	if err := s.tmpl.ExecuteTemplate(&buf, "base", data); err != nil {
+	if err := t.ExecuteTemplate(&buf, "base", data); err != nil {
 		s.deps.Logger.Error("template execute: " + err.Error())
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

@@ -47,6 +47,12 @@ func (f *fakeProtonClient) AuthFIDO2(context.Context, proton.FIDO2Req) error {
 func (f *fakeProtonClient) KeySalts(context.Context) (proton.Salts, error) {
 	panic("KeySalts: unexpected call")
 }
+func (f *fakeProtonClient) GetUser(context.Context) (proton.User, error) {
+	panic("GetUser: unexpected call")
+}
+func (f *fakeProtonClient) GetAddresses(context.Context) ([]proton.Address, error) {
+	panic("GetAddresses: unexpected call")
+}
 func (f *fakeProtonClient) Unlock(proton.User, []proton.Address, []byte) (*proton.KeyRing, map[string]*proton.KeyRing, error) {
 	panic("Unlock: unexpected call")
 }
@@ -77,6 +83,7 @@ func (f *fakeProtonClient) GetAttachment(context.Context, string) ([]byte, error
 	panic("GetAttachment: unexpected call")
 }
 func (f *fakeProtonClient) Logout(context.Context) error { return nil }
+func (f *fakeProtonClient) LatestRefreshToken() string   { return "" }
 
 // Methods added to proton.Client by the SPEC-0004 outbox work
 // (GetPublicKeys) and the SPEC-0003 IMAP MOVE/COPY work

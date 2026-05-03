@@ -116,6 +116,21 @@ type SessionGate struct {
 	// account"); SPEC-0005 REQ "Admin Account Management" (suspend /
 	// soft-delete must immediately revoke access).
 	AccountActive func(ctx context.Context, accountID string) (bool, error)
+
+	// OnDestroy, when non-nil, is invoked synchronously just before
+	// every gate-initiated Destroy call (malformed-shape fail-closed,
+	// AccountActive returns false). Lets the composition root attach
+	// per-session cleanup that the auth package can't see directly --
+	// the server uses this to drop in-flight wizard state per
+	// SPEC-0005's "WHEN session invalidated THEN partial credentials
+	// discarded from memory" requirement, since logout is only one
+	// of several invalidation paths.
+	//
+	// Implementations MUST be cheap and self-contained -- the gate
+	// fires this on every gated request that fails the account-state
+	// check, so a slow OnDestroy stalls the deny-and-redirect
+	// response.
+	OnDestroy func(ctx context.Context)
 }
 
 // RequireSession returns middleware that allows allowlisted paths
@@ -171,6 +186,9 @@ func RequireSession(gate SessionGate, next http.Handler) http.Handler {
 						slog.String("subject", id.Subject),
 						slog.String("path", r.URL.Path),
 					)
+					if gate.OnDestroy != nil {
+						gate.OnDestroy(r.Context())
+					}
 					_ = gate.Manager.Destroy(r.Context())
 					denySessionMissing(w, r, loginPath)
 					return
@@ -186,6 +204,9 @@ func RequireSession(gate SessionGate, next http.Handler) http.Handler {
 					// Account no longer authorised. Destroy the
 					// session token (best-effort; failures here MUST
 					// NOT block the response) and force re-login.
+					if gate.OnDestroy != nil {
+						gate.OnDestroy(r.Context())
+					}
 					_ = gate.Manager.Destroy(r.Context())
 					denySessionMissing(w, r, loginPath)
 					return

@@ -159,6 +159,10 @@ func (c *fakeProtonClient) AuthFIDO2(context.Context, proton.FIDO2Req) error {
 	return nil
 }
 func (c *fakeProtonClient) KeySalts(context.Context) (proton.Salts, error) { return nil, nil }
+func (c *fakeProtonClient) GetUser(context.Context) (proton.User, error)   { return proton.User{}, nil }
+func (c *fakeProtonClient) GetAddresses(context.Context) ([]proton.Address, error) {
+	return nil, nil
+}
 func (c *fakeProtonClient) Unlock(_ proton.User, _ []proton.Address, _ []byte) (*proton.KeyRing, map[string]*proton.KeyRing, error) {
 	return nil, nil, nil
 }
@@ -186,6 +190,7 @@ func (c *fakeProtonClient) UnlabelMessages(_ context.Context, msgIDs []string, l
 	return nil
 }
 func (c *fakeProtonClient) Logout(context.Context) error { return nil }
+func (c *fakeProtonClient) LatestRefreshToken() string   { return "" }
 
 // Methods added to proton.Client by SPEC-0002 (GetLatestEventID) and
 // SPEC-0004 (GetPublicKeys). IMAP mailbox tests do not exercise these
@@ -878,6 +883,12 @@ func (c *erroringProtonClient) AuthFIDO2(ctx context.Context, r proton.FIDO2Req)
 func (c *erroringProtonClient) KeySalts(ctx context.Context) (proton.Salts, error) {
 	return c.wrapped.KeySalts(ctx)
 }
+func (c *erroringProtonClient) GetUser(ctx context.Context) (proton.User, error) {
+	return c.wrapped.GetUser(ctx)
+}
+func (c *erroringProtonClient) GetAddresses(ctx context.Context) ([]proton.Address, error) {
+	return c.wrapped.GetAddresses(ctx)
+}
 func (c *erroringProtonClient) Unlock(u proton.User, a []proton.Address, p []byte) (*proton.KeyRing, map[string]*proton.KeyRing, error) {
 	return c.wrapped.Unlock(u, a, p)
 }
@@ -909,6 +920,7 @@ func (c *erroringProtonClient) UnlabelMessages(ctx context.Context, msgIDs []str
 	return c.wrapped.UnlabelMessages(ctx, msgIDs, labelID)
 }
 func (c *erroringProtonClient) Logout(ctx context.Context) error { return c.wrapped.Logout(ctx) }
+func (c *erroringProtonClient) LatestRefreshToken() string       { return c.wrapped.LatestRefreshToken() }
 
 // Forward the SPEC-0002 / SPEC-0004 surface to the wrapped client so
 // erroringProtonClient stays interface-complete after the proton.Client

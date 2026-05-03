@@ -37,6 +37,12 @@ func (stubClient) AuthFIDO2(context.Context, proton.FIDO2Req) error {
 func (stubClient) KeySalts(context.Context) (proton.Salts, error) {
 	panic("stubClient.KeySalts: lifecycle tests must not reach Proton")
 }
+func (stubClient) GetUser(context.Context) (proton.User, error) {
+	panic("stubClient.GetUser: lifecycle tests must not reach Proton")
+}
+func (stubClient) GetAddresses(context.Context) ([]proton.Address, error) {
+	panic("stubClient.GetAddresses: lifecycle tests must not reach Proton")
+}
 func (stubClient) Unlock(proton.User, []proton.Address, []byte) (*proton.KeyRing, map[string]*proton.KeyRing, error) {
 	panic("stubClient.Unlock: lifecycle tests must not reach Proton")
 }
@@ -69,6 +75,7 @@ func (stubClient) GetAttachment(context.Context, string) ([]byte, error) {
 	panic("stubClient.GetAttachment: lifecycle tests must not reach Proton")
 }
 func (stubClient) Logout(context.Context) error { return nil }
+func (stubClient) LatestRefreshToken() string   { return "" }
 
 // Methods added to proton.Client by SPEC-0003 (LabelMessages /
 // UnlabelMessages) and SPEC-0004 (GetPublicKeys). The lifecycle worker

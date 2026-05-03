@@ -164,6 +164,12 @@ runs read naturally.
 
 #### Scenario: Step 2 — FIDO2 if account has FIDO2 enabled
 
+> **Deferred (v0.3 ships without):** PR #78 implements only the
+> TOTP path for step 2. A FIDO2-only account renders a terminal
+> error explaining FIDO2 isn't supported in this release. Tracked
+> in issue #79; ship target is v0.4. The scenario below remains
+> the canonical specification.
+
 - **WHEN** step 1 succeeds and the account requires FIDO2
 - **THEN** the server SHALL render step 2 with the FIDO2 challenge
   via WebAuthn JS API. Submission calls Proton's FIDO2 endpoint

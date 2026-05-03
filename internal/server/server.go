@@ -12,7 +12,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"html/template"
 	"log/slog"
 	"net/http"
 	"time"
@@ -22,9 +21,19 @@ import (
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/auth"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
+	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/users"
 )
+
+// ProtonLoginer is the narrow surface the wizard handlers need from
+// the Proton manager: run an SRP login and hand back a session-bearing
+// Client plus the post-Auth bundle (UID, refresh token, 2FA state).
+// *proton.Manager satisfies it; tests use a stub that doesn't need a
+// live Proton API.
+type ProtonLoginer interface {
+	NewClientWithLogin(ctx context.Context, username, password string) (proton.Client, *proton.Auth, error)
+}
 
 // Deps are the dependencies a Server needs to start. Wired by
 // internal/cli/serve at startup.
@@ -52,6 +61,18 @@ type Deps struct {
 	// routes are mounted; nil in test fixtures that don't exercise
 	// /accounts.
 	AccountService account.Service
+	// ProtonManager mints proton.Client values for the add-account
+	// wizard. The wizard handlers refuse to run without it; tests
+	// that don't exercise /accounts/setup leave it nil. Held as a
+	// narrow interface so wizard tests can inject a stub without
+	// driving go-proton-api's full SRP exchange.
+	//
+	// Governing: ADR-0001, SPEC-0005 REQ "Add-Proton-Account Wizard".
+	ProtonManager ProtonLoginer
+	// WizardSessions is the in-memory store for partially-completed
+	// wizard runs. Required when ProtonManager is wired; constructed
+	// alongside in cli/serve. Tests get an isolated store per server.
+	WizardSessions *WizardSessionStore
 	// AdminSubjects is the OIDC_ADMIN_SUBS allowlist. The callback's
 	// session-bind path checks Principal.Subject against this list at
 	// bind time per SPEC-0005 REQ "Session admin tag is computed at
@@ -70,10 +91,10 @@ type Server struct {
 	srv     *http.Server
 	deps    Deps
 	stopped chan struct{}
-	// tmpl is the parsed template tree shared by every HTML-rendering
+	// tmpl is the per-page template set shared by every HTML-rendering
 	// handler. Nil when templates fail to load -- handlers degrade to
 	// 500 rather than panic.
-	tmpl *template.Template
+	tmpl *templateSet
 }
 
 // New constructs a *Server bound to addr. Routes are mounted via the
@@ -155,6 +176,11 @@ func newWithHandler(deps Deps) (*Server, http.Handler) {
 		handler = auth.RequireSession(auth.SessionGate{
 			Manager:   deps.SessionManager,
 			LoginPath: "/auth/login",
+			// OnDestroy fires on every gate-initiated session
+			// invalidation (malformed-shape, AccountActive false).
+			// We use it to tear down any in-flight wizard so partial
+			// credentials don't outlive the session per SPEC-0005.
+			OnDestroy: s.dropInFlightWizard,
 		}, handler)
 		handler = deps.SessionManager.LoadAndSave(handler)
 	}
@@ -202,6 +228,15 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// Sits behind RequireSession; authenticated users see their own
 	// accounts, admins see every account grouped by owner.
 	mux.HandleFunc("GET /accounts", s.handleAccountsDashboard)
+
+	// Add-Proton-account wizard per SPEC-0005 REQ "Add-Proton-Account
+	// Wizard". GET renders whichever step the in-flight wizard
+	// session is on (or step 1 if none); POSTs advance the flow.
+	mux.HandleFunc("GET /accounts/setup", s.handleWizardStart)
+	mux.HandleFunc("POST /accounts/setup/auth", s.handleWizardAuth)
+	mux.HandleFunc("POST /accounts/setup/2fa", s.handleWizardTOTP)
+	mux.HandleFunc("POST /accounts/setup/unlock", s.handleWizardUnlock)
+	mux.HandleFunc("POST /accounts/setup/cancel", s.handleWizardCancel)
 }
 
 // handleHealthz returns 200 OK if the process is up. It does not

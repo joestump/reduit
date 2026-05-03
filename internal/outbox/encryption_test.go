@@ -47,6 +47,12 @@ func (f *fakeProtonClient) AuthFIDO2(context.Context, proton.FIDO2Req) error {
 func (f *fakeProtonClient) KeySalts(context.Context) (proton.Salts, error) {
 	panic("fakeProtonClient: KeySalts not implemented")
 }
+func (f *fakeProtonClient) GetUser(context.Context) (proton.User, error) {
+	panic("fakeProtonClient: GetUser not implemented")
+}
+func (f *fakeProtonClient) GetAddresses(context.Context) ([]proton.Address, error) {
+	panic("fakeProtonClient: GetAddresses not implemented")
+}
 func (f *fakeProtonClient) Unlock(proton.User, []proton.Address, []byte) (*proton.KeyRing, map[string]*proton.KeyRing, error) {
 	panic("fakeProtonClient: Unlock not implemented")
 }
@@ -64,6 +70,9 @@ func (f *fakeProtonClient) SendDraft(context.Context, string, proton.SendDraftRe
 }
 func (f *fakeProtonClient) GetAttachment(context.Context, string) ([]byte, error) {
 	panic("fakeProtonClient: GetAttachment not implemented")
+}
+func (f *fakeProtonClient) LatestRefreshToken() string {
+	return ""
 }
 func (f *fakeProtonClient) Logout(context.Context) error {
 	panic("fakeProtonClient: Logout not implemented")

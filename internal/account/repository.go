@@ -192,6 +192,36 @@ func (r *repository) setPrimaryAlias(ctx context.Context, id string, alias sql.N
 	return checkOneRow(res, "set primary alias")
 }
 
+// setProtonIdentity stamps proton_user_id + email onto an existing
+// row. Surfaces ErrAccountAlreadyExists when the unique index on
+// (user_id, proton_user_id) trips because the same Proton user is
+// already bound to another row owned by the same Reduit user.
+//
+// userID is part of the WHERE predicate so a wrong-accountID call
+// (handler bug, race, etc.) cannot re-stamp another user's row --
+// the UPDATE matches zero rows in that case and surfaces as
+// ErrAccountNotFound via checkOneRow.
+//
+// Governing: ADR-0010, SPEC-0005 REQ "Add-Proton-Account Wizard";
+// PR #78 hostile N3.
+func (r *repository) setProtonIdentity(ctx context.Context, id, userID string, protonUserID, email sql.NullString, now time.Time) error {
+	const q = `UPDATE accounts SET proton_user_id = ?, email = ?, updated_at = ? WHERE id = ? AND user_id = ?`
+	res, err := r.db.ExecContext(ctx, q, protonUserID, email, now, id, userID)
+	if err != nil {
+		var sqliteErr *sqlite.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
+			return ErrAccountAlreadyExists
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "UNIQUE constraint failed") &&
+			strings.Contains(msg, "accounts.proton_user_id") {
+			return ErrAccountAlreadyExists
+		}
+		return fmt.Errorf("account: set proton identity: %w", err)
+	}
+	return checkOneRow(res, "set proton identity")
+}
+
 // list returns all accounts ordered by created_at ascending. UUIDv7
 // IDs sort by creation time, but we sort by created_at explicitly so
 // the order is stable even if a future ID scheme changes.

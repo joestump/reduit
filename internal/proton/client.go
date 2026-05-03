@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
@@ -29,6 +30,12 @@ type (
 	Auth2FAReq = gpa.Auth2FAReq
 	// FIDO2Req is the FIDO2 second-factor payload nested in Auth2FAReq.
 	FIDO2Req = gpa.FIDO2Req
+	// TwoFAStatus enumerates the 2FA modes Proton has enabled on an
+	// account. The Auth.TwoFA.Enabled field is a bitfield; callers
+	// branch on `enabled & HasTOTP != 0` style checks.
+	TwoFAStatus = gpa.TwoFAStatus
+	// TwoFAInfo is the nested `2FA` payload on Auth/AuthInfo.
+	TwoFAInfo = gpa.TwoFAInfo
 	// Salt is one entry from /core/v4/keys/salts.
 	Salt = gpa.Salt
 	// Salts is the slice form of Salt.
@@ -79,6 +86,15 @@ const (
 	KeyStateActive  = gpa.KeyStateActive
 )
 
+// 2FA mode constants. Auth.TwoFA.Enabled is a bitfield; the wizard
+// branches on `enabled & HasTOTP != 0` etc. to decide which second-
+// factor screen to render.
+const (
+	HasTOTP         = gpa.HasTOTP
+	HasFIDO2        = gpa.HasFIDO2
+	HasFIDO2AndTOTP = gpa.HasFIDO2AndTOTP
+)
+
 // ErrNotAuthenticated is returned by methods that require a session
 // when the wrapping client was constructed without one (or the session
 // has been revoked via Logout).
@@ -116,6 +132,15 @@ type Client interface {
 	// KeySalts fetches the per-key salt list for the authenticated
 	// user. Required input to Unlock.
 	KeySalts(ctx context.Context) (Salts, error)
+
+	// GetUser fetches the authenticated Proton user payload (including
+	// Keys). Required input to Unlock.
+	GetUser(ctx context.Context) (User, error)
+
+	// GetAddresses fetches every address (and per-address keys) belonging
+	// to the authenticated user. Required input to Unlock; the returned
+	// slice drives the per-address keyring map Unlock returns.
+	GetAddresses(ctx context.Context) ([]Address, error)
 
 	// Unlock decrypts the user keyring with the salted mailbox
 	// password. Returns the user keyring and per-address keyrings.
@@ -180,6 +205,20 @@ type Client interface {
 	// the underlying upstream client. Idempotent; safe to call on a
 	// pre-auth client (returns nil).
 	Logout(ctx context.Context) error
+
+	// LatestRefreshToken returns the most recent refresh token the
+	// upstream client has observed -- the initial token returned by
+	// NewClientWithLogin, or whatever a /auth/v4/refresh round-trip
+	// rotated to since. Returns "" on a pre-auth or post-Logout
+	// client.
+	//
+	// Wizards and other short-lived flows that need to persist the
+	// refresh token MUST read this value at the persist site rather
+	// than capturing the initial token at login time -- otherwise a
+	// refresh fired between login and persist (e.g., due to an early
+	// 401 on a key-fetch) would silently overwrite the upstream
+	// session with a token Reduit no longer holds.
+	LatestRefreshToken() string
 }
 
 // clientImpl is the production wrapper around go-proton-api's *Client.
@@ -197,6 +236,12 @@ type clientImpl struct {
 	upMu      sync.RWMutex
 	up        *gpa.Client // nil if pre-auth or post-Logout
 	loggedOut bool
+
+	// latestRefresh captures the most recent refresh token observed
+	// by the upstream auth handler. atomic.Pointer so the wizard
+	// (and any future short-lived flow) can read it without
+	// contending with the per-call lifecycle locks.
+	latestRefresh atomic.Pointer[string]
 }
 
 // adoptUpstream installs `up` as the live upstream client and registers
@@ -223,9 +268,18 @@ func (c *clientImpl) adoptUpstream(up *gpa.Client) {
 // when the account service is initialised lazily — without leaving
 // adopted clients permanently deaf to rotations.
 //
-// Governing: hostile-review Blocker 2 of PR #37.
+// The handler also records the latest refresh token into the per-
+// instance `latestRefresh` atomic so callers (notably the wizard at
+// commit time) can read the freshest value without depending on the
+// Manager-level callback being wired -- the wizard runs before that
+// callback's account context is known.
+//
+// Governing: hostile-review Blocker 2 of PR #37; PR #78 hostile C2.
 func (c *clientImpl) installRefreshHandler(up *gpa.Client) {
 	up.AddAuthHandler(func(a gpa.Auth) {
+		token := a.RefreshToken
+		c.latestRefresh.Store(&token)
+
 		cb := c.mgr.refreshTokenCallback()
 		if cb == nil {
 			return
@@ -242,6 +296,15 @@ func (c *clientImpl) installRefreshHandler(up *gpa.Client) {
 			)
 		}
 	})
+}
+
+// LatestRefreshToken implements Client.LatestRefreshToken.
+func (c *clientImpl) LatestRefreshToken() string {
+	p := c.latestRefresh.Load()
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // requireSession returns the upstream client or ErrNotAuthenticated,
@@ -302,6 +365,26 @@ func (c *clientImpl) KeySalts(ctx context.Context) (Salts, error) {
 	}
 	defer release()
 	return up.GetSalts(ctx)
+}
+
+// GetUser fetches the authenticated user.
+func (c *clientImpl) GetUser(ctx context.Context) (User, error) {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return User{}, err
+	}
+	defer release()
+	return up.GetUser(ctx)
+}
+
+// GetAddresses fetches the authenticated user's addresses.
+func (c *clientImpl) GetAddresses(ctx context.Context) ([]Address, error) {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return up.GetAddresses(ctx)
 }
 
 // Unlock is a pure operation upstream; we just forward.
