@@ -30,10 +30,12 @@
 package server
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/joestump/reduit/internal/auth"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
@@ -44,6 +46,14 @@ import (
 // open-redirect bait). SPEC-0005 anchors this on the account
 // dashboard.
 const defaultPostLoginPath = "/accounts"
+
+// oidcExchangeTimeout bounds the IdP token-exchange round-trip. The
+// server's WriteTimeout (60s) is the outer bound; this inner deadline
+// makes a hung IdP surface as a clear "exchange timeout" log line at
+// 15s rather than as a 60s server timeout. Generous for an OAuth2
+// token exchange against a healthy IdP (Pocket ID returns sub-second
+// in production); tighten if real-world telemetry says otherwise.
+const oidcExchangeTimeout = 15 * time.Second
 
 // handleAuthLogin starts the OIDC auth-code-with-PKCE flow.
 //
@@ -133,7 +143,9 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	// failure later doesn't leave it sitting in the browser jar.
 	http.SetCookie(w, authoidc.ClearBindCookie(s.deps.InsecureCookies))
 
-	exchange, err := s.deps.OIDC.Exchange(r.Context(), code, pre.CodeVerifier, pre.Nonce)
+	exchangeCtx, cancelExchange := context.WithTimeout(r.Context(), oidcExchangeTimeout)
+	defer cancelExchange()
+	exchange, err := s.deps.OIDC.Exchange(exchangeCtx, code, pre.CodeVerifier, pre.Nonce)
 	if err != nil {
 		s.callbackUnauthorized(w, r, "code exchange", err)
 		return
@@ -145,6 +157,18 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		DisplayName: exchange.Name,
 	}, s.deps.AdminSubjects)
 	if err != nil {
+		// BindFromOIDC writes the session in stages (PutIdentity ->
+		// Commit -> BindSessionToUser). A failure after Commit leaves
+		// the browser holding a valid SCS cookie pointing at a
+		// session row whose Subject is set -- IsAuthenticated would
+		// return true on the next request, letting the user past the
+		// gate with a half-bound session that no users-scoped
+		// revocation can find. Destroy unconditionally so any partial
+		// state is cleared. Destroy is idempotent and cheap.
+		if destroyErr := s.deps.SessionManager.Destroy(r.Context()); destroyErr != nil {
+			s.deps.Logger.Warn("auth/callback: destroy after bind error",
+				slog.String("error", destroyErr.Error()))
+		}
 		s.deps.Logger.Error("auth/callback: bind",
 			slog.String("error", err.Error()),
 			slog.String("subject", exchange.Subject))
@@ -231,22 +255,38 @@ func (s *Server) authReady(w http.ResponseWriter) bool {
 // otherwise let an unrelated site funnel users through Reduit's
 // login and land them somewhere off-host.
 //
+// Backslash variants get the same treatment: Chrome and Firefox
+// normalize `\` to `/` when parsing a `Location:` header value, so
+// `/\attacker.example/path` and `\\attacker.example/path` both
+// land the user at attacker.example even though `url.Parse` reports
+// Scheme=Host="" for the raw string. We reject any input whose first
+// two bytes (after a leading `/`, if any) include a `\` -- that's the
+// shape every known browser-side open-redirect bypass for this case
+// takes. See OWASP "Unvalidated Redirects and Forwards".
+//
 // Returns "" on rejection; the caller falls back to defaultPostLoginPath.
 func sanitizeReturnTo(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
 	}
+	// Strip any backslashes from inspection -- a single \ in the first
+	// few bytes is enough to flip browser parsing to authority mode.
+	// Cheap to just reject anything containing \ in the first 3 bytes
+	// (covers `\\x`, `/\x`, `\foo`).
+	for i := 0; i < len(s) && i < 3; i++ {
+		if s[i] == '\\' {
+			return ""
+		}
+	}
 	// Reject scheme://host and //host. These are the two open-redirect
-	// shapes a return_to query param can take.
+	// shapes a return_to query param can take that url.Parse alone
+	// catches.
 	if strings.HasPrefix(s, "//") {
 		return ""
 	}
 	if u, err := url.Parse(s); err != nil || u.Scheme != "" || u.Host != "" {
 		// Parse error => junk; non-empty Scheme/Host => off-origin.
-		if err != nil {
-			return ""
-		}
 		return ""
 	}
 	// Require leading "/" so a plain "accounts" doesn't accidentally
@@ -256,6 +296,11 @@ func sanitizeReturnTo(s string) string {
 	}
 	return s
 }
+
+// SanitizeReturnToForTest exposes sanitizeReturnTo for the
+// open-redirect bypass test suite. Production callers MUST NOT use
+// this -- handlers call sanitizeReturnTo directly.
+func SanitizeReturnToForTest(s string) string { return sanitizeReturnTo(s) }
 
 // callbackUnauthorized renders the uniform 401 used for every
 // callback-validation failure. The reason flows to the log only --

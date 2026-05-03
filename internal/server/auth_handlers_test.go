@@ -425,21 +425,80 @@ func TestAuthLogin_RejectsAbsoluteReturnTo(t *testing.T) {
 	baseURL, _, _ := newTestServer(t, nil)
 	c := newClient(t)
 
+	// Each entry MUST be sanitized to "" so the eventual /auth/callback
+	// redirect lands at the defaultPostLoginPath rather than at the
+	// attacker-controlled host. The handler still 302s to the IdP --
+	// what matters is that the PreSession's ReturnTo is empty.
 	for _, ret := range []string{
+		// Classic absolute URL.
 		"https://attacker.example/",
-		"//attacker.example/",
 		"http://attacker.example/path",
+		// Scheme-relative.
+		"//attacker.example/",
+		// Backslash variants -- Chrome/Firefox normalize `\` to `/`
+		// in Location headers, so these land at attacker.example
+		// even though url.Parse reports Scheme=Host="".
+		`\\attacker.example/`,
+		`/\attacker.example/`,
+		`/\\attacker.example/`,
+		`\attacker.example`,
+		// Mixed-case + leading whitespace (TrimSpace handles the latter).
+		"   //attacker.example/",
+		"   https://attacker.example/",
 	} {
 		resp, err := c.Get(baseURL + "/auth/login?return_to=" + url.QueryEscape(ret))
 		if err != nil {
 			t.Fatalf("GET /auth/login (%s): %v", ret, err)
 		}
 		resp.Body.Close()
-		// Redirect to IdP still happens; the ReturnTo gets sanitized
-		// to "" so the eventual callback lands at /accounts default.
 		if resp.StatusCode != http.StatusFound {
-			t.Errorf("ret=%s status = %d, want 302", ret, resp.StatusCode)
+			t.Errorf("ret=%q status = %d, want 302", ret, resp.StatusCode)
 		}
+	}
+}
+
+// TestSanitizeReturnTo exercises the open-redirect-bypass surface
+// directly against the helper -- complements
+// TestAuthLogin_RejectsAbsoluteReturnTo's end-to-end coverage with a
+// targeted unit test that doesn't pay the per-case httptest cost.
+func TestSanitizeReturnTo(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		in   string
+		want string
+	}{
+		// Accepted: same-origin paths starting with /.
+		{"/accounts", "/accounts"},
+		{"/accounts/abc/messages", "/accounts/abc/messages"},
+		{"/", "/"},
+		{"  /accounts  ", "/accounts"}, // TrimSpace
+		// Rejected: empty / no leading /.
+		{"", ""},
+		{"   ", ""},
+		{"accounts", ""}, // would resolve relative to /auth/
+		// Rejected: classic absolute URLs.
+		{"https://attacker.example/", ""},
+		{"http://attacker.example/path", ""},
+		{"ftp://x", ""},
+		// Rejected: scheme-relative.
+		{"//attacker.example/", ""},
+		{"//x", ""},
+		// Rejected: backslash bypass shapes (browsers normalize \ to /).
+		{`\\attacker.example/`, ""},
+		{`/\attacker.example/`, ""},
+		{`/\\attacker.example/`, ""},
+		{`\attacker.example`, ""},
+		{`\\`, ""},
+		// Rejected: junk that url.Parse refuses.
+		{"http://[::1", ""},
+	} {
+		tc := tc
+		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
+			if got := server.SanitizeReturnToForTest(tc.in); got != tc.want {
+				t.Errorf("sanitizeReturnTo(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
