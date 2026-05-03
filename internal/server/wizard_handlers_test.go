@@ -634,6 +634,43 @@ func TestWizard_WrongPassphrase_StaysOnStep3(t *testing.T) {
 	}
 }
 
+func TestWizard_NoKeys_RendersTerminalError(t *testing.T) {
+	t.Parallel()
+	f := newWizardFixture(t, 0)
+	c, userID := f.makeUser(t, "sub-nokeys", "joe@example.com", "Joe")
+
+	// User with no keys -- a brand-new Proton account shape.
+	stubClient := readyClient()
+	stubClient.getUserResult = proton.User{} // empty Keys slice
+	f.stub.push(stubLoginResult{client: stubClient, auth: stubAuth(0)})
+
+	c.Get(f.url + "/accounts/setup")
+	post(t, c, f.url+"/accounts/setup/auth", url.Values{
+		"username": {"joe@protonmail.com"}, "password": {"hunter2"},
+	}).Body.Close()
+	resp := post(t, c, f.url+"/accounts/setup/unlock", url.Values{
+		"passphrase": {"x"},
+	})
+	body := readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "no encryption keys") {
+		t.Errorf("expected no-keys terminal copy; body excerpt=%s", body[:min(len(body), 500)])
+	}
+
+	// Pending row was soft-deleted; client logged out.
+	accts, _ := f.accSvc.ListByUser(t.Context(), userID)
+	for _, a := range accts {
+		if a.State != account.StateSoftDeleted {
+			t.Errorf("account %s state = %s, want soft_deleted", a.ID, a.State)
+		}
+	}
+	if stubClient.logoutCalls == 0 {
+		t.Error("expected Logout to be called on no-keys abort")
+	}
+}
+
 func TestWizard_FIDO2Only_RendersTerminalError(t *testing.T) {
 	t.Parallel()
 	f := newWizardFixture(t, 0)

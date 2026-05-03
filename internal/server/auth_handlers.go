@@ -210,18 +210,7 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "session subsystem not configured", http.StatusInternalServerError)
 		return
 	}
-	if s.deps.WizardSessions != nil {
-		if accountID := s.deps.SessionManager.GetString(r.Context(), wizardSessionKey); accountID != "" {
-			if sess, ok := s.deps.WizardSessions.Get(accountID); ok {
-				sess.Lock()
-				if sess.Client != nil {
-					_ = sess.Client.Logout(r.Context())
-				}
-				sess.Unlock()
-			}
-			s.deps.WizardSessions.Drop(accountID)
-		}
-	}
+	s.dropInFlightWizard(r.Context())
 	if err := s.deps.SessionManager.Destroy(r.Context()); err != nil {
 		s.deps.Logger.Warn("auth/logout: destroy: " + err.Error())
 	}

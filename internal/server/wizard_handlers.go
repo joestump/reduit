@@ -28,6 +28,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -42,6 +43,38 @@ import (
 // wizardSessionKey is the SCS key holding the in-flight wizard's
 // pending account ID. Cleared on commit and on cancel.
 const wizardSessionKey = "wizard.account_id"
+
+// dropInFlightWizard is the shared cleanup hook fired from any
+// session-invalidation path (handleAuthLogout, the auth gate's
+// malformed-shape fail-closed branch, the auth gate's
+// AccountActive-false branch). It Logouts the upstream Proton
+// session under the per-session lock, then drops the in-memory
+// wizard entry. SCS removal is left to the caller -- some sites
+// follow this with Destroy (which clears everything), others just
+// want the wizard gone.
+//
+// Safe to call when no wizard is in flight (no-op).
+//
+// Governing: SPEC-0005 REQ "Add-Proton-Account Wizard" -- "WHEN
+// wizard idle 30 min OR session invalidated THEN partial credentials
+// discarded from memory."
+func (s *Server) dropInFlightWizard(ctx context.Context) {
+	if s.deps.SessionManager == nil || s.deps.WizardSessions == nil {
+		return
+	}
+	accountID := s.deps.SessionManager.GetString(ctx, wizardSessionKey)
+	if accountID == "" {
+		return
+	}
+	if sess, ok := s.deps.WizardSessions.Get(accountID); ok {
+		sess.Lock()
+		if sess.Client != nil {
+			_ = sess.Client.Logout(ctx)
+		}
+		sess.Unlock()
+	}
+	s.deps.WizardSessions.Drop(accountID)
+}
 
 // maxFormFieldBytes caps each form-field length so a runaway POST
 // can't blow up server memory. The Proton login surface fields
@@ -294,6 +327,20 @@ func (s *Server) handleWizardStart(w http.ResponseWriter, r *http.Request) {
 		}
 		acctID = acct.ID
 	}
+
+	// If the in-memory wizard store already has a live session for
+	// this accountID (e.g., the SCS cookie was cleared but the in-
+	// memory state lingered), reuse it -- replacing it with a fresh
+	// WizardSession would orphan the prior live proton.Client without
+	// Logout. The store key is per-account and accounts are owned by
+	// users, so a Get hit here is by construction owned by id.UserID;
+	// we still verify defensively.
+	if existing, ok := s.deps.WizardSessions.Get(acctID); ok && existing.UserID == id.UserID {
+		s.deps.SessionManager.Put(r.Context(), wizardSessionKey, acctID)
+		s.renderWizard(w, r, existing, "")
+		return
+	}
+
 	sess := &WizardSession{
 		AccountID: acctID,
 		UserID:    id.UserID,

@@ -176,6 +176,11 @@ func newWithHandler(deps Deps) (*Server, http.Handler) {
 		handler = auth.RequireSession(auth.SessionGate{
 			Manager:   deps.SessionManager,
 			LoginPath: "/auth/login",
+			// OnDestroy fires on every gate-initiated session
+			// invalidation (malformed-shape, AccountActive false).
+			// We use it to tear down any in-flight wizard so partial
+			// credentials don't outlive the session per SPEC-0005.
+			OnDestroy: s.dropInFlightWizard,
 		}, handler)
 		handler = deps.SessionManager.LoadAndSave(handler)
 	}
