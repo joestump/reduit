@@ -31,11 +31,10 @@ type repository struct {
 // access return *accountRow; everything else returns *Account.
 type accountRow struct {
 	ID                          string         `db:"id"`
-	OIDCSubject                 string         `db:"oidc_subject"`
+	UserID                      string         `db:"user_id"`
 	ProtonUserID                sql.NullString `db:"proton_user_id"`
 	Email                       sql.NullString `db:"email"`
 	State                       string         `db:"state"`
-	IsAdmin                     int64          `db:"is_admin"`
 	KeyEnvelope                 []byte         `db:"key_envelope"`
 	RefreshTokenCiphertext      []byte         `db:"refresh_token_ciphertext"`
 	MailboxPassphraseCiphertext []byte         `db:"mailbox_passphrase_ciphertext"`
@@ -52,11 +51,10 @@ type accountRow struct {
 func (r accountRow) toAccount() *Account {
 	a := &Account{
 		ID:                   r.ID,
-		OIDCSubject:          r.OIDCSubject,
+		UserID:               r.UserID,
 		ProtonUserID:         r.ProtonUserID.String,
 		Email:                r.Email.String,
 		State:                State(r.State),
-		IsAdmin:              r.IsAdmin != 0,
 		KeyEnvelope:          append([]byte(nil), r.KeyEnvelope...),
 		HasRefreshToken:      len(r.RefreshTokenCiphertext) > 0,
 		HasMailboxPassphrase: len(r.MailboxPassphraseCiphertext) > 0,
@@ -76,24 +74,29 @@ func (r accountRow) toAccount() *Account {
 }
 
 const accountColumns = `
-    id, oidc_subject, proton_user_id, email, state, is_admin,
+    id, user_id, proton_user_id, email, state,
     key_envelope, refresh_token_ciphertext, mailbox_passphrase_ciphertext,
     imap_password_ciphertext, imap_password_hash, primary_alias,
     last_event_id, crashed, created_at, updated_at, deleted_at
 `
 
 // insert persists a brand-new account row. The unique constraint on
-// `oidc_subject` is the storage-layer enforcement of SPEC-0001's
-// "OIDC subject uniqueness"; we surface that as ErrAccountAlreadyExists.
+// `(user_id, proton_user_id)` is the storage-layer enforcement of
+// SPEC-0001's "no duplicate Proton account per user" rule; we surface
+// it as ErrAccountAlreadyExists. SQLite treats NULL as distinct under
+// UNIQUE, so two pending-Proton-setup rows for the same user (both
+// with NULL proton_user_id) are accepted; the collision becomes
+// observable when the wizard updates proton_user_id to a value the
+// user already owns on another row.
 func (r *repository) insert(ctx context.Context, row *accountRow) error {
 	const q = `
     INSERT INTO accounts (
-        id, oidc_subject, proton_user_id, email, state, is_admin,
+        id, user_id, proton_user_id, email, state,
         key_envelope, refresh_token_ciphertext, mailbox_passphrase_ciphertext,
         imap_password_ciphertext, imap_password_hash, primary_alias,
         last_event_id, crashed, created_at, updated_at, deleted_at
     ) VALUES (
-        :id, :oidc_subject, :proton_user_id, :email, :state, :is_admin,
+        :id, :user_id, :proton_user_id, :email, :state,
         :key_envelope, :refresh_token_ciphertext, :mailbox_passphrase_ciphertext,
         :imap_password_ciphertext, :imap_password_hash, :primary_alias,
         :last_event_id, :crashed, :created_at, :updated_at, :deleted_at
@@ -104,14 +107,15 @@ func (r *repository) insert(ctx context.Context, row *accountRow) error {
 		// driver message-text changes. Fall back to a substring match
 		// against the unique-constraint message so a future driver swap
 		// still has a chance to surface ErrAccountAlreadyExists rather
-		// than 500-ing the OIDC login path.
+		// than 500-ing the wizard path.
 		var sqliteErr *sqlite.Error
 		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
 			return ErrAccountAlreadyExists
 		}
 		msg := err.Error()
 		if strings.Contains(msg, "UNIQUE constraint failed") &&
-			strings.Contains(msg, "accounts.oidc_subject") {
+			(strings.Contains(msg, "accounts.user_id") ||
+				strings.Contains(msg, "accounts.proton_user_id")) {
 			return ErrAccountAlreadyExists
 		}
 		return fmt.Errorf("account: insert: %w", err)
@@ -131,16 +135,17 @@ func (r *repository) getByID(ctx context.Context, id string) (*accountRow, error
 	return &row, nil
 }
 
-func (r *repository) getByOIDCSubject(ctx context.Context, sub string) (*accountRow, error) {
-	q := `SELECT ` + accountColumns + ` FROM accounts WHERE oidc_subject = ?`
-	var row accountRow
-	if err := r.db.GetContext(ctx, &row, q, sub); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrAccountNotFound
-		}
-		return nil, fmt.Errorf("account: get by oidc subject: %w", err)
+// listByUserID returns every account owned by the given user, ordered
+// by creation time ascending. Used by the account dashboard's "list
+// my accounts" view (per SPEC-0005) and by ownership checks that need
+// to enumerate the user's account_ids.
+func (r *repository) listByUserID(ctx context.Context, userID string) ([]*accountRow, error) {
+	q := `SELECT ` + accountColumns + ` FROM accounts WHERE user_id = ? ORDER BY created_at ASC, id ASC`
+	var rows []*accountRow
+	if err := r.db.SelectContext(ctx, &rows, q, userID); err != nil {
+		return nil, fmt.Errorf("account: list by user id: %w", err)
 	}
-	return &row, nil
+	return rows, nil
 }
 
 // getByPrimaryAlias resolves the SASL `user@host` identity to an

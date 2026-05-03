@@ -22,15 +22,17 @@ import (
 // and Reduit-issued per-user MCP tokens — so handlers can log the
 // authentication mechanism without needing to re-classify.
 //
-// Subject is the OIDC `sub` of the underlying account, regardless of
-// the bearer mechanism. For PrincipalSourceOIDC it is read from the
-// validated ID token's `sub` claim. For PrincipalSourceMCPToken it
-// is resolved from `accounts.oidc_subject` via the
-// SubjectResolver callback supplied to NewBearerValidator. If the
-// resolver is nil, or returns an error, the field is left empty —
-// downstream handlers MUST therefore treat Subject as best-effort
-// audit metadata, not as a primary identity key. The primary
-// identity key for MCP-token bearers is AccountID.
+// Subject is the OIDC `sub` of the user the bearer ultimately
+// represents, regardless of the bearer mechanism. For
+// PrincipalSourceOIDC it is read from the validated ID token's `sub`
+// claim. For PrincipalSourceMCPToken it is resolved through the
+// chain `mcp_tokens.account_id → accounts.user_id → users.oidc_subject`
+// via the SubjectResolver callback supplied to NewBearerValidator
+// (per ADR-0010, the OIDC subject lives on `users`, not `accounts`).
+// If the resolver is nil, or returns an error, the field is left
+// empty — downstream handlers MUST therefore treat Subject as
+// best-effort audit metadata, not as a primary identity key. The
+// primary identity key for MCP-token bearers is AccountID.
 type Principal struct {
 	Subject    string // OIDC sub when known; empty when SubjectResolver is nil or fails
 	AccountID  string // empty for OIDC tokens; account resolution is the caller's job

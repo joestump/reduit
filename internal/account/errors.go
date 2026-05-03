@@ -2,17 +2,26 @@
 // repository that own its persistence and crypto.
 //
 // Governing: ADR-0002 (multi-tenant), ADR-0003 (envelope encryption),
-// SPEC-0001 (Account Model).
+// ADR-0010 (multi-Proton-account per user), SPEC-0001 (Account Model).
 package account
 
 import "errors"
 
-// ErrAccountAlreadyExists is returned by Service.Create when a row for
-// the given OIDC subject already exists. The unique constraint on
-// `accounts(oidc_subject)` is enforced at the SQLite layer (see the
-// v0.1 migration); this sentinel surfaces that constraint to callers.
+// ErrAccountAlreadyExists is returned by Service.Create when a user
+// already owns an account for the supplied Proton user id. The
+// underlying constraint is `UNIQUE (user_id, proton_user_id)` in the
+// accounts migration -- per-user, not global. Two users may relay the
+// same Proton mailbox from different deployments; one user MUST NOT
+// add the same Proton account twice.
 //
-// Governing: SPEC-0001 REQ "Account Identity".
+// At create time `proton_user_id` may be NULL (the wizard creates the
+// row in `pending_proton_setup` before the Proton login completes);
+// SQLite treats NULL as distinct under UNIQUE, so two pending wizards
+// for the same user are allowed. The collision becomes observable
+// when the wizard updates `proton_user_id` against an active row that
+// already carries the same Proton id for the user.
+//
+// Governing: ADR-0010, SPEC-0001 REQ "Account Identity".
 var ErrAccountAlreadyExists = errors.New("account: already exists")
 
 // ErrAccountNotFound is returned when a lookup matches no row. It

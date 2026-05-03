@@ -329,13 +329,22 @@ func loginAs(t *testing.T, c *http.Client, baseURL, accountID string) {
 	}
 }
 
+// Per ADR-0010, accounts.user_id FK requires a users row first --
+// insertAccountForSession mints both inline so each call is
+// self-contained.
 func insertAccountForSession(t *testing.T, st *store.Store, id string) {
 	t.Helper()
+	if _, err := st.DB.ExecContext(t.Context(),
+		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
+		"user-"+id, "sub-"+id,
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
 	const q = `
-		INSERT INTO accounts (id, oidc_subject, state, key_envelope)
+		INSERT INTO accounts (id, user_id, state, key_envelope)
 		VALUES (?, ?, 'active', X'00')
 	`
-	if _, err := st.DB.ExecContext(t.Context(), q, id, "sub-"+id); err != nil {
+	if _, err := st.DB.ExecContext(t.Context(), q, id, "user-"+id); err != nil {
 		t.Fatalf("insert account: %v", err)
 	}
 }

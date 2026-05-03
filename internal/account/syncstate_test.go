@@ -20,13 +20,10 @@ import (
 // bootstrap via GetLatestEventID rather than incorrectly retry.
 func TestGetSyncStateMissingReturnsSentinel(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-no-cursor"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-no-cursor")
 	if _, err := svc.GetSyncState(ctx, a.ID); !errors.Is(err, ErrNoSyncState) {
 		t.Fatalf("GetSyncState on empty = %v, want ErrNoSyncState", err)
 	}
@@ -38,13 +35,10 @@ func TestGetSyncStateMissingReturnsSentinel(t *testing.T) {
 // stored row is what GetSyncState returns.
 func TestSetSyncStateRoundTrip(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-cursor"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-cursor")
 
 	if err := svc.SetSyncState(ctx, a.ID, "evt-1", nil); err != nil {
 		t.Fatalf("SetSyncState 1: %v", err)
@@ -83,13 +77,10 @@ func TestSetSyncStateRoundTrip(t *testing.T) {
 // worker iteration re-fetches the same batch and retries.
 func TestSetSyncStateAtomicityRollsBackOnTxWorkFailure(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-tx-rollback"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-tx-rollback")
 
 	// Seed a baseline cursor so we can prove a failed advance does
 	// NOT clobber the prior value.
@@ -98,7 +89,7 @@ func TestSetSyncStateAtomicityRollsBackOnTxWorkFailure(t *testing.T) {
 	}
 
 	wantErr := errors.New("simulated derived-state failure")
-	err = svc.SetSyncState(ctx, a.ID, "evt-should-not-stick", func(tx *sqlx.Tx) error {
+	err := svc.SetSyncState(ctx, a.ID, "evt-should-not-stick", func(tx *sqlx.Tx) error {
 		// Even after the txWork has done work in the tx, returning an
 		// error MUST roll back the cursor upsert that ran before us.
 		// We make a dummy write so the rollback covers more than a no-op.
@@ -128,13 +119,10 @@ func TestSetSyncStateAtomicityRollsBackOnTxWorkFailure(t *testing.T) {
 // is the same shape: a single transaction commits both writes.
 func TestSetSyncStateCommitsTxWorkAlongsideCursor(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-tx-commit"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-tx-commit")
 
 	// Capture pre-write updated_at so we can assert the txWork side
 	// effect actually landed.
@@ -146,7 +134,7 @@ func TestSetSyncStateCommitsTxWorkAlongsideCursor(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 
 	marker := time.Now().UTC().Add(time.Hour) // distinctive value
-	err = svc.SetSyncState(ctx, a.ID, "evt-committed", func(tx *sqlx.Tx) error {
+	err := svc.SetSyncState(ctx, a.ID, "evt-committed", func(tx *sqlx.Tx) error {
 		_, err := tx.ExecContext(ctx, `UPDATE accounts SET updated_at = ? WHERE id = ?`, marker, a.ID)
 		return err
 	})
@@ -187,13 +175,10 @@ func TestSetSyncStateCommitsTxWorkAlongsideCursor(t *testing.T) {
 // line exists to surface.
 func TestSetSyncStateLogsRollbackFailure(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-rollback-log"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-rollback-log")
 
 	// Capture slog.Default output. Restore the original handler at
 	// test exit so we don't poison sibling tests in the same package.
@@ -209,7 +194,7 @@ func TestSetSyncStateLogsRollbackFailure(t *testing.T) {
 	// Rollback to do real work — which the driver rejects with a
 	// non-ErrTxDone error. This reliably surfaces the logging path.
 	wantTxErr := errors.New("simulated derived-state failure")
-	err = svc.SetSyncState(ctx, a.ID, "evt-rollback-log", func(tx *sqlx.Tx) error {
+	err := svc.SetSyncState(ctx, a.ID, "evt-rollback-log", func(tx *sqlx.Tx) error {
 		if _, rbErr := tx.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
 			return fmt.Errorf("manual rollback: %w", rbErr)
 		}
@@ -261,10 +246,7 @@ func TestSetSyncStateAccountCascade(t *testing.T) {
 	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-cascade"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-cascade")
 	if err := svc.SetSyncState(ctx, a.ID, "evt-pre-delete", nil); err != nil {
 		t.Fatalf("SetSyncState: %v", err)
 	}
@@ -293,13 +275,10 @@ func TestSetSyncStateAccountCascade(t *testing.T) {
 // upsert this test would be free to read garbage.
 func TestSetSyncStateConcurrentWritesPickOne(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-tx-race"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-tx-race")
 
 	var wg sync.WaitGroup
 	start := make(chan struct{})

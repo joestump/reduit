@@ -1,11 +1,10 @@
 // Package account implements Reduit's account model.
 //
 // Governing: ADR-0002 (multi-tenant), ADR-0003 (envelope encryption),
-// SPEC-0001 (Account Model).
+// ADR-0010 (multi-Proton-account per user), SPEC-0001 (Account Model).
 package account
 
 import (
-	"slices"
 	"time"
 )
 
@@ -17,8 +16,8 @@ import (
 type State string
 
 const (
-	// StatePendingProtonSetup is the initial state after OIDC login but
-	// before the Proton login wizard completes.
+	// StatePendingProtonSetup is the initial state after the wizard
+	// creates the row but before Proton login completes.
 	StatePendingProtonSetup State = "pending_proton_setup"
 	// StateActive means the account is fully provisioned and the sync
 	// worker is running (or eligible to run).
@@ -46,15 +45,21 @@ func (s State) Valid() bool {
 // which take care of unsealing the per-account data key from
 // `KeyEnvelope` and discarding it after the operation.
 //
-// Governing: SPEC-0001 REQ "Per-Account Data Key" (data key never
-// persists in plaintext), SPEC-0001 REQ "Encrypted Secret Storage".
+// Per ADR-0010, ownership flows through UserID (FK to users.id). The
+// previous shape carried oidc_subject directly on the account row;
+// callers that need the OIDC subject for an account now resolve it via
+// users.GetByID(account.UserID). Admin status is NOT a property of the
+// account -- it is computed at session-bind time from OIDC_ADMIN_SUBS
+// per SPEC-0001 REQ "Admin Status".
+//
+// Governing: SPEC-0001 REQ "Account Identity", SPEC-0001 REQ
+// "Per-Account Data Key", SPEC-0001 REQ "Encrypted Secret Storage".
 type Account struct {
 	ID                   string
-	OIDCSubject          string
+	UserID               string
 	ProtonUserID         string
 	Email                string
 	State                State
-	IsAdmin              bool
 	KeyEnvelope          []byte
 	HasRefreshToken      bool
 	HasMailboxPassphrase bool
@@ -71,17 +76,4 @@ type Account struct {
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	DeletedAt    *time.Time
-}
-
-// AdminBy reports whether the account's OIDC subject appears in the
-// supplied admin allowlist (typically the `OIDC_ADMIN_SUBS` config).
-// Comparison is exact and case-sensitive — Pocket ID and most OIDC
-// providers issue opaque subjects so case-insensitivity would be unsafe.
-//
-// Governing: SPEC-0001 REQ "Admin Status".
-func (a Account) AdminBy(adminSubs []string) bool {
-	if a.OIDCSubject == "" {
-		return false
-	}
-	return slices.Contains(adminSubs, a.OIDCSubject)
 }
