@@ -24,9 +24,22 @@
 -- can own zero accounts and still have a valid session, e.g. right
 -- after first login before the wizard runs). `account_id` is OPTIONAL
 -- and only set when handlers scope a request to a specific account
--- (e.g. /accounts/{id}/...). Both columns CASCADE on hard-delete; the
--- account-scoped revocation path (RevokeSessionsForAccount) lives
--- alongside the user-scoped one (RevokeSessionsForUser).
+-- (e.g. /accounts/{id}/...).
+--
+-- We DELIBERATELY do NOT add a FK from session_owners.token to
+-- sessions(token). SCS's sqlite3store commits via
+-- `REPLACE INTO sessions(token, data, expiry)` on every request,
+-- which is DELETE + INSERT under the hood. A cascading FK would
+-- therefore drop the matching session_owners row on every commit
+-- and the bind would not survive the SCS LoadAndSave middleware's
+-- end-of-handler Commit. The cost is that re-login (which renews
+-- the SCS token) leaves the prior token's owner row orphaned in
+-- session_owners until it is swept on schedule -- a known follow-up.
+--
+-- users(id) and accounts(id) cascades drive the per-user and
+-- per-account revocation paths (RevokeSessionsForUser /
+-- RevokeSessionsForAccount), neither of which conflicts with SCS's
+-- write pattern.
 --
 -- session_owners.token is the SCS session token verbatim.
 CREATE TABLE session_owners (

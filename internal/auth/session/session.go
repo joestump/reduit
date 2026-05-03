@@ -169,18 +169,24 @@ func PutIdentity(ctx context.Context, mgr *scs.SessionManager, id Identity) erro
 //
 // A sidecar (rather than extra columns on `sessions`) is required
 // because SCS's sqlite3store commits via `REPLACE INTO sessions(...)`
-// which clobbers any other column on every request. cascade-on-delete
-// against `users(id)` is wired at the schema layer.
+// which clobbers any other column on every request. CASCADE on
+// `users(id)` and `accounts(id)` drives the revocation paths;
+// session_owners.token deliberately lacks a FK to sessions(token)
+// because the same REPLACE-on-commit would cascade-drop the owner
+// row mid-handler (see the schema migration's comment for detail).
 //
 // Callers SHOULD invoke mgr.Commit before BindSessionToUser so a live
-// `sessions.token` row exists when CASCADE fires, but BindSessionToUser
-// itself does not depend on that ordering -- the session_owners row
-// stands on its own.
+// `sessions.token` row exists when downstream lookups (e.g. revoke
+// by user) join on it, but BindSessionToUser does not enforce that
+// ordering -- the session_owners row stands on its own.
 //
-// On re-login through the same browser the upsert keeps a single row
-// per token (the second login renews the token, so the prior row
-// becomes orphaned and is dropped by the SCS sweep with the expired
-// session).
+// On re-login through the same browser the SCS token is renewed
+// inside PutIdentity, so this INSERT lands on a fresh primary key
+// rather than upserting the prior row. The prior token's owner row
+// is left orphaned in session_owners until a scheduled sweep cleans
+// it up (tracked as a known follow-up; the rows are tiny and revoke
+// paths key on user_id/account_id, so the orphan does not affect
+// correctness).
 //
 // Governing: ADR-0010, SPEC-0005 REQ "OIDC Login Flow", SPEC-0001
 // REQ "User Lifecycle".

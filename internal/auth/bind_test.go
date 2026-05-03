@@ -19,56 +19,56 @@ import (
 )
 
 // runBindThroughHandler wires a one-shot HTTP handler that runs
-// BindFromOIDC inside the SCS LoadAndSave middleware and returns the
-// resulting Identity (or the bind error). Tests use this rather than
-// calling BindFromOIDC directly because BindFromOIDC depends on an
-// active SCS request scope (mgr.Token, mgr.Commit) -- driving it
-// through a real httptest server is the simplest way to satisfy
-// that.
-func runBindThroughHandler(t *testing.T, st *store.Store, usrSvc users.Service, claims auth.OIDCClaims, adminSubs []string) (session.Identity, error) {
+// BindFromOIDC inside the SCS LoadAndSave middleware and returns
+// BindFromOIDC's returned Identity, the persisted Identity (read back
+// via GetIdentity on a follow-up request), and the bind error. Tests
+// use this rather than calling BindFromOIDC directly because
+// BindFromOIDC depends on an active SCS request scope (mgr.Token,
+// mgr.Commit) -- driving it through a real httptest server is the
+// simplest way to satisfy that.
+//
+// Returning both the in-handler value and the post-roundtrip read
+// catches a class of bug where BindFromOIDC's return diverges from
+// what actually got persisted (e.g., a future refactor that moves
+// fields around in the Identity struct without updating PutIdentity).
+func runBindThroughHandler(t *testing.T, st *store.Store, usrSvc users.Service, claims auth.OIDCClaims, adminSubs []string) (returned, persisted session.Identity, err error) {
 	t.Helper()
-	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
-	if err != nil {
-		t.Fatalf("session.New: %v", err)
+	mgr, cleanup, mgrErr := session.New(st.DB.DB, session.Options{Insecure: true})
+	if mgrErr != nil {
+		t.Fatalf("session.New: %v", mgrErr)
 	}
 	t.Cleanup(cleanup)
 
-	var (
-		bound   session.Identity
-		bindErr error
-	)
+	var bindErr error
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		bound, bindErr = auth.BindFromOIDC(r.Context(), mgr, st.DB.DB, usrSvc, claims, adminSubs)
+		returned, bindErr = auth.BindFromOIDC(r.Context(), mgr, st.DB.DB, usrSvc, claims, adminSubs)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/me", func(w http.ResponseWriter, r *http.Request) {
+		persisted = session.GetIdentity(r.Context(), mgr)
 		_, _ = w.Write([]byte("ok"))
 	})
 	srv := httptest.NewServer(mgr.LoadAndSave(mux))
 	t.Cleanup(srv.Close)
 
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		t.Fatalf("cookiejar: %v", err)
+	jar, jarErr := cookiejar.New(nil)
+	if jarErr != nil {
+		t.Fatalf("cookiejar: %v", jarErr)
 	}
 	c := &http.Client{Jar: jar}
-	resp, err := c.Get(srv.URL + "/callback")
-	if err != nil {
-		t.Fatalf("GET /callback: %v", err)
+	if resp, e := c.Get(srv.URL + "/callback"); e != nil {
+		t.Fatalf("GET /callback: %v", e)
+	} else {
+		resp.Body.Close()
 	}
-	resp.Body.Close()
-
 	// Probe a follow-up request so the session is queryable post-bind.
-	// A second handler-scoped read of GetIdentity verifies the bind
-	// persisted across the LoadAndSave roundtrip.
-	mux.HandleFunc("/me", func(w http.ResponseWriter, r *http.Request) {
-		bound = session.GetIdentity(r.Context(), mgr)
-		_, _ = w.Write([]byte("ok"))
-	})
-	resp, err = c.Get(srv.URL + "/me")
-	if err != nil {
-		t.Fatalf("GET /me: %v", err)
+	if resp, e := c.Get(srv.URL + "/me"); e != nil {
+		t.Fatalf("GET /me: %v", e)
+	} else {
+		resp.Body.Close()
 	}
-	resp.Body.Close()
-	return bound, bindErr
+	return returned, persisted, bindErr
 }
 
 func TestBindFromOIDC_FirstLoginCreatesUserAndBindsSession(t *testing.T) {
@@ -81,7 +81,7 @@ func TestBindFromOIDC_FirstLoginCreatesUserAndBindsSession(t *testing.T) {
 		Email:       "joe@example.com",
 		DisplayName: "Joe",
 	}
-	id, err := runBindThroughHandler(t, st, usrSvc, claims, nil)
+	id, persisted, err := runBindThroughHandler(t, st, usrSvc, claims, nil)
 	if err != nil {
 		t.Fatalf("BindFromOIDC: %v", err)
 	}
@@ -96,6 +96,15 @@ func TestBindFromOIDC_FirstLoginCreatesUserAndBindsSession(t *testing.T) {
 	}
 	if id.IsAdmin {
 		t.Error("Identity.IsAdmin should be false when adminSubs is nil")
+	}
+
+	// BindFromOIDC's returned Identity MUST match what GetIdentity
+	// reads back from the persisted session. A divergence here would
+	// mean a future refactor wrote a different value to the session
+	// than it returned to the caller -- silent data drift that the
+	// per-field assertions above can't catch on their own.
+	if persisted != id {
+		t.Errorf("persisted Identity diverged from returned: persisted=%+v returned=%+v", persisted, id)
 	}
 
 	// Confirm the users row exists with the expected shape.
@@ -113,11 +122,11 @@ func TestBindFromOIDC_SubsequentLoginReusesUserRow(t *testing.T) {
 	st := openTempStore(t)
 	usrSvc := users.New(st)
 
-	first, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: "sub-reuse"}, nil)
+	first, _, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: "sub-reuse"}, nil)
 	if err != nil {
 		t.Fatalf("first bind: %v", err)
 	}
-	second, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: "sub-reuse"}, nil)
+	second, _, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: "sub-reuse"}, nil)
 	if err != nil {
 		t.Fatalf("second bind: %v", err)
 	}
@@ -132,7 +141,7 @@ func TestBindFromOIDC_ComputesAdminFromAllowlist(t *testing.T) {
 	usrSvc := users.New(st)
 	adminSubs := []string{"sub-admin", "sub-other-admin"}
 
-	admin, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: "sub-admin"}, adminSubs)
+	admin, _, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: "sub-admin"}, adminSubs)
 	if err != nil {
 		t.Fatalf("admin bind: %v", err)
 	}
@@ -140,7 +149,7 @@ func TestBindFromOIDC_ComputesAdminFromAllowlist(t *testing.T) {
 		t.Error("Identity.IsAdmin should be true for an allowlisted subject")
 	}
 
-	user, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: "sub-regular"}, adminSubs)
+	user, _, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: "sub-regular"}, adminSubs)
 	if err != nil {
 		t.Fatalf("user bind: %v", err)
 	}
@@ -160,7 +169,7 @@ func TestBindFromOIDC_EmptyAllowlistEntryDoesNotPromoteEmptySubject(t *testing.T
 	// the allowlist. The empty-subject case is also rejected by the
 	// upstream guard (we won't get past Upsert), so this assertion is
 	// belt-and-suspenders -- but the guard belongs in both places.
-	if _, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: ""}, []string{"", "sub-foo"}); err == nil {
+	if _, _, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: ""}, []string{"", "sub-foo"}); err == nil {
 		t.Fatal("BindFromOIDC accepted an empty subject")
 	}
 }
@@ -170,7 +179,7 @@ func TestBindFromOIDC_PreservesEmailWhenSubsequentClaimDrops(t *testing.T) {
 	st := openTempStore(t)
 	usrSvc := users.New(st)
 
-	if _, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{
+	if _, _, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{
 		Subject: "sub-email-preserve",
 		Email:   "first@example.com",
 	}, nil); err != nil {
@@ -179,7 +188,7 @@ func TestBindFromOIDC_PreservesEmailWhenSubsequentClaimDrops(t *testing.T) {
 
 	// Second login drops the email claim. The Identity should still
 	// see the preserved value (users.Service.Upsert is COALESCE-NULLIF).
-	id, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: "sub-email-preserve"}, nil)
+	id, _, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{Subject: "sub-email-preserve"}, nil)
 	if err != nil {
 		t.Fatalf("second bind: %v", err)
 	}
@@ -193,7 +202,7 @@ func TestBindFromOIDC_GuardsBadInput(t *testing.T) {
 	st := openTempStore(t)
 	usrSvc := users.New(st)
 
-	if _, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{}, nil); err == nil {
+	if _, _, err := runBindThroughHandler(t, st, usrSvc, auth.OIDCClaims{}, nil); err == nil {
 		t.Error("empty subject: expected error, got nil")
 	}
 	// nil session manager / db / users service guards are exercised
