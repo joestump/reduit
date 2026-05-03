@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/joestump/reduit/internal/account"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	authsession "github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/cryptenv"
@@ -53,7 +54,8 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		return fmt.Errorf("master key not found at %s; run `reduit master-key generate` first",
 			cfg.MasterKey.Path)
 	}
-	if _, err := cryptenv.LoadMasterKey(cfg.MasterKey.Path); err != nil {
+	masterKey, err := cryptenv.LoadMasterKey(cfg.MasterKey.Path)
+	if err != nil {
 		return fmt.Errorf("load master key: %w", err)
 	}
 	logger.Info("master key loaded", slog.String("path", cfg.MasterKey.Path))
@@ -130,11 +132,11 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		preSessions = authoidc.NewPreSessionStore(authoidc.DefaultPreSessionTTL)
 	}
 
-	// Users service feeds the OIDC callback's session-bind path
-	// (auth.BindFromOIDC) -- it upserts the users row keyed by the
-	// validated OIDC subject. Constructed here (rather than
-	// per-request) so the underlying *sqlx.DB stays singleton.
+	// Users + account services feed the dashboard, the OIDC callback,
+	// and the wizard (#24). Constructed here (rather than per-request)
+	// so the underlying *sqlx.DB / master key stay singletons.
 	usersService := users.New(st)
+	accountService := account.New(st, masterKey)
 
 	// HTTP server.
 	srv := server.New(cfg.Server.HTTPAddr, server.Deps{
@@ -146,6 +148,7 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		OIDC:           oidcClient,
 		PreSessions:    preSessions,
 		UsersService:   usersService,
+		AccountService: accountService,
 		AdminSubjects:  cfg.OIDC.AdminSubjects,
 	})
 

@@ -1,0 +1,85 @@
+{{define "base"}}<!DOCTYPE html>
+<html lang="en" data-theme="reduit-dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} — Reduit</title>
+<!--
+  v1 ships Tailwind via CDN play-mode. The proper build pipeline
+  (Tailwind 4 + DaisyUI 5 with PurgeCSS) lands when the asset
+  pipeline ADR is filed (tracked separately). Acceptable for the
+  pre-alpha MVP; the visible identity matches the mockups in
+  docs/mockups/spec-0005/.
+-->
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5.0.0/dist/full.min.css" rel="stylesheet">
+<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+<style>
+  :root { font-family: 'Inter', system-ui, sans-serif; }
+  body { background: #0F172A; color: #E2E8F0; }
+  .surface { background: #1E293B; border: 1px solid #334155; }
+  .nav-active { background: #312E81; color: #C7D2FE; }
+  .mountain {
+    background: linear-gradient(180deg, transparent 60%, rgba(51,65,85,0.4) 100%);
+    background-size: cover;
+    background-position: bottom;
+  }
+</style>
+</head>
+<body class="min-h-screen flex flex-col">
+  <!-- Top bar -->
+  <header class="flex items-center justify-between px-8 py-5 border-b border-slate-700">
+    <div class="flex items-center gap-3">
+      {{template "shield_logo" .}}
+      <span class="text-2xl font-semibold tracking-tight">Reduit</span>
+    </div>
+    <div class="flex items-center gap-3 text-sm">
+      <div class="text-right">
+        <div class="font-medium">{{.Identity.DisplayName}}</div>
+        <div class="text-slate-400">{{.Identity.Email}}</div>
+      </div>
+      <div class="w-9 h-9 rounded-full bg-slate-700 flex items-center justify-center font-semibold text-slate-200">
+        {{.Identity.Initials}}
+      </div>
+    </div>
+  </header>
+
+  <div class="flex-1 flex">
+    <!-- Left rail -->
+    <nav class="w-56 border-r border-slate-700 px-4 py-8 flex flex-col gap-2 text-sm">
+      <a href="/accounts" class="px-4 py-3 rounded-lg flex items-center gap-3 nav-active">
+        {{template "icon_home" .}}<span class="font-medium">Dashboard</span>
+      </a>
+      <a href="/accounts" class="px-4 py-3 rounded-lg flex items-center gap-3 hover:bg-slate-800">
+        {{template "icon_users" .}}<span>Accounts</span>
+      </a>
+      <a href="#" class="px-4 py-3 rounded-lg flex items-center gap-3 text-slate-400 cursor-not-allowed">
+        {{template "icon_key" .}}<span>MCP tokens</span>
+      </a>
+      <a href="#" class="px-4 py-3 rounded-lg flex items-center gap-3 text-slate-400 cursor-not-allowed">
+        {{template "icon_settings" .}}<span>Settings</span>
+      </a>
+      <form method="POST" action="/auth/logout" class="mt-auto">
+        <button type="submit" class="w-full px-4 py-3 rounded-lg flex items-center gap-3 hover:bg-slate-800 text-left">
+          {{template "icon_logout" .}}<span>Logout</span>
+        </button>
+      </form>
+    </nav>
+
+    <!-- Main content -->
+    <main class="flex-1 px-12 py-8 mountain min-h-full">
+      {{template "content" .}}
+    </main>
+  </div>
+</body>
+</html>{{end}}
+
+{{define "shield_logo"}}<svg width="28" height="28" viewBox="0 0 24 24" fill="#4F46E5" xmlns="http://www.w3.org/2000/svg"><path d="M12 2L4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5l-8-3z"/></svg>{{end}}
+
+{{define "icon_home"}}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12l9-9 9 9M5 10v10h14V10"/></svg>{{end}}
+{{define "icon_users"}}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>{{end}}
+{{define "icon_key"}}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>{{end}}
+{{define "icon_settings"}}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>{{end}}
+{{define "icon_logout"}}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>{{end}}
+{{define "icon_plus"}}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>{{end}}
+{{define "icon_check_shield"}}<svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#4F46E5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5l-8-3z"/><path d="M9 12l2 2 4-4"/></svg>{{end}}
