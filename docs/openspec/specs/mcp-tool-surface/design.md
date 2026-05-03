@@ -34,10 +34,13 @@ sequenceDiagram
     participant Idp as OIDC IdP
     participant DB as SQLite
 
-    alt OIDC bearer (JWT) + X-Reduit-Account selector
-        C->>M: POST /mcp (Authorization: Bearer <jwt>, X-Reduit-Account: <id>)
+    alt OIDC bearer (JWT) + selector
+        C->>M: POST /accounts/{id}/mcp OR POST /mcp + X-Reduit-Account
         M->>Idp: Verify JWT signature (cached JWKS)
-        M->>DB: Lookup account by id; verify owner_oidc_sub == jwt.sub
+        M->>M: Resolve selector (path > header; header ignored if path present)
+        M->>DB: Resolve users.id from jwt.sub
+        M->>DB: Lookup account by id; verify account.user_id == users.id
+        Note right of M: On unowned OR non-existent account:<br/>byte-identical 403
     else Per-account MCP token
         C->>M: POST /mcp (Authorization: Bearer <opaque>)
         M->>DB: SELECT mcp_tokens WHERE token_hash = sha256(opaque)
@@ -45,6 +48,33 @@ sequenceDiagram
     end
     M-->>C: tool result (scoped to account)
 ```
+
+### Selector precedence and authz indistinguishability
+
+OIDC-bearer requests carry the account selector either as a path
+parameter (`/accounts/{id}/mcp` or any `/accounts/{id}/...` route
+that the MCP surface mounts) OR as the `X-Reduit-Account` header on
+the bare `/mcp` route. **Path wins.** When both are present the
+header is silently ignored — not parsed, not validated, not
+error-reported — so an attacker cannot use the header value to
+probe whether it matches the path id and learn ownership of a
+non-owned account.
+
+For authz failures on OIDC-bearer requests, "selector references
+non-existent account" and "selector references existing account
+not owned by the JWT subject" MUST produce byte-identical
+responses. UUIDv7 carries a creation timestamp; without this
+discipline, any holder of a valid OIDC ID token could iterate UUIDs
+and learn which exist on the deployment. The 400 ("selector
+required") path is distinct because it carries no account
+identifier and so leaks nothing.
+
+Implementation: a single `accountFromOIDC(ctx, jwt) (*Account,
+error)` helper resolves the selector, looks up the account, and
+returns either the account or a sentinel `errForbidden` for both
+"not found" and "not owned" cases. Callers that emit the response
+MUST treat `errForbidden` uniformly. Tests assert byte-equal
+responses across the two cases.
 
 ## Tool registry
 
@@ -154,14 +184,23 @@ sequenceDiagram
     participant UI as Admin UI
     participant DB as SQLite
     U->>UI: POST /accounts/{id}/mcp-tokens (label="Claude on laptop")
+    UI->>UI: authz: account.user_id == session.user_id || session.is_admin
     UI->>UI: generate 32 random bytes -> base32 -> token
     UI->>UI: hash := SHA-256(token)
     UI->>DB: INSERT mcp_tokens (account_id, hash, label, created_at)
     UI-->>U: render token once in modal (copy to clipboard)
 ```
 
-Subsequent revocation deletes the row by ID. Token expiry is
-optional (column is nullable); a periodic sweep removes expired rows.
+Issuance authority is "owner of the target account, OR an admin"
+(per SPEC-0006 Token Issuance and Revocation REQ). Same authority
+gate applies to revocation. Subsequent revocation deletes the row
+by ID. Token expiry is optional (column is nullable); a periodic
+sweep removes expired rows.
+
+Authz failures on issuance/revocation paths follow the same
+indistinguishability discipline as the auth-handshake layer — a
+non-admin user must not learn whether a given account UUID exists
+just because they probed `/accounts/{id}/mcp-tokens`.
 
 ## Why HTTP+SSE only (no stdio)
 

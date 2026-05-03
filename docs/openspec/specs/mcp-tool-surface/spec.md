@@ -21,9 +21,10 @@ SPEC-0003 (IMAP Server) for label/folder mapping consistency.
 
 Every MCP tool invocation MUST be authenticated. Authentication MUST
 identify the calling Reduit account and scope all operations to that
-account. Because a single user (OIDC subject) MAY own multiple
-accounts per ADR-0010, the bearer credential alone MUST be
-sufficient to disambiguate a single account.
+account. Because a single user MAY own multiple accounts per
+ADR-0010 / SPEC-0001, the bearer credential alone MUST be sufficient
+to disambiguate a single account; when it is not, an out-of-band
+account selector is required.
 
 #### Scenario: Per-account MCP token authenticates as the bound account
 
@@ -39,21 +40,121 @@ sufficient to disambiguate a single account.
 - **WHEN** an MCP request carries `Authorization: Bearer <jwt>`
   where the JWT is a valid OIDC ID token from the configured IdP
 - **THEN** the server SHALL validate the JWT (signature, issuer,
-  audience, expiry, nonce). The request MUST also carry an account
-  selector (e.g., the `X-Reduit-Account` header containing the
-  account's UUID) so the server can disambiguate which of the
-  user's accounts to bind. The server SHALL verify that the
-  selected account is owned by the OIDC `sub` of the JWT (per
-  SPEC-0001's `owner_oidc_sub`) before binding the request. If the
-  selector is missing, the server SHALL respond `400 Bad Request`;
-  if the selector references an account the user does not own,
-  the server SHALL respond `403 Forbidden`
+  audience, expiry, nonce) and resolve `Principal.Subject` to a
+  `user_id` via the `users` table. The request MUST also carry an
+  account selector — either a path parameter (`/accounts/{id}/...`)
+  or the `X-Reduit-Account` header containing the account's UUID —
+  so the server can disambiguate which of the user's accounts to
+  bind. Selector resolution MUST follow the precedence rule
+  ("Selector precedence" REQ). The server SHALL verify the resolved
+  account satisfies `account.user_id == users.id` for the JWT
+  subject (per SPEC-0001) before binding the request. Failure
+  responses MUST follow the indistinguishability rule
+  ("Authorization-failure indistinguishability" REQ)
 
 #### Scenario: Unauthenticated MCP request is rejected
 
 - **WHEN** an MCP request arrives without a valid bearer token
-- **THEN** the server SHALL respond `401 Unauthorized`. No tool
-  invocation SHALL proceed
+- **THEN** the server SHALL respond `401 Unauthorized` with a
+  generic body (e.g., `{"error":"unauthenticated"}`). The
+  `WWW-Authenticate` header MAY name `Bearer` as a scheme but MUST
+  NOT include a `realm` parameter that leaks deployment-internal
+  identifiers
+
+### Requirement: Selector Precedence
+
+When both a path-parameter account selector (`/accounts/{id}/...`)
+and an `X-Reduit-Account` header are present, the path parameter
+MUST win. The header MUST be ignored — not parsed, not validated,
+not error-reported — when a path parameter is also present. The
+header is consulted only on routes that do not carry an account-id
+path parameter (today: the bare `/mcp` endpoint accessed with an
+OIDC bearer).
+
+This rule eliminates a request-shape oracle (an attacker cannot
+probe whether the header value matches the path value to learn
+ownership of a non-owned account).
+
+#### Scenario: Path parameter wins over header
+
+- **WHEN** an MCP request carries both `/accounts/A/mcp` and
+  `X-Reduit-Account: B`
+- **THEN** the server SHALL bind the request to account `A`. The
+  `X-Reduit-Account` header SHALL NOT be parsed; the value of `B`
+  SHALL NOT influence routing, ownership checks, error responses,
+  log lines, or response headers. No "header conflicts with path"
+  warning SHALL be surfaced — the header is silently ignored
+
+#### Scenario: Header consulted only when path has no selector
+
+- **WHEN** an MCP request reaches a route without an account-id
+  path parameter (e.g., bare `/mcp`) AND carries
+  `X-Reduit-Account: A`
+- **THEN** the server SHALL parse the header and treat its value
+  as the account selector for ownership and binding purposes,
+  subject to the indistinguishability rule on failures
+
+#### Scenario: No selector at all
+
+- **WHEN** an OIDC-bearer MCP request arrives at a route without
+  an account-id path parameter and without an `X-Reduit-Account`
+  header
+- **THEN** the server SHALL respond `400 Bad Request` with body
+  `{"error":"selector_required"}`. This is the ONE response code
+  that distinguishes "selector missing" from "selector present but
+  not owned" — and it carries no account identifiers. See the
+  indistinguishability rule
+
+### Requirement: Authorization-Failure Indistinguishability
+
+When an OIDC-bearer MCP request supplies an account selector, the
+server MUST NOT leak which-account-exists-versus-which-is-owned via
+its failure response. "Selector present, account does not exist"
+and "selector present, account exists but is not owned by the JWT
+subject" MUST produce byte-identical responses (status, headers,
+body, timing characteristics).
+
+The threat: UUIDv7 carries a creation timestamp. Without this
+discipline, any holder of a valid OIDC ID token (even a non-admin
+user with zero accounts) could iterate UUIDs and learn which exist
+on the deployment, plus when each was created.
+
+This REQ is the auth-handshake-layer counterpart to the existing
+"Account Scope on All Operations" REQ, which already mandates
+identical-to-a-genuine-miss responses at the tool layer.
+
+#### Scenario: Non-existent and non-owned selectors return identical responses
+
+- **WHEN** an OIDC-bearer request carries a selector referencing
+  account UUID `X` where (case A) no account row exists with
+  `id=X`, OR (case B) a row exists but `account.user_id != users.id`
+  for the JWT subject
+- **THEN** in both cases the server SHALL respond `403 Forbidden`
+  with body `{"error":"forbidden"}` — byte-identical between cases.
+  Headers SHALL be byte-identical: `Content-Type: application/json`,
+  no `WWW-Authenticate` realm leak, no `X-Reduit-*` diagnostic
+  headers. Server-side log lines MAY differ (operators need to
+  triage misconfigurations) but the wire response MUST NOT
+
+#### Scenario: Indistinguishability test exists
+
+- **WHEN** the test suite runs the MCP authz-failure tests
+- **THEN** there SHALL be at least one test that exercises both
+  cases (A: non-existent UUID; B: existing UUID owned by a
+  different user) with the same OIDC bearer and asserts byte-for-
+  byte equality of the HTTP response (status code, headers minus
+  `Date`, body). Timing-side-channel testing is out of scope for
+  v0.1 but a coarse same-order-of-magnitude check is RECOMMENDED
+
+#### Scenario: Selector-missing distinguishable from selector-present-failures
+
+- **WHEN** the selector is missing entirely (no path id, no
+  `X-Reduit-Account` header)
+- **THEN** the server SHALL respond `400 Bad Request` with body
+  `{"error":"selector_required"}`, distinguishable from the 403
+  used for both case A and case B above. This 400 carries no
+  account identifier and so leaks nothing about which UUIDs
+  exist
 
 ### Requirement: Account Scope on All Operations
 
@@ -229,26 +330,34 @@ avoid one user exhausting per-account Proton API quotas.
 
 Per-account MCP tokens MUST be issuable from the admin UI and
 revocable. Tokens are scoped to exactly one account; a user who owns
-multiple accounts issues tokens separately for each.
+multiple accounts issues tokens separately for each. Issuance and
+revocation authority is "owner of the target account, OR an admin"
+— admins MAY operate on any account; non-admins MAY operate only
+on accounts where `account.user_id == session.user_id`.
 
-#### Scenario: User issues a new MCP token for an owned account
+#### Scenario: Owner or admin issues a new MCP token
 
 - **WHEN** an authenticated user creates a token via the admin UI
-  scoped to an account they own (e.g.,
-  `/accounts/{id}/mcp-tokens`)
-- **THEN** the server SHALL verify the user owns the referenced
-  account (per SPEC-0001), generate a 32-byte random token, store
-  its SHA-256 hash with the issuing account, an optional label, and
-  optional expiry. The plaintext token SHALL be returned exactly
-  once via the admin UI. If the user does not own the referenced
-  account, the server SHALL respond `403 Forbidden`
+  scoped to an account `A` (e.g., `POST /accounts/A/mcp-tokens`)
+- **THEN** the server SHALL verify either `A.user_id ==
+  session.user_id` OR `session.is_admin == true`. On success it
+  SHALL generate a 32-byte random token, store its SHA-256 hash
+  with `account_id = A`, an optional label, and optional expiry.
+  The plaintext token SHALL be returned exactly once via the admin
+  UI. If neither authority condition holds, the server SHALL
+  respond `403 Forbidden` with the indistinguishability discipline
+  applied to the case where `A` does not exist (an attacker without
+  admin must not be able to learn whether a given UUID exists)
 
-#### Scenario: User revokes a token
+#### Scenario: Owner or admin revokes a token
 
-- **WHEN** a user revokes a token via the admin UI for an account
-  they own
-- **THEN** subsequent MCP requests carrying that token SHALL fail
-  with `401 Unauthorized` within 1 second
+- **WHEN** an authenticated user revokes a token via the admin UI
+  for account `A`
+- **THEN** the server SHALL apply the same authority check
+  (`A.user_id == session.user_id || session.is_admin`). On success
+  the token SHALL be marked revoked and subsequent MCP requests
+  carrying it SHALL fail with `401 Unauthorized` within 1 second.
+  Failure responses follow the indistinguishability discipline
 
 ## Out of Scope
 
