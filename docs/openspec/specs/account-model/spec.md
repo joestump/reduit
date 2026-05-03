@@ -15,9 +15,10 @@ Reduit distinguishes two persisted entities and one derived attribute:
   email clients. Every account row is owned by exactly one user via a
   `user_id` foreign key.
 - **Admin status** is a derived, computed attribute, not a column on
-  either table. At session-bind time the system checks whether the
-  authenticated `Principal.Subject` appears in the configured
-  `OIDC_ADMIN_SUBS` allowlist and tags the session accordingly.
+  either table. At session-bind time (and only at session-bind time)
+  the system checks whether the authenticated `Principal.Subject`
+  appears in the configured `OIDC_ADMIN_SUBS` allowlist and tags the
+  session accordingly. The tag is not recomputed per-request.
 
 All persisted state is in SQLite per ADR-0006; sensitive account
 fields are envelope-encrypted per ADR-0003.
@@ -138,30 +139,48 @@ which Proton mailbox the account row represents.
 
 ### Requirement: Admin Status
 
-Admin status is a property of the **user**, computed at request
-time from the OIDC subjects allowlist (`OIDC_ADMIN_SUBS`). It MUST
-NOT be persisted as a column on `users` or `accounts`. The allowlist
-is the single source of truth.
+Admin status is a property of the **user**, computed exactly once
+per session at session-bind time from the OIDC subjects allowlist
+(`OIDC_ADMIN_SUBS`). It MUST NOT be persisted as a column on
+`users` or `accounts`, and it MUST NOT be recomputed per-request.
+The allowlist is the single source of truth.
 
-#### Scenario: Admin status is sourced from the OIDC subjects allowlist
+#### Scenario: Admin status is sourced from the OIDC subjects allowlist at session-bind time
 
-- **WHEN** an authenticated session is bound (i.e., immediately after
-  successful OIDC login or successful session lookup)
+- **WHEN** an authenticated session is bound (immediately after a
+  successful OIDC `/auth/callback` exchange creates the session
+  record)
 - **THEN** the system SHALL set the session's admin tag to `true` if
   and only if the authenticated `Principal.Subject` appears in the
   configured `OIDC_ADMIN_SUBS` allowlist (env var, comma-separated).
   The check is performed against the user identity, never against any
-  per-account row
+  per-account row. The result SHALL be stored on the session payload
+  (or kept in the in-process session struct — implementation detail)
+  and SHALL NOT be recomputed on subsequent requests within the same
+  session
 
-#### Scenario: Admin status is cached for the session lifetime
+#### Scenario: Per-request handlers read the cached admin tag, never the allowlist
 
-- **WHEN** a session has been bound with an admin tag
-- **THEN** subsequent requests within the same session MAY rely on
-  the cached tag without re-querying the allowlist on every request.
-  The allowlist is read from the process environment at startup and
-  is treated as static for the process lifetime; if hot-reload
-  becomes a requirement later, the contract SHALL be re-derived from
-  the allowlist at that time
+- **WHEN** a request handler authorizes an admin-only operation
+- **THEN** it SHALL read the admin tag from the bound session and
+  SHALL NOT re-consult `OIDC_ADMIN_SUBS`. The tag computed at
+  session-bind time is authoritative for the lifetime of that
+  session
+
+#### Scenario: Allowlist changes take effect on the next session bind
+
+- **WHEN** the operator updates `OIDC_ADMIN_SUBS` and restarts the
+  process (the v0.1 supported reconfiguration path; hot-reload is
+  deferred), and an existing user re-authenticates so a fresh
+  session is bound
+- **THEN** the new session SHALL be tagged according to the updated
+  allowlist. Sessions bound prior to the restart SHALL be
+  invalidated by the restart itself in the v0.1 in-memory session
+  store; if the SCS sqlite store ever outlives the process restart,
+  the operator-facing reconfiguration procedure SHALL include an
+  explicit session-invalidation step (truncate the sessions table,
+  or call a `RevokeAllSessions` admin tool) so no stale admin tag
+  survives a tightening of the allowlist
 
 #### Scenario: No admin column exists on either users or accounts
 

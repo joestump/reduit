@@ -8,9 +8,9 @@ management, sync-status visibility, and per-account IMAP/SMTP
 credential rotation. It is server-rendered HTML using HTMX for
 interactions and SSE for live updates per ADR-0005. A user (one OIDC
 identity, one row in `users`) MAY own zero or more accounts (Proton
-mailboxes) per ADR-0010 / SPEC-0001. Admin status is computed at
-session-bind time from `OIDC_ADMIN_SUBS`, never stored on `users` or
-`accounts`.
+mailboxes) per ADR-0010 / SPEC-0001. Admin status is computed once
+per session at session-bind time from `OIDC_ADMIN_SUBS`, never
+stored on `users` or `accounts`, and never recomputed per-request.
 
 Governing: ADR-0004 (OIDC), ADR-0005 (frontend stack), ADR-0010
 (multi-Proton-account per user), SPEC-0001 (Account Model).
@@ -72,12 +72,16 @@ The login flow MUST follow OIDC authorization-code with PKCE.
 
 #### Scenario: Session admin tag is computed at bind time
 
-- **WHEN** a session is bound (immediately after callback validation
-  or on session lookup hydration)
+- **WHEN** a session is bound (immediately after `/auth/callback`
+  validation creates the session record)
 - **THEN** the server SHALL set the session's admin tag to `true`
   if and only if `Principal.Subject` appears in `OIDC_ADMIN_SUBS`,
   and SHALL NOT consult any `is_admin` column (none exists) on
-  `users` or `accounts`
+  `users` or `accounts`. The result is computed exactly once per
+  session and cached on the session payload (or in the in-process
+  session struct — implementation detail) per SPEC-0001 "Admin
+  Status". Per-request handlers SHALL read the cached tag and
+  SHALL NOT re-consult the allowlist on each request
 
 #### Scenario: First-time login establishes user identity only
 
@@ -345,13 +349,18 @@ in the UI; it SHALL NOT promote anyone to compensate.
 
 #### Scenario: Allowlist match grants admin on next bind
 
-- **WHEN** the operator updates `OIDC_ADMIN_SUBS` (process restart
-  in v0.1; hot-reload deferred) so that an existing user's
+- **WHEN** the operator updates `OIDC_ADMIN_SUBS` and restarts the
+  process (v0.1 — hot-reload deferred) so that an existing user's
   `oidc_subject` is now in the allowlist, and that user
-  re-authenticates or their session is re-bound
+  re-authenticates so a fresh session is bound
 - **THEN** the new session's admin tag SHALL be `true`. No data
-  migration SHALL be required; admin is purely a session-time
-  attribute
+  migration SHALL be required; admin is purely a session-bind-time
+  attribute. Sessions bound prior to the restart SHALL be
+  invalidated by the restart itself (in-memory session store) or
+  via the operator-facing session-revocation step required by
+  SPEC-0001 "Admin Status" if the SCS sqlite store outlives the
+  restart, so no stale admin tag survives a tightening of the
+  allowlist
 
 ## Out of Scope
 
