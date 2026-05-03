@@ -95,6 +95,7 @@ func New(db *sql.DB, opts Options) (*scs.SessionManager, func(), error) {
 // packages cannot disagree on the spelling.
 const (
 	keySubject  = "auth.subject"
+	keyUserID   = "auth.user_id"
 	keyAccount  = "auth.account_id"
 	keyIsAdmin  = "auth.is_admin"
 	keyEmail    = "auth.email"
@@ -102,12 +103,18 @@ const (
 )
 
 // Identity is the subset of authenticated-user state Reduit caches in
-// the session. Admin promotion comes either from
-// SPEC-0005 first-run-bootstrap or from the OIDC_ADMIN_SUBS env at
-// callback time; once set on the session it is sticky for the
-// session's lifetime (re-login refreshes it).
+// the session. Per ADR-0010, sessions bind primarily to UserID (the
+// `users` row resolved from the OIDC subject at callback time);
+// AccountID is OPTIONAL and only set when handlers scope a request
+// to a specific Proton account.
+//
+// IsAdmin is computed at session-bind time from OIDC_ADMIN_SUBS
+// against Subject -- per SPEC-0005 REQ "Session admin tag is computed
+// at bind time" -- and cached here for the session's lifetime (a
+// re-login recomputes it).
 type Identity struct {
 	Subject   string
+	UserID    string
 	AccountID string
 	Email     string
 	IsAdmin   bool
@@ -137,6 +144,7 @@ func PutIdentity(ctx context.Context, mgr *scs.SessionManager, id Identity) erro
 		return errors.New("session: nil manager")
 	}
 	mgr.Put(ctx, keySubject, id.Subject)
+	mgr.Put(ctx, keyUserID, id.UserID)
 	mgr.Put(ctx, keyAccount, id.AccountID)
 	mgr.Put(ctx, keyEmail, id.Email)
 	mgr.Put(ctx, keyIsAdmin, id.IsAdmin)
@@ -149,25 +157,77 @@ func PutIdentity(ctx context.Context, mgr *scs.SessionManager, id Identity) erro
 	return nil
 }
 
-// BindSessionToAccount records the (token, account_id) pair in the
-// session_owners sidecar table so a future RevokeSessionsForAccount
-// call can drop every session belonging to a suspended/soft-deleted
-// account in O(log n) on the idx_session_owners_account_id index.
+// BindSessionToUser records the (token, user_id) pair in the
+// session_owners sidecar table so a future RevokeSessionsForUser
+// call can drop every session belonging to a soft-deleted user in
+// O(log n) on the idx_session_owners_user_id index.
 //
-// A sidecar (rather than an extra column on `sessions`) is required
+// Per ADR-0010 this is the PRIMARY bind path -- a session is owned
+// by a user; the optional account_id scoping comes later via
+// BindSessionToAccount when a handler narrows the request to a
+// specific account.
+//
+// A sidecar (rather than extra columns on `sessions`) is required
 // because SCS's sqlite3store commits via `REPLACE INTO sessions(...)`
-// which clobbers any other column on every request. The token is the
-// FK from session_owners → sessions; cascade-on-delete on
-// session_owners is sufficient because we DELETE both rows together
-// in RevokeSessionsForAccount.
+// which clobbers any other column on every request. CASCADE on
+// `users(id)` and `accounts(id)` drives the revocation paths;
+// session_owners.token deliberately lacks a FK to sessions(token)
+// because the same REPLACE-on-commit would cascade-drop the owner
+// row mid-handler (see the schema migration's comment for detail).
 //
-// Callers SHOULD invoke mgr.Commit before BindSessionToAccount so a
-// live `sessions.token` row exists for the FK target; the call site
-// is the post-callback handler in #23, which does this naturally
-// (PutIdentity → Commit → BindSessionToAccount → redirect).
+// Callers SHOULD invoke mgr.Commit before BindSessionToUser so a live
+// `sessions.token` row exists when downstream lookups (e.g. revoke
+// by user) join on it, but BindSessionToUser does not enforce that
+// ordering -- the session_owners row stands on its own.
 //
-// Governing: SPEC-0005 REQ "Admin Account Management" (drop sessions
-// on suspend / soft-delete).
+// On re-login through the same browser the SCS token is renewed
+// inside PutIdentity, so this INSERT lands on a fresh primary key
+// rather than upserting the prior row. The prior token's owner row
+// is left orphaned in session_owners until a scheduled sweep cleans
+// it up (tracked as a known follow-up; the rows are tiny and revoke
+// paths key on user_id/account_id, so the orphan does not affect
+// correctness).
+//
+// Governing: ADR-0010, SPEC-0005 REQ "OIDC Login Flow", SPEC-0001
+// REQ "User Lifecycle".
+func BindSessionToUser(ctx context.Context, mgr *scs.SessionManager, db *sql.DB, userID string) error {
+	if mgr == nil {
+		return errors.New("session: nil manager")
+	}
+	if db == nil {
+		return errors.New("session: nil db")
+	}
+	if userID == "" {
+		return errors.New("session: empty user id")
+	}
+	token := mgr.Token(ctx)
+	if token == "" {
+		// No session token yet (the caller forgot to wrap with
+		// LoadAndSave, or Commit has not happened). Nothing to bind.
+		return nil
+	}
+	const q = `INSERT INTO session_owners (token, user_id) VALUES (?, ?)
+	           ON CONFLICT(token) DO UPDATE SET user_id = excluded.user_id, bound_at = CURRENT_TIMESTAMP`
+	if _, err := db.ExecContext(ctx, q, token, userID); err != nil {
+		return fmt.Errorf("session: bind to user: %w", err)
+	}
+	return nil
+}
+
+// BindSessionToAccount sets the OPTIONAL account_id scope on an
+// already-user-bound session row. This is the narrow form used when a
+// handler scopes a request to a specific Proton account (e.g.
+// /accounts/{id}/messages -- per SPEC-0006); the broader user binding
+// is established earlier in the OIDC callback via BindSessionToUser.
+//
+// Errors with a clear "session not bound to a user" message if no
+// session_owners row exists for the current token. Callers MUST call
+// BindSessionToUser before BindSessionToAccount; the schema's
+// `user_id NOT NULL` constraint enforces this at the storage layer
+// even if a future caller tries to skip the user-bind step.
+//
+// Governing: ADR-0010, SPEC-0005 REQ "Admin Account Management"
+// (drop sessions on suspend / soft-delete -- per-account fan-out).
 func BindSessionToAccount(ctx context.Context, mgr *scs.SessionManager, db *sql.DB, accountID string) error {
 	if mgr == nil {
 		return errors.New("session: nil manager")
@@ -180,19 +240,19 @@ func BindSessionToAccount(ctx context.Context, mgr *scs.SessionManager, db *sql.
 	}
 	token := mgr.Token(ctx)
 	if token == "" {
-		// No session token yet (the caller forgot to wrap with
-		// LoadAndSave, or Commit has not happened). Nothing to bind.
 		return nil
 	}
-	// REPLACE so the bind is idempotent on re-login through the same
-	// browser (the second login renews the token, and the previous
-	// (token, account_id) row is naturally dropped by sessions
-	// cascade if we ever wired a delete-from-sessions trigger; for
-	// now the row simply lingers until the session expires).
-	const q = `INSERT INTO session_owners (token, account_id) VALUES (?, ?)
-	           ON CONFLICT(token) DO UPDATE SET account_id = excluded.account_id, bound_at = CURRENT_TIMESTAMP`
-	if _, err := db.ExecContext(ctx, q, token, accountID); err != nil {
+	const q = `UPDATE session_owners SET account_id = ?, bound_at = CURRENT_TIMESTAMP WHERE token = ?`
+	res, err := db.ExecContext(ctx, q, accountID, token)
+	if err != nil {
 		return fmt.Errorf("session: bind to account: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("session: bind to account rows affected: %w", err)
+	}
+	if n == 0 {
+		return errors.New("session: bind to account: session not bound to a user (call BindSessionToUser first)")
 	}
 	return nil
 }
@@ -241,6 +301,46 @@ func RevokeSessionsForAccount(ctx context.Context, db *sql.DB, accountID string)
 	return n, nil
 }
 
+// RevokeSessionsForUser drops every session row owned by the supplied
+// user, returning the number of rows affected. Symmetric to
+// RevokeSessionsForAccount but scoped to user_id -- the primary
+// revocation primitive used when a users row is removed (per
+// SPEC-0001 REQ "User Lifecycle") or on operator-initiated
+// "log everyone out" actions.
+//
+// Sessions written before the OIDC callback handler is in service
+// (i.e. without a corresponding session_owners row) are NOT revoked
+// by this function -- they have no recorded owner, by definition
+// cannot have authorised any user-scoped traffic yet, and will
+// expire naturally via the SCS sweep within DefaultLifetime.
+//
+// Idempotent: calling on a user with zero live sessions returns
+// (0, nil).
+//
+// Governing: ADR-0010, SPEC-0001 REQ "User Lifecycle".
+func RevokeSessionsForUser(ctx context.Context, db *sql.DB, userID string) (int64, error) {
+	if db == nil {
+		return 0, errors.New("session: nil db")
+	}
+	if userID == "" {
+		return 0, errors.New("session: empty user id")
+	}
+	const deleteSessions = `DELETE FROM sessions WHERE token IN (SELECT token FROM session_owners WHERE user_id = ?)`
+	res, err := db.ExecContext(ctx, deleteSessions, userID)
+	if err != nil {
+		return 0, fmt.Errorf("session: revoke for user: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("session: rows affected: %w", err)
+	}
+	const deleteOwners = `DELETE FROM session_owners WHERE user_id = ?`
+	if _, err := db.ExecContext(ctx, deleteOwners, userID); err != nil {
+		return n, fmt.Errorf("session: cleanup session_owners: %w", err)
+	}
+	return n, nil
+}
+
 // GetIdentity returns the cached identity. Subject is empty when no
 // authenticated user is bound to the session, which is the canonical
 // "unauthenticated" signal middleware uses.
@@ -250,6 +350,7 @@ func GetIdentity(ctx context.Context, mgr *scs.SessionManager) Identity {
 	}
 	return Identity{
 		Subject:   mgr.GetString(ctx, keySubject),
+		UserID:    mgr.GetString(ctx, keyUserID),
 		AccountID: mgr.GetString(ctx, keyAccount),
 		Email:     mgr.GetString(ctx, keyEmail),
 		IsAdmin:   mgr.GetBool(ctx, keyIsAdmin),
@@ -274,6 +375,7 @@ func Clear(ctx context.Context, mgr *scs.SessionManager) {
 		return
 	}
 	mgr.Remove(ctx, keySubject)
+	mgr.Remove(ctx, keyUserID)
 	mgr.Remove(ctx, keyAccount)
 	mgr.Remove(ctx, keyEmail)
 	mgr.Remove(ctx, keyIsAdmin)
