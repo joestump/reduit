@@ -52,6 +52,25 @@ account selector is required.
   responses MUST follow the indistinguishability rule
   ("Authorization-failure indistinguishability" REQ)
 
+#### Scenario: OIDC bearer subject with no `users` row is rejected
+
+- **WHEN** an MCP request carries a valid OIDC ID token whose
+  `Principal.Subject` does not resolve to any row in the `users`
+  table (the subject has never completed a web OIDC login, so the
+  callback-driven user-row upsert has never run)
+- **THEN** the server SHALL NOT silently upsert a `users` row from
+  the MCP path. The server SHALL respond `403 Forbidden` with body
+  `{"error":"forbidden"}` — byte-identical (status, headers, body)
+  to the not-existent and not-owned 403 responses defined under the
+  "Authorization-failure indistinguishability" REQ. This forecloses
+  an enumeration oracle for "has any user with this OIDC subject
+  ever logged into Reduit's web UI" and forces the SPEC-0005
+  login-policy gate (web `/auth/callback`) to be the single seam
+  that admits a new subject. Server-side log lines MAY record
+  "no users row for subject" for operator triage, but the wire
+  response MUST NOT distinguish this case from selector-references-
+  unknown-account or selector-references-not-owned-account
+
 #### Scenario: Unauthenticated MCP request is rejected
 
 - **WHEN** an MCP request arrives without a valid bearer token
@@ -109,27 +128,33 @@ ownership of a non-owned account).
 
 When an OIDC-bearer MCP request supplies an account selector, the
 server MUST NOT leak which-account-exists-versus-which-is-owned via
-its failure response. "Selector present, account does not exist"
-and "selector present, account exists but is not owned by the JWT
-subject" MUST produce byte-identical responses (status, headers,
-body, timing characteristics).
+its failure response. "Selector present, account does not exist",
+"selector present, account exists but is not owned by the JWT
+subject", and "selector present, JWT subject has no `users` row at
+all" MUST all produce byte-identical responses (status, headers,
+body, timing characteristics). See the "OIDC bearer subject with no
+`users` row is rejected" scenario for the no-users-row case.
 
 The threat: UUIDv7 carries a creation timestamp. Without this
 discipline, any holder of a valid OIDC ID token (even a non-admin
-user with zero accounts) could iterate UUIDs and learn which exist
-on the deployment, plus when each was created.
+user with zero accounts, or a subject the IdP issues tokens to
+without that subject ever having completed a Reduit web login)
+could iterate UUIDs and learn which exist on the deployment, plus
+when each was created.
 
 This REQ is the auth-handshake-layer counterpart to the existing
 "Account Scope on All Operations" REQ, which already mandates
 identical-to-a-genuine-miss responses at the tool layer.
 
-#### Scenario: Non-existent and non-owned selectors return identical responses
+#### Scenario: Non-existent, non-owned, and no-users-row selectors return identical responses
 
 - **WHEN** an OIDC-bearer request carries a selector referencing
   account UUID `X` where (case A) no account row exists with
   `id=X`, OR (case B) a row exists but `account.user_id != users.id`
-  for the JWT subject
-- **THEN** in both cases the server SHALL respond `403 Forbidden`
+  for the JWT subject, OR (case C) no `users` row exists for the
+  JWT subject at all (per the "OIDC bearer subject with no `users`
+  row is rejected" scenario)
+- **THEN** in all three cases the server SHALL respond `403 Forbidden`
   with body `{"error":"forbidden"}` — byte-identical between cases.
   Headers SHALL be byte-identical: `Content-Type: application/json`,
   no `WWW-Authenticate` realm leak, no `X-Reduit-*` diagnostic
@@ -139,12 +164,15 @@ identical-to-a-genuine-miss responses at the tool layer.
 #### Scenario: Indistinguishability test exists
 
 - **WHEN** the test suite runs the MCP authz-failure tests
-- **THEN** there SHALL be at least one test that exercises both
-  cases (A: non-existent UUID; B: existing UUID owned by a
-  different user) with the same OIDC bearer and asserts byte-for-
-  byte equality of the HTTP response (status code, headers minus
-  `Date`, body). Timing-side-channel testing is out of scope for
-  v0.1 but a coarse same-order-of-magnitude check is RECOMMENDED
+- **THEN** there SHALL be at least one test that exercises all
+  three cases (A: non-existent UUID; B: existing UUID owned by a
+  different user; C: valid OIDC JWT whose subject has no `users`
+  row at all) with the same OIDC bearer (or, for case C, a
+  separately-issued bearer for an unseen subject) and asserts
+  byte-for-byte equality of the HTTP response (status code,
+  headers minus `Date`, body). Timing-side-channel testing is out
+  of scope for v0.1 but a coarse same-order-of-magnitude check is
+  RECOMMENDED
 
 #### Scenario: Selector-missing distinguishable from selector-present-failures
 

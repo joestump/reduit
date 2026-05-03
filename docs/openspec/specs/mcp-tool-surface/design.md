@@ -60,21 +60,26 @@ error-reported — so an attacker cannot use the header value to
 probe whether it matches the path id and learn ownership of a
 non-owned account.
 
-For authz failures on OIDC-bearer requests, "selector references
-non-existent account" and "selector references existing account
-not owned by the JWT subject" MUST produce byte-identical
-responses. UUIDv7 carries a creation timestamp; without this
+For authz failures on OIDC-bearer requests, three cases MUST
+produce byte-identical responses: "selector references non-existent
+account", "selector references existing account not owned by the
+JWT subject", and "JWT subject has no `users` row at all" (the MCP
+path does NOT silently upsert from a JWT — the SPEC-0005
+`/auth/callback` login-policy gate is the single seam that admits a
+new subject). UUIDv7 carries a creation timestamp; without this
 discipline, any holder of a valid OIDC ID token could iterate UUIDs
-and learn which exist on the deployment. The 400 ("selector
-required") path is distinct because it carries no account
-identifier and so leaks nothing.
+and learn which exist on the deployment, or probe whether any user
+with a given OIDC subject has ever signed into Reduit. The 400
+("selector required") path is distinct because it carries no
+account identifier and so leaks nothing.
 
 Implementation: a single `accountFromOIDC(ctx, jwt) (*Account,
-error)` helper resolves the selector, looks up the account, and
-returns either the account or a sentinel `errForbidden` for both
-"not found" and "not owned" cases. Callers that emit the response
-MUST treat `errForbidden` uniformly. Tests assert byte-equal
-responses across the two cases.
+error)` helper resolves the JWT subject to a `users.id` (returning
+`errForbidden` if no row exists), then resolves the selector and
+looks up the account, returning either the account or
+`errForbidden` for both "not found" and "not owned" cases. Callers
+that emit the response MUST treat `errForbidden` uniformly. Tests
+assert byte-equal responses across all three cases.
 
 ## Tool registry
 
