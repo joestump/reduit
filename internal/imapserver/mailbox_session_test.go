@@ -190,6 +190,7 @@ func (c *fakeProtonClient) UnlabelMessages(_ context.Context, msgIDs []string, l
 	return nil
 }
 func (c *fakeProtonClient) Logout(context.Context) error { return nil }
+func (c *fakeProtonClient) LatestRefreshToken() string   { return "" }
 
 // Methods added to proton.Client by SPEC-0002 (GetLatestEventID) and
 // SPEC-0004 (GetPublicKeys). IMAP mailbox tests do not exercise these
@@ -919,6 +920,7 @@ func (c *erroringProtonClient) UnlabelMessages(ctx context.Context, msgIDs []str
 	return c.wrapped.UnlabelMessages(ctx, msgIDs, labelID)
 }
 func (c *erroringProtonClient) Logout(ctx context.Context) error { return c.wrapped.Logout(ctx) }
+func (c *erroringProtonClient) LatestRefreshToken() string       { return c.wrapped.LatestRefreshToken() }
 
 // Forward the SPEC-0002 / SPEC-0004 surface to the wrapped client so
 // erroringProtonClient stays interface-complete after the proton.Client

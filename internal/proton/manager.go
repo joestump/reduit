@@ -183,6 +183,11 @@ func (m *Manager) NewClientWithLogin(ctx context.Context, username, password str
 	}
 
 	c := &clientImpl{mgr: m}
+	// Seed latestRefresh with the initial token so a caller that
+	// reads LatestRefreshToken() before any rotation gets the value
+	// returned in `auth`, not the empty string.
+	initial := auth.RefreshToken
+	c.latestRefresh.Store(&initial)
 	c.adoptUpstream(up)
 
 	if cbErr := m.fireInitialRefreshCallback(ctx, auth.RefreshToken); cbErr != nil {

@@ -67,12 +67,15 @@ type wizardStepIndicator struct {
 	Index int
 	Label string
 	State string // "done", "current", "pending"
+	Last  bool   // true on the rightmost step; the template skips its trailing connector
 }
 
-// stepIndicatorFor renders the 5-step header given the current stage.
-// We collapse the spec's "label sync" + "done" into a single visual
-// step beyond unlock; the user lands on the dashboard immediately on
-// success so the "Done" tick is implicit.
+// stepIndicatorFor renders the 3-step header given the current stage.
+// The spec/mockup show 5 visual steps (Credentials → Two-factor →
+// Mailbox key → Label sync → Done), but this PR only ships handlers
+// for the first three and redirects to /accounts on success. Render
+// only the steps that match real handler stages so the indicator
+// doesn't dangle on "step 3 of 5" forever.
 func stepIndicatorFor(stage WizardStage) []wizardStepIndicator {
 	cur := 1
 	switch stage {
@@ -83,7 +86,7 @@ func stepIndicatorFor(stage WizardStage) []wizardStepIndicator {
 	case WizardStageUnlock:
 		cur = 3
 	}
-	labels := []string{"Credentials", "Two-factor", "Mailbox key", "Label sync", "Done"}
+	labels := []string{"Credentials", "Two-factor", "Mailbox key"}
 	out := make([]wizardStepIndicator, len(labels))
 	for i, label := range labels {
 		state := "pending"
@@ -93,7 +96,7 @@ func stepIndicatorFor(stage WizardStage) []wizardStepIndicator {
 		case i+1 == cur:
 			state = "current"
 		}
-		out[i] = wizardStepIndicator{Index: i + 1, Label: label, State: state}
+		out[i] = wizardStepIndicator{Index: i + 1, Label: label, State: state, Last: i == len(labels)-1}
 	}
 	return out
 }
@@ -260,21 +263,44 @@ func (s *Server) handleWizardStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// No live session -- mint a fresh pending account row + wizard
-	// session entry in stage 1.
-	acct, err := s.deps.AccountService.Create(r.Context(), account.CreateParams{UserID: id.UserID})
+	// No live in-memory session. Try to reuse an existing pending
+	// row owned by this user before creating a new one -- otherwise
+	// every cookie-cleared GET, every TTL-expired wizard, every
+	// race-double-click would mint another orphan pending row that
+	// nothing ever cleans up. The retention sweep is a separate
+	// concern (#73-class follow-up).
+	accts, err := s.deps.AccountService.ListByUser(r.Context(), id.UserID)
 	if err != nil {
-		s.deps.Logger.Error("wizard/start: create account: " + err.Error())
+		s.deps.Logger.Error("wizard/start: list accounts: " + err.Error())
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	var pending *account.Account
+	for _, a := range accts {
+		if a.State == account.StatePendingProtonSetup {
+			pending = a
+			break
+		}
+	}
+	var acctID string
+	if pending != nil {
+		acctID = pending.ID
+	} else {
+		acct, err := s.deps.AccountService.Create(r.Context(), account.CreateParams{UserID: id.UserID})
+		if err != nil {
+			s.deps.Logger.Error("wizard/start: create account: " + err.Error())
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		acctID = acct.ID
+	}
 	sess := &WizardSession{
-		AccountID: acct.ID,
+		AccountID: acctID,
 		UserID:    id.UserID,
 		Stage:     WizardStageCredentials,
 	}
 	s.deps.WizardSessions.Put(sess)
-	s.deps.SessionManager.Put(r.Context(), wizardSessionKey, acct.ID)
+	s.deps.SessionManager.Put(r.Context(), wizardSessionKey, acctID)
 
 	s.renderWizard(w, r, sess, "")
 }
@@ -306,6 +332,11 @@ func (s *Server) handleWizardAuth(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/accounts/setup", http.StatusSeeOther)
 		return
 	}
+	// Per-session lock serialises concurrent POSTs (double-click,
+	// HTMX retry, two tabs) so stage transitions and TOTP-attempt
+	// counting cannot race.
+	sess.Lock()
+	defer sess.Unlock()
 	if sess.Stage != WizardStageCredentials {
 		// Out-of-order POST. Render whichever step we are actually on.
 		s.renderWizard(w, r, sess, "")
@@ -380,6 +411,8 @@ func (s *Server) handleWizardTOTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/accounts/setup", http.StatusSeeOther)
 		return
 	}
+	sess.Lock()
+	defer sess.Unlock()
 	if sess.Stage != WizardStageTOTP {
 		s.renderWizard(w, r, sess, "")
 		return
@@ -454,6 +487,8 @@ func (s *Server) handleWizardUnlock(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/accounts/setup", http.StatusSeeOther)
 		return
 	}
+	sess.Lock()
+	defer sess.Unlock()
 	if sess.Stage != WizardStageUnlock {
 		s.renderWizard(w, r, sess, "")
 		return
@@ -472,19 +507,32 @@ func (s *Server) handleWizardUnlock(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.commitWizard(r, sess, passphrase); err != nil {
-		// Three branches:
+		// Four branches:
 		//  1. errWizardUnlock: wrong passphrase. Re-render step 3
 		//     with an inline error (the wizard stays alive).
-		//  2. ErrAccountAlreadyExists: this Proton account is
+		//  2. errWizardNoKeys: brand-new Proton account with no
+		//     primary key yet. Terminal error -- the user has to
+		//     finish Proton-side setup before relaying mail.
+		//  3. ErrAccountAlreadyExists: this Proton account is
 		//     already bound to another row owned by the same user.
 		//     Tear the wizard down (we can't pin a duplicate
 		//     identity onto the pending row) and surface a clear
 		//     message.
-		//  3. anything else: 500.
+		//  4. anything else: 500.
 		switch {
 		case errors.Is(err, errWizardUnlock):
 			s.renderWizard(w, r, sess,
 				"Reduit could not unlock your mailbox with that passphrase. Use your Proton login password unless you've set a separate mailbox key.")
+			return
+		case errors.Is(err, errWizardNoKeys):
+			_ = sess.Client.Logout(r.Context())
+			s.deps.WizardSessions.Drop(accountID)
+			s.deps.SessionManager.Remove(r.Context(), wizardSessionKey)
+			if _, delErr := s.deps.AccountService.Delete(r.Context(), accountID); delErr != nil {
+				s.deps.Logger.Warn("wizard/unlock: soft-delete after no-keys: " + delErr.Error())
+			}
+			s.renderWizardError(w, r,
+				"This Proton account has no encryption keys yet. Sign in to Proton on the web once to provision your primary key, then restart this wizard.")
 			return
 		case errors.Is(err, account.ErrAccountAlreadyExists):
 			_ = sess.Client.Logout(r.Context())
@@ -523,6 +571,12 @@ func (s *Server) handleWizardUnlock(w http.ResponseWriter, r *http.Request) {
 // re-render and a 500.
 var errWizardUnlock = errors.New("wizard: mailbox unlock failed")
 
+// errWizardNoKeys is returned when Proton's GetUser response carries
+// no keys -- a real-world possibility for a brand-new Proton account
+// that hasn't generated its primary key yet. The handler renders the
+// terminal error page (vs. 500-ing) so the user gets a clear message.
+var errWizardNoKeys = errors.New("wizard: proton account has no keys")
+
 // commitWizard runs the Proton-side unlock + persists every column
 // the dashboard and sync supervisor need. Returns errWizardUnlock for
 // "wrong passphrase" so the handler can re-render step 3 inline.
@@ -532,7 +586,7 @@ func (s *Server) commitWizard(r *http.Request, sess *WizardSession, passphrase s
 		return fmt.Errorf("get user: %w", err)
 	}
 	if len(user.Keys) == 0 {
-		return fmt.Errorf("user has no keys")
+		return errWizardNoKeys
 	}
 	salts, err := sess.Client.KeySalts(r.Context())
 	if err != nil {
@@ -550,22 +604,39 @@ func (s *Server) commitWizard(r *http.Request, sess *WizardSession, passphrase s
 		return fmt.Errorf("%w: %v", errWizardUnlock, err)
 	}
 
-	// Unlock succeeded. Persist everything in this fixed order:
-	//   1. Refresh token (most sensitive bit -- gets sealed first).
-	//   2. Mailbox passphrase (also sealed under the per-account key).
-	//   3. ProtonUserID + Email columns.
+	// Unlock succeeded. Persist everything in this order:
+	//   1. ProtonUserID + Email columns. The unique (user_id,
+	//      proton_user_id) index makes this the cheapest dedup check;
+	//      if the user already has another row bound to this Proton
+	//      account it surfaces as ErrAccountAlreadyExists *before*
+	//      any ciphertext lands on disk.
+	//   2. Refresh token (sealed under the per-account data key).
+	//      We read the freshest value off the live client rather than
+	//      the captured-at-login sess.RefreshToken in case any of the
+	//      GetUser/KeySalts/GetAddresses/Unlock calls above provoked
+	//      a /auth/v4/refresh round-trip; the upstream auth handler
+	//      captured the rotated token into latestRefresh.
+	//   3. Mailbox passphrase (sealed under the same key).
 	//   4. Transition to active (fires the supervisor callback).
 	//
-	// Each step is its own DB write; a partial failure leaves the
-	// row in pending_proton_setup which is fine for resume.
-	if err := s.deps.AccountService.SealRefreshToken(r.Context(), sess.AccountID, []byte(sess.RefreshToken)); err != nil {
+	// Each step is its own DB write. A failure between step 1 and
+	// step 4 leaves the row in pending_proton_setup with identity
+	// stamped but credentials missing or partial -- the next wizard
+	// run will reuse this row (handleWizardStart picks up any pending
+	// row owned by the same user) and overwrite the half-committed
+	// ciphertext columns.
+	if err := s.setAccountProtonIdentity(r, sess); err != nil {
+		return err
+	}
+	refresh := sess.Client.LatestRefreshToken()
+	if refresh == "" {
+		refresh = sess.RefreshToken
+	}
+	if err := s.deps.AccountService.SealRefreshToken(r.Context(), sess.AccountID, []byte(refresh)); err != nil {
 		return fmt.Errorf("seal refresh token: %w", err)
 	}
 	if err := s.deps.AccountService.SealMailboxPassphrase(r.Context(), sess.AccountID, []byte(passphrase)); err != nil {
 		return fmt.Errorf("seal mailbox passphrase: %w", err)
-	}
-	if err := s.setAccountProtonIdentity(r, sess); err != nil {
-		return err
 	}
 	if _, err := s.deps.AccountService.Transition(r.Context(), sess.AccountID, account.StateActive); err != nil {
 		return fmt.Errorf("transition active: %w", err)
@@ -577,8 +648,10 @@ func (s *Server) commitWizard(r *http.Request, sess *WizardSession, passphrase s
 // on the pending account row. The columns were left NULL by Create
 // (ADR-0010 says Proton identity isn't known until the wizard runs),
 // so this is the first write that pins the row to a Proton account.
+// Passes sess.UserID to the service so the storage layer can WHERE-
+// clause on it (defense-in-depth against wrong-accountID bugs).
 func (s *Server) setAccountProtonIdentity(r *http.Request, sess *WizardSession) error {
-	return s.deps.AccountService.SetProtonIdentity(r.Context(), sess.AccountID, sess.ProtonUserID, sess.Username)
+	return s.deps.AccountService.SetProtonIdentity(r.Context(), sess.AccountID, sess.UserID, sess.ProtonUserID, sess.Username)
 }
 
 // handleWizardCancel discards the in-flight wizard. Soft-deletes the
@@ -592,7 +665,17 @@ func (s *Server) handleWizardCancel(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	accountID, _, hasSession := s.resolveWizardSession(r, id.UserID)
+	accountID, sess, hasSession := s.resolveWizardSession(r, id.UserID)
+	if hasSession {
+		// Lock so we cannot race a concurrent /unlock holding the
+		// session's Client field. Logout the upstream Proton session
+		// inside the lock, then drop from the store.
+		sess.Lock()
+		if sess.Client != nil {
+			_ = sess.Client.Logout(r.Context())
+		}
+		sess.Unlock()
+	}
 	if hasSession || accountID != "" {
 		s.deps.WizardSessions.Drop(accountID)
 		s.deps.SessionManager.Remove(r.Context(), wizardSessionKey)

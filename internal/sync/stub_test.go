@@ -75,6 +75,7 @@ func (stubClient) GetAttachment(context.Context, string) ([]byte, error) {
 	panic("stubClient.GetAttachment: lifecycle tests must not reach Proton")
 }
 func (stubClient) Logout(context.Context) error { return nil }
+func (stubClient) LatestRefreshToken() string   { return "" }
 
 // Methods added to proton.Client by SPEC-0003 (LabelMessages /
 // UnlabelMessages) and SPEC-0004 (GetPublicKeys). The lifecycle worker

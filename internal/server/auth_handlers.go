@@ -198,10 +198,29 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 // is normally a CSRF risk -- here it is bounded by the SCS session
 // cookie itself: an unauthenticated visit to /auth/logout is a
 // no-op. The destroy path is idempotent.
+//
+// If the user has an in-flight wizard, the in-memory wizard session
+// is dropped before the SCS session is destroyed -- otherwise the
+// live proton.Client + freshly-minted refresh token would linger in
+// process memory until the wizard's 30-min idle TTL fired, in
+// violation of SPEC-0005's "WHEN ... session invalidated THEN
+// partial credentials discarded from memory" requirement.
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	if s.deps.SessionManager == nil {
 		http.Error(w, "session subsystem not configured", http.StatusInternalServerError)
 		return
+	}
+	if s.deps.WizardSessions != nil {
+		if accountID := s.deps.SessionManager.GetString(r.Context(), wizardSessionKey); accountID != "" {
+			if sess, ok := s.deps.WizardSessions.Get(accountID); ok {
+				sess.Lock()
+				if sess.Client != nil {
+					_ = sess.Client.Logout(r.Context())
+				}
+				sess.Unlock()
+			}
+			s.deps.WizardSessions.Drop(accountID)
+		}
 	}
 	if err := s.deps.SessionManager.Destroy(r.Context()); err != nil {
 		s.deps.Logger.Warn("auth/logout: destroy: " + err.Error())

@@ -105,6 +105,11 @@ type stubProtonClient struct {
 	getAddressesErr    error
 	unlockErr          error
 
+	// latestRefresh is what LatestRefreshToken returns. Tests set it
+	// to assert the wizard persists the freshest value (vs. the
+	// initial token captured at login).
+	latestRefresh string
+
 	totpCalls   []string
 	unlockCalls int
 	logoutCalls int
@@ -184,6 +189,11 @@ func (c *stubProtonClient) Logout(context.Context) error {
 	defer c.mu.Unlock()
 	c.logoutCalls++
 	return nil
+}
+func (c *stubProtonClient) LatestRefreshToken() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.latestRefresh
 }
 
 // --- fixture ------------------------------------------------------
@@ -276,11 +286,18 @@ func newWizardFixture(t *testing.T, ttl time.Duration) *wizardFixture {
 func (f *wizardFixture) makeUser(t *testing.T, sub, email, name string) (*http.Client, string) {
 	t.Helper()
 	c := loginAndFollow(t, f.url, f.idp, sub, email, name)
+	return c, f.usrIDFor(t, sub)
+}
+
+// usrIDFor resolves an OIDC subject to its Reduit user ID via the
+// users service.
+func (f *wizardFixture) usrIDFor(t *testing.T, sub string) string {
+	t.Helper()
 	u, err := f.usrSvc.GetByOIDCSubject(t.Context(), sub)
 	if err != nil {
 		t.Fatalf("GetByOIDCSubject(%s): %v", sub, err)
 	}
-	return c, u.ID
+	return u.ID
 }
 
 // post is a tiny POST helper for form-urlencoded bodies.
@@ -438,6 +455,60 @@ func TestWizard_HappyPath_NoTwoFA(t *testing.T) {
 	}
 	if stubClient.unlockCalls != 1 {
 		t.Errorf("Unlock calls = %d, want 1", stubClient.unlockCalls)
+	}
+
+	// The persisted refresh token must round-trip to the captured-
+	// at-login value (the stub didn't simulate a rotation).
+	plaintext, err := f.accSvc.OpenRefreshToken(t.Context(), a.ID)
+	if err != nil {
+		t.Fatalf("OpenRefreshToken: %v", err)
+	}
+	if got := string(plaintext); got != "proton-refresh" {
+		t.Errorf("persisted refresh token = %q, want proton-refresh", got)
+	}
+
+	// Wizard commit-success path doesn't fire upstream Logout (we
+	// keep the session alive so the supervisor can adopt the tokens).
+	// What we DO want is that the wizard store no longer holds the
+	// session.
+	if _, ok := f.wizards.Get(a.ID); ok {
+		t.Error("wizard session still in store after commit; want dropped")
+	}
+}
+
+// TestWizard_HappyPath_PersistsRotatedRefreshToken asserts the C2
+// fix: if the upstream client's refresh token rotates between login
+// and the unlock-time persist, the wizard persists the *rotated*
+// value, not the captured-at-login one.
+func TestWizard_HappyPath_PersistsRotatedRefreshToken(t *testing.T) {
+	t.Parallel()
+	f := newWizardFixture(t, 0)
+	c, _ := f.makeUser(t, "sub-rotated", "joe@example.com", "Joe")
+
+	stubClient := readyClient()
+	// Simulate a rotation: between login and commit the upstream
+	// auth handler fired and updated latestRefresh.
+	stubClient.latestRefresh = "rotated-refresh"
+	f.stub.push(stubLoginResult{client: stubClient, auth: stubAuth(0)})
+
+	c.Get(f.url + "/accounts/setup")
+	post(t, c, f.url+"/accounts/setup/auth", url.Values{
+		"username": {"joe@protonmail.com"}, "password": {"hunter2"},
+	}).Body.Close()
+	post(t, c, f.url+"/accounts/setup/unlock", url.Values{
+		"passphrase": {"my-mailbox-passphrase"},
+	}).Body.Close()
+
+	accts, _ := f.accSvc.ListByUser(t.Context(), f.usrIDFor(t, "sub-rotated"))
+	if len(accts) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(accts))
+	}
+	plaintext, err := f.accSvc.OpenRefreshToken(t.Context(), accts[0].ID)
+	if err != nil {
+		t.Fatalf("OpenRefreshToken: %v", err)
+	}
+	if got := string(plaintext); got != "rotated-refresh" {
+		t.Errorf("persisted refresh token = %q, want rotated-refresh (the upstream-rotated value)", got)
 	}
 }
 
@@ -644,6 +715,74 @@ func TestWizard_IdleTimeout_DiscardsCredentials(t *testing.T) {
 	}
 	if len(stubClient.totpCalls) != 0 {
 		t.Errorf("expected 0 TOTP calls after expiry, got %v", stubClient.totpCalls)
+	}
+}
+
+func TestWizard_DuplicateProtonAccount_AbortsWithTerminalError(t *testing.T) {
+	t.Parallel()
+	f := newWizardFixture(t, 0)
+	c, userID := f.makeUser(t, "sub-dup", "joe@example.com", "Joe")
+
+	// Pre-seed an active account already bound to "proton-user-joe"
+	// for this user. The wizard's SetProtonIdentity step will then
+	// trip the unique (user_id, proton_user_id) index.
+	pre, err := f.accSvc.Create(t.Context(), account.CreateParams{
+		UserID:       userID,
+		ProtonUserID: "proton-user-joe",
+		Email:        "first@protonmail.com",
+	})
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	if _, err := f.accSvc.Transition(t.Context(), pre.ID, account.StateActive); err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+
+	stubClient := readyClient()
+	f.stub.push(stubLoginResult{client: stubClient, auth: stubAuth(0)})
+
+	c.Get(f.url + "/accounts/setup")
+	post(t, c, f.url+"/accounts/setup/auth", url.Values{
+		"username": {"joe@protonmail.com"}, "password": {"hunter2"},
+	}).Body.Close()
+	resp := post(t, c, f.url+"/accounts/setup/unlock", url.Values{
+		"passphrase": {"my-mailbox-passphrase"},
+	})
+	body := readBody(t, resp)
+
+	if !strings.Contains(body, "already linked") {
+		t.Errorf("expected duplicate-account terminal copy; body excerpt=%s", body[:min(len(body), 600)])
+	}
+
+	// The pending row created at GET time must be soft-deleted; the
+	// pre-seeded active row stays put.
+	accts, _ := f.accSvc.ListByUser(t.Context(), userID)
+	var active, soft int
+	for _, a := range accts {
+		switch a.State {
+		case account.StateActive:
+			active++
+		case account.StateSoftDeleted:
+			soft++
+		}
+	}
+	if active != 1 {
+		t.Errorf("expected 1 active account post-abort, got %d", active)
+	}
+	if soft != 1 {
+		t.Errorf("expected 1 soft-deleted (the wizard's pending row), got %d", soft)
+	}
+
+	// And the cipher columns on the soft-deleted row must NOT have
+	// been written -- C4 requires the dedup check to run before any
+	// seal does.
+	for _, a := range accts {
+		if a.State == account.StateSoftDeleted {
+			if a.HasRefreshToken || a.HasMailboxPassphrase {
+				t.Errorf("aborted wizard's row has ciphertext (HasRefresh=%v HasPass=%v); want neither — seals must run AFTER the dedup check",
+					a.HasRefreshToken, a.HasMailboxPassphrase)
+			}
+		}
 	}
 }
 

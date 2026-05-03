@@ -23,7 +23,6 @@
 package server
 
 import (
-	"context"
 	"sync"
 	"time"
 
@@ -58,8 +57,18 @@ const (
 )
 
 // WizardSession is the per-account-in-flight wizard state. Stored
-// only in memory.
+// only in memory. The embedded mutex serialises mutation for the
+// per-account hot path -- two concurrent POSTs from the same user
+// (double-click, HTMX retry, two browser tabs) both resolve to the
+// same pointer; without the lock they would race on stage/attempt
+// fields and could bypass the 3-fail TOTP budget.
+//
+// Handlers MUST take the lock right after store.Get returns and
+// hold it across the read-modify-write sequence. The store's own
+// mutex protects only the map.
 type WizardSession struct {
+	sync.Mutex
+
 	// AccountID is the pending account row this wizard is bound to.
 	// Used as the map key.
 	AccountID string
@@ -131,9 +140,10 @@ func (s *WizardSessionStore) Stop() {
 	s.stopOnce.Do(func() { close(s.stopCh) })
 }
 
-// janitor sweeps expired sessions every TTL/4. The sweep takes the
-// store lock for the brief duration of the iteration -- per-session
-// Logout calls run lockless after the lock is released.
+// janitor sweeps expired sessions every TTL/4. We do NOT call Logout
+// on swept sessions: the upstream Proton access token expires on its
+// own (~30min), and calling Logout here would race against any in-
+// flight handler still holding the per-session lock.
 func (s *WizardSessionStore) janitor() {
 	tick := time.NewTicker(s.ttl / 4)
 	defer tick.Stop()
@@ -150,18 +160,10 @@ func (s *WizardSessionStore) janitor() {
 func (s *WizardSessionStore) sweep() {
 	cutoff := s.now().Add(-s.ttl)
 	s.mu.Lock()
-	expired := make([]*WizardSession, 0)
+	defer s.mu.Unlock()
 	for id, sess := range s.sessions {
 		if sess.IdleAt.Before(cutoff) {
-			expired = append(expired, sess)
 			delete(s.sessions, id)
-		}
-	}
-	s.mu.Unlock()
-	// Best-effort upstream logout outside the lock.
-	for _, sess := range expired {
-		if sess.Client != nil {
-			_ = sess.Client.Logout(context.Background())
 		}
 	}
 }
@@ -194,30 +196,23 @@ func (s *WizardSessionStore) Get(accountID string) (*WizardSession, bool) {
 	}
 	if s.now().Sub(sess.IdleAt) > s.ttl {
 		delete(s.sessions, accountID)
-		// Best-effort upstream logout, lockless. We're already
-		// holding the lock so do this in a goroutine -- the caller
-		// shouldn't pay for the round-trip on a miss.
-		if sess.Client != nil {
-			go sess.Client.Logout(context.Background())
-		}
 		return nil, false
 	}
 	sess.IdleAt = s.now()
 	return sess, true
 }
 
-// Drop removes the session for accountID. Calls Logout on the held
-// client (best-effort) so the upstream session is revoked. Safe to
-// call when no session exists.
+// Drop removes the session for accountID from the store. Pure map
+// operation — does NOT call Logout on the held client. Callers that
+// want to revoke the upstream Proton session MUST call sess.Client
+// .Logout themselves, ideally while holding the per-session lock so
+// they cannot race against another goroutine still using sess.Client.
+// Safe to call when no session exists.
 func (s *WizardSessionStore) Drop(accountID string) {
 	if accountID == "" {
 		return
 	}
 	s.mu.Lock()
-	sess := s.sessions[accountID]
 	delete(s.sessions, accountID)
 	s.mu.Unlock()
-	if sess != nil && sess.Client != nil {
-		_ = sess.Client.Logout(context.Background())
-	}
 }

@@ -12,7 +12,7 @@
   <div class="surface rounded-xl p-8">
     <!-- Step indicator -->
     <div class="flex items-center justify-between mb-8 px-2">
-      {{range $i, $s := .StepIndicator}}
+      {{range $s := .StepIndicator}}
         <div class="flex flex-col items-center text-center" style="min-width: 4.5rem;">
           {{if eq $s.State "done"}}
             <div class="w-10 h-10 rounded-full flex items-center justify-center text-white" style="background:#4F46E5">
@@ -31,7 +31,7 @@
             {{$s.Label}}
           </div>
         </div>
-        {{if lt $i 4}}
+        {{if not $s.Last}}
           <div class="flex-1 h-px mx-2 {{if eq $s.State "done"}}bg-indigo-500{{else}}bg-slate-700{{end}}"></div>
         {{end}}
       {{end}}
@@ -57,7 +57,7 @@
 
   {{if ne .Stage "aborted"}}
     <p class="text-center text-sm text-slate-500 mt-4">
-      Step {{.Step}} of 5 &middot; {{.StateExpires}}
+      Step {{.Step}} of 3 &middot; {{.StateExpires}}
     </p>
   {{end}}
 </div>

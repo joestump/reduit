@@ -83,6 +83,7 @@ func (f *fakeProtonClient) GetAttachment(context.Context, string) ([]byte, error
 	panic("GetAttachment: unexpected call")
 }
 func (f *fakeProtonClient) Logout(context.Context) error { return nil }
+func (f *fakeProtonClient) LatestRefreshToken() string   { return "" }
 
 // Methods added to proton.Client by the SPEC-0004 outbox work
 // (GetPublicKeys) and the SPEC-0003 IMAP MOVE/COPY work

@@ -71,6 +71,9 @@ func (f *fakeProtonClient) SendDraft(context.Context, string, proton.SendDraftRe
 func (f *fakeProtonClient) GetAttachment(context.Context, string) ([]byte, error) {
 	panic("fakeProtonClient: GetAttachment not implemented")
 }
+func (f *fakeProtonClient) LatestRefreshToken() string {
+	return ""
+}
 func (f *fakeProtonClient) Logout(context.Context) error {
 	panic("fakeProtonClient: Logout not implemented")
 }
