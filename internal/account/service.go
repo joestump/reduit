@@ -213,9 +213,9 @@ func newUUIDv7() (string, error) {
 
 // Create implements Service.Create.
 //
-// Governing: SPEC-0001 REQ "Account Identity" (UUIDv7 + OIDC uniqueness),
+// Governing: SPEC-0001 REQ "Account Identity",
 // SPEC-0001 REQ "Per-Account Data Key" (fresh data key, sealed envelope),
-// SPEC-0001 REQ "Admin Flag" (is_admin set from allowlist at create time).
+// SPEC-0001 REQ "Admin Status" (is_admin set from allowlist at create time).
 func (s *service) Create(ctx context.Context, params CreateParams) (*Account, error) {
 	// Defensive trim so a sub pasted with a leading/trailing space
 	// matches the in-memory allowlist (which is configured by an
