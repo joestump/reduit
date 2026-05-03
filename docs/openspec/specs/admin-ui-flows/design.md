@@ -121,19 +121,27 @@ on every `sync_progress` event).
 
 ## First-run bootstrap
 
-The first OIDC login on a fresh deployment becomes the initial admin
-user. Implementation: in the OIDC callback handler, if no admin has
-ever authenticated (no allowlist entry has matched a real login and
-no first-run flag has been recorded), the OIDC `sub` is added to
-the in-memory admin set and a sentinel is persisted so subsequent
-logins fall through to the configured allowlist. No `accounts` row
-is created at bootstrap; the user is routed into the add-account
-wizard via the dashboard empty-state rule, and ownership of any
-accounts they create is recorded in `owner_oidc_sub`.
+The first OIDC login on a fresh deployment creates a regular user.
+There is no auto-promotion to admin. Implementation: in the OIDC
+callback handler, the system upserts a `users` row keyed by the
+authenticating `oidc_subject` and binds a session whose `is_admin`
+tag is computed from `OIDC_ADMIN_SUBS` only. No `accounts` row is
+created at bootstrap; the user is routed into the add-account wizard
+via the dashboard empty-state rule.
 
-This is documented prominently — the operator MUST log in first
-before exposing Reduit publicly, otherwise an attacker who reaches
-the OIDC redirect could become admin.
+If the operator has not yet configured `OIDC_ADMIN_SUBS`, the
+dashboard renders an explicit operator-configuration warning banner
+(per SPEC-0005 First-Run Bootstrap REQ). The system never elevates
+anyone in the absence of allowlist configuration — the safe default
+is "no admin" rather than "first authenticator wins". This removes
+the previous race where an attacker reaching the OIDC redirect
+before the operator could become the de-facto admin.
+
+The warning banner is conservative — it shows whenever the system
+has zero admin-tagged sessions in living memory AND the allowlist
+is empty. It is not a security boundary on its own; the boundary is
+"admin actions require a session whose `is_admin` tag is true, and
+no session can be admin-tagged without an allowlist match."
 
 ## Content security and CSRF
 
