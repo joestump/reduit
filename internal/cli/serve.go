@@ -18,6 +18,7 @@ import (
 	"github.com/joestump/reduit/internal/server"
 	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/tlsloader"
+	"github.com/joestump/reduit/internal/users"
 )
 
 func newServeCmd(cfgPath *string, verbose *bool) *cobra.Command {
@@ -129,6 +130,12 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		preSessions = authoidc.NewPreSessionStore(authoidc.DefaultPreSessionTTL)
 	}
 
+	// Users service feeds the OIDC callback's session-bind path
+	// (auth.BindFromOIDC) -- it upserts the users row keyed by the
+	// validated OIDC subject. Constructed here (rather than
+	// per-request) so the underlying *sqlx.DB stays singleton.
+	usersService := users.New(st)
+
 	// HTTP server.
 	srv := server.New(cfg.Server.HTTPAddr, server.Deps{
 		Store:          st,
@@ -138,6 +145,8 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		SessionManager: scsMgr,
 		OIDC:           oidcClient,
 		PreSessions:    preSessions,
+		UsersService:   usersService,
+		AdminSubjects:  cfg.OIDC.AdminSubjects,
 	})
 
 	errCh := make(chan error, 1)

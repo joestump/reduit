@@ -21,6 +21,7 @@ import (
 	"github.com/joestump/reduit/internal/auth"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	"github.com/joestump/reduit/internal/store"
+	"github.com/joestump/reduit/internal/users"
 )
 
 // Deps are the dependencies a Server needs to start. Wired by
@@ -30,20 +31,29 @@ type Deps struct {
 	GetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	Logger         *slog.Logger
 	Version        string // for /healthz response body
-	// SessionManager is the SCS-backed session store. Optional in v0.1
-	// (the only routes are health probes), but the gate middleware is
-	// wired so the moment a protected route is added it Just Works.
+	// SessionManager is the SCS-backed session store.
 	//
 	// Governing: ADR-0004, SPEC-0005 REQ "Authentication Gating".
 	SessionManager *scs.SessionManager
-	// OIDC is the configured Relying Party. Reserved for issue #23 —
-	// the login/callback handlers call into it. Server v0.1 holds the
-	// reference so a startup-time misconfiguration surfaces here, not
-	// on the first user click.
+	// OIDC is the configured Relying Party. The login/callback handlers
+	// call into it.
 	OIDC *authoidc.Client
-	// PreSessions is the in-memory store for PKCE pre-sessions, used
-	// by the future #23 callback handler.
+	// PreSessions is the in-memory store for PKCE pre-sessions used by
+	// /auth/login and /auth/callback to correlate the redirect with
+	// the eventual auth-code exchange.
 	PreSessions *authoidc.PreSessionStore
+	// UsersService is the users repository the OIDC callback upserts
+	// against (per ADR-0010 / SPEC-0001 REQ "User Identity").
+	UsersService users.Service
+	// AdminSubjects is the OIDC_ADMIN_SUBS allowlist. The callback's
+	// session-bind path checks Principal.Subject against this list at
+	// bind time per SPEC-0005 REQ "Session admin tag is computed at
+	// bind time"; nil means "no admins."
+	AdminSubjects []string
+	// InsecureCookies disables the Secure cookie flag, ONLY for tests
+	// that drive the server over plain HTTP (httptest.NewServer).
+	// Production callers MUST leave this false.
+	InsecureCookies bool
 }
 
 // Server holds an http.Server pre-configured with TLS and the
@@ -61,35 +71,8 @@ func New(addr string, deps Deps) *Server {
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
 	}
-	mux := http.NewServeMux()
-	s := &Server{
-		addr:    addr,
-		deps:    deps,
-		stopped: make(chan struct{}),
-	}
-	s.routes(mux)
-
-	// The handler chain is:
-	//
-	//   ServeMux
-	//     ↓
-	//   auth.RequireSession (302→/auth/login on miss; allowlist passes)
-	//     ↓
-	//   scs.LoadAndSave (loads/saves the cookie-bound session row)
-	//
-	// LoadAndSave wraps the OUTERMOST so RequireSession can read the
-	// session via scs.GetString from the request context. We compose
-	// in the order applied (the last call is the outermost wrapper).
-	//
-	// Governing: SPEC-0005 REQ "Authentication Gating".
-	var handler http.Handler = mux
-	if deps.SessionManager != nil {
-		handler = auth.RequireSession(auth.SessionGate{
-			Manager:   deps.SessionManager,
-			LoginPath: "/auth/login",
-		}, handler)
-		handler = deps.SessionManager.LoadAndSave(handler)
-	}
+	s, handler := newWithHandler(deps)
+	s.addr = addr
 
 	tlsCfg := &tls.Config{
 		GetCertificate: deps.GetCertificate,
@@ -106,6 +89,56 @@ func New(addr string, deps Deps) *Server {
 		ErrorLog:          slog.NewLogLogger(deps.Logger.Handler(), slog.LevelError),
 	}
 	return s
+}
+
+// NewForTest builds the same routes + middleware chain as New but
+// without the http.Server / TLS setup. Tests mount the returned
+// handler under their own httptest.Server and exercise the full
+// production middleware stack (RequireSession, LoadAndSave, etc.).
+//
+// Returns the Server (for any future hooks tests need on it) and the
+// http.Handler tests should serve.
+func NewForTest(deps Deps) (*Server, http.Handler) {
+	if deps.Logger == nil {
+		deps.Logger = slog.Default()
+	}
+	return newWithHandler(deps)
+}
+
+// newWithHandler is the shared construction path: builds the mux,
+// mounts routes, and wraps the configured middleware chain. Returns
+// the Server (with mux/routes wired but srv unset) and the composed
+// handler ready to serve.
+//
+// The handler chain is:
+//
+//	ServeMux
+//	  ↓
+//	auth.RequireSession (302→/auth/login on miss; allowlist passes)
+//	  ↓
+//	scs.LoadAndSave (loads/saves the cookie-bound session row)
+//
+// LoadAndSave wraps the OUTERMOST so RequireSession can read the
+// session via scs.GetString from the request context.
+//
+// Governing: SPEC-0005 REQ "Authentication Gating".
+func newWithHandler(deps Deps) (*Server, http.Handler) {
+	mux := http.NewServeMux()
+	s := &Server{
+		deps:    deps,
+		stopped: make(chan struct{}),
+	}
+	s.routes(mux)
+
+	var handler http.Handler = mux
+	if deps.SessionManager != nil {
+		handler = auth.RequireSession(auth.SessionGate{
+			Manager:   deps.SessionManager,
+			LoginPath: "/auth/login",
+		}, handler)
+		handler = deps.SessionManager.LoadAndSave(handler)
+	}
+	return s, handler
 }
 
 // Start begins serving. It returns when the listener exits (typically
@@ -136,6 +169,14 @@ func (s *Server) Stopped() <-chan struct{} { return s.stopped }
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
+
+	// OIDC login flow per SPEC-0005 REQ "OIDC Login Flow".
+	// All three paths are allowlisted (auth.Allowlist) so the
+	// RequireSession gate doesn't 302-loop them.
+	mux.HandleFunc("GET /auth/login", s.handleAuthLogin)
+	mux.HandleFunc("GET /auth/callback", s.handleAuthCallback)
+	mux.HandleFunc("POST /auth/logout", s.handleAuthLogout)
+	mux.HandleFunc("GET /auth/logout", s.handleAuthLogout)
 }
 
 // handleHealthz returns 200 OK if the process is up. It does not
