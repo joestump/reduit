@@ -347,11 +347,19 @@ func newOIDCTestServer(t *testing.T) (priv crypto.PrivateKey, srvURL, keyID, alg
 
 func insertAccount(t *testing.T, st *store.Store, id string) {
 	t.Helper()
+	// Per ADR-0010, accounts.user_id FK requires a users row first.
+	sub := "sub-" + uuid.NewString()
+	if _, err := st.DB.ExecContext(context.Background(),
+		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
+		"user-"+id, sub,
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
 	const q = `
-		INSERT INTO accounts (id, oidc_subject, state, key_envelope)
+		INSERT INTO accounts (id, user_id, state, key_envelope)
 		VALUES (?, ?, 'pending_proton_setup', X'00')
 	`
-	if _, err := st.DB.ExecContext(context.Background(), q, id, "sub-"+uuid.NewString()); err != nil {
+	if _, err := st.DB.ExecContext(context.Background(), q, id, "user-"+id); err != nil {
 		t.Fatalf("insert account: %v", err)
 	}
 }

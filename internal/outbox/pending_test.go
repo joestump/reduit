@@ -112,12 +112,20 @@ func openMigratedStore(t *testing.T) *store.Store {
 
 // insertAccount writes the minimum row the FK constraint requires.
 // We don't go through internal/account because that pulls in the
-// envelope crypto and adds noise to the test.
+// envelope crypto and adds noise to the test. Per ADR-0010 the
+// accounts table requires a user_id FK, so we mint a users row
+// inline as well.
 func insertAccount(t *testing.T, s *store.Store, id string) {
 	t.Helper()
+	if _, err := s.DB.Exec(
+		`INSERT INTO users(id, oidc_subject) VALUES (?, ?)`,
+		"user-"+id, "sub-"+id,
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
 	_, err := s.DB.Exec(`
-		INSERT INTO accounts(id, oidc_subject, state, key_envelope)
-		VALUES (?, ?, 'active', x'00')`, id, id)
+		INSERT INTO accounts(id, user_id, state, key_envelope)
+		VALUES (?, ?, 'active', x'00')`, id, "user-"+id)
 	if err != nil {
 		t.Fatalf("insert account: %v", err)
 	}

@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -43,15 +42,17 @@ type TransitionCallback func(ctx context.Context, prev, next State, account *Acc
 // Service is the contract every consumer (HTTP handlers, sync worker,
 // IMAP/SMTP servers, MCP tools) talks to.
 type Service interface {
-	// Create mints a new account row for the given OIDC subject. It
-	// generates a fresh per-account data key, seals it under the master
-	// key, and persists the envelope. Returns ErrAccountAlreadyExists
-	// when the OIDC subject is already taken.
+	// Create mints a new account row for the given user. It generates
+	// a fresh per-account data key, seals it under the master key, and
+	// persists the envelope. Returns ErrAccountAlreadyExists when the
+	// (user_id, proton_user_id) pair is already taken (i.e., the user
+	// already owns an account for that Proton user).
+	//
+	// Per ADR-0010 the caller resolves UserID from the bound session
+	// before calling Create -- account.Service does not look up users
+	// itself. ProtonUserID is optional at create time; the wizard
+	// fills it in once Proton login completes.
 	Create(ctx context.Context, params CreateParams) (*Account, error)
-
-	// GetByOIDCSubject returns the account for the given OIDC `sub`
-	// claim, or ErrAccountNotFound.
-	GetByOIDCSubject(ctx context.Context, sub string) (*Account, error)
 
 	// GetByID returns the account with the given ID, or
 	// ErrAccountNotFound.
@@ -62,15 +63,19 @@ type Service interface {
 	Transition(ctx context.Context, id string, next State) (*Account, error)
 
 	// List returns every account, ordered by creation time ascending.
+	// Used by admin views and by the sync supervisor's startup scan;
+	// per-user views SHOULD use ListByUser instead.
 	List(ctx context.Context) ([]*Account, error)
+
+	// ListByUser returns every account owned by the given user,
+	// ordered by creation time ascending. This is the hot path for
+	// the per-user account dashboard (SPEC-0005) and ownership
+	// enumeration (SPEC-0001).
+	ListByUser(ctx context.Context, userID string) ([]*Account, error)
 
 	// Delete is a convenience for `Transition(ctx, id, StateSoftDeleted)`.
 	// Hard deletion is the responsibility of the retention sweep job.
 	Delete(ctx context.Context, id string) (*Account, error)
-
-	// IsAdmin reports whether the given account's OIDC subject is on
-	// the configured admin allowlist.
-	IsAdmin(a *Account) bool
 
 	// SealRefreshToken seals plaintext under the account's data key
 	// (fresh nonce per call) and persists the ciphertext.
@@ -156,19 +161,19 @@ type Service interface {
 
 // CreateParams collects the inputs to Service.Create. ProtonUserID
 // and Email are optional at create time — they are filled in by the
-// Proton login wizard once it completes.
+// Proton login wizard once it completes. UserID MUST reference an
+// existing users row (the FK is enforced at the storage layer).
 type CreateParams struct {
-	OIDCSubject  string
+	UserID       string
 	ProtonUserID string
 	Email        string
 }
 
 type service struct {
-	repo      *repository
-	master    cryptenv.MasterKey
-	adminSubs []string
-	now       func() time.Time
-	newID     func() (string, error)
+	repo   *repository
+	master cryptenv.MasterKey
+	now    func() time.Time
+	newID  func() (string, error)
 
 	// transitionCBs holds the live set of transition subscribers. A
 	// pointer-keyed registration cell is used so unsubscribe is O(1)
@@ -184,19 +189,19 @@ type transitionReg struct {
 	cb TransitionCallback
 }
 
-// New constructs a Service backed by the given store, master key, and
-// admin allowlist. The Service does not take ownership of the store —
-// the caller closes it.
-func New(s *store.Store, master cryptenv.MasterKey, adminSubs []string) Service {
+// New constructs a Service backed by the given store and master key.
+// The Service does not take ownership of the store — the caller
+// closes it. Per ADR-0010, admin status is no longer an account
+// attribute, so the admin allowlist is not passed here -- it lives
+// at the session layer (computed at session-bind time from
+// OIDC_ADMIN_SUBS per SPEC-0001 REQ "Admin Status").
+func New(s *store.Store, master cryptenv.MasterKey) Service {
 	if s == nil || s.DB == nil {
 		panic("account: New called with nil store")
 	}
-	subs := make([]string, len(adminSubs))
-	copy(subs, adminSubs)
 	return &service{
 		repo:         &repository{db: s.DB},
 		master:       master,
-		adminSubs:    subs,
 		now:          time.Now,
 		newID:        newUUIDv7,
 		transitionCB: make(map[*transitionReg]struct{}),
@@ -213,16 +218,12 @@ func newUUIDv7() (string, error) {
 
 // Create implements Service.Create.
 //
-// Governing: SPEC-0001 REQ "Account Identity",
-// SPEC-0001 REQ "Per-Account Data Key" (fresh data key, sealed envelope),
-// SPEC-0001 REQ "Admin Status" (admin computed at session-bind time per ADR-0010; not persisted).
+// Governing: ADR-0010 (multi-Proton-account per user), SPEC-0001 REQ
+// "Account Identity", SPEC-0001 REQ "Per-Account Data Key".
 func (s *service) Create(ctx context.Context, params CreateParams) (*Account, error) {
-	// Defensive trim so a sub pasted with a leading/trailing space
-	// matches the in-memory allowlist (which is configured by an
-	// operator who may also have pasted with whitespace).
-	params.OIDCSubject = strings.TrimSpace(params.OIDCSubject)
-	if params.OIDCSubject == "" {
-		return nil, errors.New("account: OIDCSubject is required")
+	params.UserID = strings.TrimSpace(params.UserID)
+	if params.UserID == "" {
+		return nil, errors.New("account: UserID is required")
 	}
 
 	id, err := s.newID()
@@ -245,7 +246,7 @@ func (s *service) Create(ctx context.Context, params CreateParams) (*Account, er
 	now := s.now().UTC()
 	row := &accountRow{
 		ID:          id,
-		OIDCSubject: params.OIDCSubject,
+		UserID:      params.UserID,
 		State:       string(StatePendingProtonSetup),
 		KeyEnvelope: envelope,
 		CreatedAt:   now,
@@ -257,9 +258,6 @@ func (s *service) Create(ctx context.Context, params CreateParams) (*Account, er
 	if params.Email != "" {
 		row.Email = sql.NullString{String: params.Email, Valid: true}
 	}
-	if slices.Contains(s.adminSubs, params.OIDCSubject) {
-		row.IsAdmin = 1
-	}
 
 	if err := s.repo.insert(ctx, row); err != nil {
 		return nil, err
@@ -267,12 +265,20 @@ func (s *service) Create(ctx context.Context, params CreateParams) (*Account, er
 	return row.toAccount(), nil
 }
 
-func (s *service) GetByOIDCSubject(ctx context.Context, sub string) (*Account, error) {
-	row, err := s.repo.getByOIDCSubject(ctx, sub)
+func (s *service) ListByUser(ctx context.Context, userID string) ([]*Account, error) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return nil, errors.New("account: userID is required")
+	}
+	rows, err := s.repo.listByUserID(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
-	return row.toAccount(), nil
+	out := make([]*Account, len(rows))
+	for i, r := range rows {
+		out[i] = r.toAccount()
+	}
+	return out, nil
 }
 
 func (s *service) GetByID(ctx context.Context, id string) (*Account, error) {
@@ -443,17 +449,6 @@ func allowedPrevStates(next State) []State {
 
 func (s *service) Delete(ctx context.Context, id string) (*Account, error) {
 	return s.Transition(ctx, id, StateSoftDeleted)
-}
-
-func (s *service) IsAdmin(a *Account) bool {
-	if a == nil || a.OIDCSubject == "" {
-		// Defense-in-depth: a misconfigured OIDC_ADMIN_SUBS that contains
-		// "" (e.g. from "OIDC_ADMIN_SUBS=,sub-foo") would otherwise grant
-		// admin to any account whose subject is empty. Mirror the guard
-		// in Account.AdminBy so the two answers always agree.
-		return false
-	}
-	return slices.Contains(s.adminSubs, a.OIDCSubject)
 }
 
 // zeroDataKey best-effort wipes a data key from memory after use. Go

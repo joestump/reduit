@@ -56,21 +56,26 @@ func newMailboxStack(t *testing.T) (mailbox.Service, *store.Store, string) {
 	}
 
 	const accountID = "acct-imap-test"
-	const q = `
-INSERT INTO accounts (id, oidc_subject, state, key_envelope, created_at, updated_at)
-VALUES (?, ?, 'active', X'00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-	if _, err := st.DB.Exec(q, accountID, "sub-"+accountID); err != nil {
-		t.Fatalf("seed account: %v", err)
-	}
+	seedAccountID(t, st, accountID)
 	return mailbox.New(st), st, accountID
 }
 
+// Per ADR-0010, accounts.user_id FK requires a users row first --
+// seedAccountID mints both inline so each call is self-contained
+// and the rest of the IMAP test surface doesn't have to reason
+// about the user/account split.
 func seedAccountID(t *testing.T, st *store.Store, id string) {
 	t.Helper()
+	if _, err := st.DB.Exec(
+		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
+		"user-"+id, "sub-"+id,
+	); err != nil {
+		t.Fatalf("seed user %s: %v", id, err)
+	}
 	const q = `
-INSERT INTO accounts (id, oidc_subject, state, key_envelope, created_at, updated_at)
+INSERT INTO accounts (id, user_id, state, key_envelope, created_at, updated_at)
 VALUES (?, ?, 'active', X'00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-	if _, err := st.DB.Exec(q, id, "sub-"+id); err != nil {
+	if _, err := st.DB.Exec(q, id, "user-"+id); err != nil {
 		t.Fatalf("seed account %s: %v", id, err)
 	}
 }

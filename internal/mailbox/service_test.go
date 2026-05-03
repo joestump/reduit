@@ -49,11 +49,21 @@ func newTestStore(t *testing.T) (*store.Store, string) {
 	return st, accountID
 }
 
+// Per ADR-0010 the accounts table no longer carries oidc_subject;
+// ownership is the user_id FK to users(id). seedAccount mints the
+// owning user inline so each account is a self-contained fixture and
+// the rest of the test doesn't have to reason about the user split.
 func seedAccount(st *store.Store, id string) error {
+	if _, err := st.DB.Exec(
+		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
+		"user-"+id, "sub-"+id,
+	); err != nil {
+		return err
+	}
 	const q = `
-INSERT INTO accounts (id, oidc_subject, state, key_envelope, created_at, updated_at)
+INSERT INTO accounts (id, user_id, state, key_envelope, created_at, updated_at)
 VALUES (?, ?, 'active', X'00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-	_, err := st.DB.Exec(q, id, "sub-"+id)
+	_, err := st.DB.Exec(q, id, "user-"+id)
 	return err
 }
 

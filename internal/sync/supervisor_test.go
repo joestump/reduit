@@ -19,6 +19,7 @@ import (
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/cryptenv"
 	"github.com/joestump/reduit/internal/store"
+	"github.com/joestump/reduit/internal/users"
 )
 
 // TestMain verifies the supervisor's drain semantics via goleak: any
@@ -37,7 +38,12 @@ var migrateMu sync.Mutex
 // newTestAccountService spins up an isolated SQLite + account.Service
 // per test. Accounts are created in StatePendingProtonSetup; tests
 // are responsible for transitioning them to StateActive.
-func newTestAccountService(t *testing.T) account.Service {
+//
+// Per ADR-0010, account.Service.Create takes a UserID rather than an
+// OIDC subject -- the users.Service returned alongside is what tests
+// use to mint the user row first. Most tests should use
+// createTestAccount, which encapsulates the user-then-account pair.
+func newTestAccountService(t *testing.T) (account.Service, users.Service) {
 	t.Helper()
 
 	dbPath := filepath.Join(t.TempDir(), "reduit-test.db")
@@ -58,7 +64,30 @@ func newTestAccountService(t *testing.T) account.Service {
 	if err != nil {
 		t.Fatalf("GenerateMasterKey: %v", err)
 	}
-	return account.New(st, master, nil)
+	return account.New(st, master), users.New(st)
+}
+
+// createTestAccount upserts a users row keyed by the supplied OIDC
+// subject and returns a freshly-created account owned by that user
+// (in StatePendingProtonSetup -- callers transition as needed).
+//
+// Use this for the common "I just need an account in pending state"
+// pattern; tests that need finer control over the user/account split
+// should call the services directly. Repeated calls with the same
+// subject reuse the same user (Upsert is idempotent), so passing
+// distinct subjects per call is the way to get distinct users.
+func createTestAccount(t *testing.T, accSvc account.Service, usrSvc users.Service, sub string) *account.Account {
+	t.Helper()
+	ctx := context.Background()
+	u, err := usrSvc.Upsert(ctx, users.UpsertParams{OIDCSubject: sub})
+	if err != nil {
+		t.Fatalf("createTestAccount: users.Upsert(%q): %v", sub, err)
+	}
+	a, err := accSvc.Create(ctx, account.CreateParams{UserID: u.ID})
+	if err != nil {
+		t.Fatalf("createTestAccount: account.Create(user=%q): %v", u.ID, err)
+	}
+	return a
 }
 
 // fastConfig returns a Config that ticks every millisecond so the
@@ -85,7 +114,7 @@ func fastConfig() Config {
 // within 1 second.
 func TestSupervisorStartsWorkerOnActivation(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
 	sup := New(svc, fastConfig())
@@ -94,10 +123,7 @@ func TestSupervisorStartsWorkerOnActivation(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sup.Stop() })
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-activate"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-activate")
 	if _, err := svc.Transition(ctx, a.ID, account.StateActive); err != nil {
 		t.Fatalf("Transition: %v", err)
 	}
@@ -111,7 +137,7 @@ func TestSupervisorStartsWorkerOnActivation(t *testing.T) {
 // "Worker stops on suspension or deletion" scenario.
 func TestSupervisorStopsWorkerOnDeactivation(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
 	sup := New(svc, fastConfig())
@@ -120,10 +146,7 @@ func TestSupervisorStopsWorkerOnDeactivation(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sup.Stop() })
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-stop"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-stop")
 	if _, err := svc.Transition(ctx, a.ID, account.StateActive); err != nil {
 		t.Fatalf("Transition active: %v", err)
 	}
@@ -146,7 +169,7 @@ func TestSupervisorStopsWorkerOnDeactivation(t *testing.T) {
 // already-running account is a no-op.
 func TestSupervisorIdempotentStart(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
 	sup := New(svc, fastConfig())
@@ -155,10 +178,7 @@ func TestSupervisorIdempotentStart(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sup.Stop() })
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-idem"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-idem")
 	if _, err := svc.Transition(ctx, a.ID, account.StateActive); err != nil {
 		t.Fatalf("Transition: %v", err)
 	}
@@ -182,7 +202,7 @@ func TestSupervisorIdempotentStart(t *testing.T) {
 // drained naturally.
 func TestSupervisorStopGracefulThenHard(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
 	sup := New(svc, fastConfig())
@@ -192,10 +212,7 @@ func TestSupervisorStopGracefulThenHard(t *testing.T) {
 
 	// Spin up a few workers.
 	for _, sub := range []string{"a", "b", "c"} {
-		acc, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-stop-" + sub})
-		if err != nil {
-			t.Fatalf("Create %s: %v", sub, err)
-		}
+		acc := createTestAccount(t, svc, usrSvc, "sub-stop-"+sub)
 		if _, err := svc.Transition(ctx, acc.ID, account.StateActive); err != nil {
 			t.Fatalf("Transition %s: %v", sub, err)
 		}
@@ -231,7 +248,7 @@ func TestSupervisorStopGracefulThenHard(t *testing.T) {
 // blocks until one is released.
 func TestConcurrencyCap(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, _ := newTestAccountService(t)
 	cfg := fastConfig()
 	cfg.ConcurrencyCap = 2 // tighten so we can assert on a small N
 	sup := New(svc, cfg)
@@ -289,7 +306,7 @@ func TestConcurrencyCap(t *testing.T) {
 // acquire returns when its context is canceled.
 func TestAcquireProtonSlotHonorsContextCancel(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, _ := newTestAccountService(t)
 	cfg := fastConfig()
 	cfg.ConcurrencyCap = 1
 	sup := New(svc, cfg)
@@ -322,7 +339,7 @@ func TestAcquireProtonSlotHonorsContextCancel(t *testing.T) {
 // Governing: SPEC-0002 REQ "Panic Isolation".
 func TestSupervisorPanicIsolation(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	sup := New(svc, fastConfig())
 	if err := sup.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -330,10 +347,7 @@ func TestSupervisorPanicIsolation(t *testing.T) {
 	t.Cleanup(func() { _ = sup.Stop() })
 
 	// Spawn a sibling worker the normal way.
-	siblingAcc, err := svc.Create(context.Background(), account.CreateParams{OIDCSubject: "sub-sibling"})
-	if err != nil {
-		t.Fatalf("Create sibling: %v", err)
-	}
+	siblingAcc := createTestAccount(t, svc, usrSvc, "sub-sibling")
 	if _, err := svc.Transition(context.Background(), siblingAcc.ID, account.StateActive); err != nil {
 		t.Fatalf("Transition sibling: %v", err)
 	}
@@ -378,7 +392,7 @@ func TestSupervisorPanicIsolation(t *testing.T) {
 // REAL account service (not a mock) per the issue brief.
 func TestServiceOnTransitionFiresCallback(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
 	type capture struct {
@@ -400,10 +414,7 @@ func TestServiceOnTransitionFiresCallback(t *testing.T) {
 	// cannot leak the subscription past the test.
 	t.Cleanup(unsub)
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-cb"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-cb")
 	if _, err := svc.Transition(ctx, a.ID, account.StateActive); err != nil {
 		t.Fatalf("Transition active: %v", err)
 	}
@@ -459,7 +470,7 @@ func TestServiceOnTransitionFiresCallback(t *testing.T) {
 // Governing: SPEC-0002 REQ "One Worker Per Active Account".
 func TestRapidFlapKeepsWorkerRunning(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
 	sup := New(svc, fastConfig())
@@ -468,10 +479,7 @@ func TestRapidFlapKeepsWorkerRunning(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = sup.Stop() })
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-flap"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-flap")
 
 	// Step 1: get a baseline worker running.
 	sup.OnAccountStateChange(account.StatePendingProtonSetup, account.StateActive, a)
@@ -539,7 +547,7 @@ func TestRapidFlapKeepsWorkerRunning(t *testing.T) {
 // Governing: SPEC-0002 REQ "Panic Isolation".
 func TestSupervisorRecoversInjectedPanic(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	sup := New(svc, fastConfig())
 	if err := sup.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -547,10 +555,7 @@ func TestSupervisorRecoversInjectedPanic(t *testing.T) {
 	t.Cleanup(func() { _ = sup.Stop() })
 
 	// Sibling worker via the normal path.
-	siblingAcc, err := svc.Create(context.Background(), account.CreateParams{OIDCSubject: "sub-sibling-real"})
-	if err != nil {
-		t.Fatalf("Create sibling: %v", err)
-	}
+	siblingAcc := createTestAccount(t, svc, usrSvc, "sub-sibling-real")
 	if _, err := svc.Transition(context.Background(), siblingAcc.ID, account.StateActive); err != nil {
 		t.Fatalf("Transition sibling: %v", err)
 	}

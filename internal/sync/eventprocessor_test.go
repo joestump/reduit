@@ -114,13 +114,10 @@ func nopLogger() *slog.Logger {
 // scope for v0.1 per SPEC-0002 "Out of Scope").
 func TestEventProcessorBootstrapFromLatestOnFirstBoot(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-bootstrap"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-bootstrap")
 
 	fc := &fakeProtonClient{latest: "evt-current"}
 	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger())
@@ -150,13 +147,10 @@ func TestEventProcessorBootstrapFromLatestOnFirstBoot(t *testing.T) {
 // (NOT call GetLatestEventID).
 func TestEventProcessorResumesFromPersistedCursor(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-resume"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-resume")
 	if err := svc.SetSyncState(ctx, a.ID, "evt-persisted", nil); err != nil {
 		t.Fatalf("seed cursor: %v", err)
 	}
@@ -191,13 +185,10 @@ func TestEventProcessorResumesFromPersistedCursor(t *testing.T) {
 // once per batch.
 func TestEventProcessorAdvancesCursorAfterBatch(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-advance"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-advance")
 
 	fc := &fakeProtonClient{latest: "evt-0"}
 	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger())
@@ -247,13 +238,10 @@ func TestEventProcessorAdvancesCursorAfterBatch(t *testing.T) {
 // admin-UI hint.)
 func TestEventProcessorEmptyBatchKeepsCursor(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-empty"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-empty")
 	if err := svc.SetSyncState(ctx, a.ID, "evt-stable", nil); err != nil {
 		t.Fatalf("seed cursor: %v", err)
 	}
@@ -306,13 +294,10 @@ func TestEventProcessorEmptyBatchKeepsCursor(t *testing.T) {
 // where A left off.
 func TestEventProcessorRestartResumesFromPersistedCursor(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-restart"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-restart")
 
 	// Process A: bootstrap, ingest one batch, advance cursor.
 	fcA := &fakeProtonClient{
@@ -363,13 +348,10 @@ func TestEventProcessorRestartResumesFromPersistedCursor(t *testing.T) {
 // Persistence".
 func TestEventProcessorPropagatesGetEventError(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-err"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-err")
 	if err := svc.SetSyncState(ctx, a.ID, "evt-stuck", nil); err != nil {
 		t.Fatalf("seed cursor: %v", err)
 	}
@@ -407,13 +389,10 @@ func TestEventProcessorPropagatesGetEventError(t *testing.T) {
 // "Event Cursor Persistence" scenarios describe.
 func TestWorkerTickInvokesEventProcessor(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-worker-tick"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-worker-tick")
 
 	fc := &fakeProtonClient{
 		latest: "evt-now",
@@ -454,13 +433,10 @@ func TestWorkerTickInvokesEventProcessor(t *testing.T) {
 // shutdown isn't starved by a runaway burst.
 func TestWorkerTickHonoursMaxConsecutiveTicks(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-burst"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-burst")
 
 	var calls int32
 	fc := &fakeProtonClient{
@@ -519,13 +495,10 @@ func TestWorkerTickHonoursMaxConsecutiveTicks(t *testing.T) {
 // tick. Pre-fix the worker spun forever on the dead cursor.
 func TestEventProcessorRecoversFromStaleCursor(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-stale"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-stale")
 	if err := svc.SetSyncState(ctx, a.ID, "evt-too-old", nil); err != nil {
 		t.Fatalf("seed cursor: %v", err)
 	}
@@ -580,13 +553,10 @@ func TestEventProcessorRecoversFromStaleCursor(t *testing.T) {
 // the worker waits for the next ticker fire.
 func TestEventProcessorRejectsEmptyTrailingEventID(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-empty-id"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-empty-id")
 	if err := svc.SetSyncState(ctx, a.ID, "evt-good", nil); err != nil {
 		t.Fatalf("seed cursor: %v", err)
 	}
@@ -630,7 +600,7 @@ func TestEventProcessorRejectsEmptyTrailingEventID(t *testing.T) {
 // fails loudly at boot.
 func TestNewRejectsNilClientFactory(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, _ := newTestAccountService(t)
 
 	defer func() {
 		r := recover()
@@ -657,13 +627,10 @@ func TestNewRejectsNilClientFactory(t *testing.T) {
 // than producing a worker that never syncs.
 func TestWorkerStartReportsBootstrapFailure(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-boot-fail"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-boot-fail")
 
 	wantErr := errors.New("simulated factory failure")
 	cfg := fastConfig()
@@ -710,14 +677,11 @@ func TestWorkerStartReportsBootstrapFailure(t *testing.T) {
 // two acquires can't both be pre-burst because cap=1).
 func TestWorkerTickReleasesSlotBetweenBurstIterations(t *testing.T) {
 	t.Parallel()
-	svc := newTestAccountService(t)
+	svc, usrSvc := newTestAccountService(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	a, err := svc.Create(ctx, account.CreateParams{OIDCSubject: "sub-fairness"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, usrSvc, "sub-fairness")
 
 	// Worker iter pacing: each iteration blocks until the test sends
 	// on `proceed`, so the test deterministically holds the worker

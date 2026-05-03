@@ -23,8 +23,13 @@ import (
 var migrateMu sync.Mutex
 
 // newTestService spins up a fresh on-disk SQLite (under t.TempDir),
-// runs the embedded migrations, and returns a Service plus a cleanup.
-func newTestService(t *testing.T, adminSubs ...string) (Service, *store.Store) {
+// runs the embedded migrations, and returns a Service plus the
+// underlying store (so tests can seed users directly via raw SQL).
+//
+// Per ADR-0010 admin status is no longer an account attribute, so
+// no admin allowlist is wired here -- that's the session layer's
+// concern (computed from OIDC_ADMIN_SUBS at session-bind time).
+func newTestService(t *testing.T) (Service, *store.Store) {
 	t.Helper()
 
 	dbPath := filepath.Join(t.TempDir(), "reduit-test.db")
@@ -45,16 +50,47 @@ func newTestService(t *testing.T, adminSubs ...string) (Service, *store.Store) {
 	if err != nil {
 		t.Fatalf("GenerateMasterKey: %v", err)
 	}
-	svc := New(st, master, adminSubs)
+	svc := New(st, master)
 	return svc, st
 }
 
-func TestCreateAndGetByOIDCSubject(t *testing.T) {
+// seedUser inserts a users row directly via raw SQL (sidestepping
+// internal/users to keep this package's tests self-contained) and
+// returns the user_id callers can pass to Service.Create.
+func seedUser(t *testing.T, st *store.Store, sub string) string {
+	t.Helper()
+	id := "user-" + sub
+	if _, err := st.DB.Exec(
+		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
+		id, sub,
+	); err != nil {
+		t.Fatalf("seedUser(%q): %v", sub, err)
+	}
+	return id
+}
+
+// createTestAccount mints a user keyed by the supplied OIDC subject
+// (via seedUser) and returns a freshly-created account owned by that
+// user. Use this for the common "I just need an account in pending
+// state" pattern; tests that need finer control should call seedUser
+// + svc.Create directly.
+func createTestAccount(t *testing.T, svc Service, st *store.Store, ctx context.Context, sub string) *Account {
+	t.Helper()
+	uid := seedUser(t, st, sub)
+	a, err := svc.Create(ctx, CreateParams{UserID: uid})
+	if err != nil {
+		t.Fatalf("createTestAccount(%q): %v", sub, err)
+	}
+	return a
+}
+
+func TestCreateAndGetByID(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	created, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-joe"})
+	uid := seedUser(t, st, "sub-joe")
+	created, err := svc.Create(ctx, CreateParams{UserID: uid})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -67,76 +103,97 @@ func TestCreateAndGetByOIDCSubject(t *testing.T) {
 	if len(created.KeyEnvelope) == 0 {
 		t.Fatal("KeyEnvelope must be populated at creation")
 	}
-	if created.IsAdmin {
-		t.Error("IsAdmin should default to false when subject not in allowlist")
+	if created.UserID != uid {
+		t.Errorf("UserID = %q, want %q", created.UserID, uid)
 	}
 
-	got, err := svc.GetByOIDCSubject(ctx, "sub-joe")
-	if err != nil {
-		t.Fatalf("GetByOIDCSubject: %v", err)
-	}
-	if got.ID != created.ID {
-		t.Errorf("round-trip ID mismatch: got %q want %q", got.ID, created.ID)
-	}
-
-	gotByID, err := svc.GetByID(ctx, created.ID)
+	got, err := svc.GetByID(ctx, created.ID)
 	if err != nil {
 		t.Fatalf("GetByID: %v", err)
 	}
-	if gotByID.OIDCSubject != "sub-joe" {
-		t.Errorf("GetByID subject = %q, want sub-joe", gotByID.OIDCSubject)
+	if got.ID != created.ID {
+		t.Errorf("GetByID round-trip ID mismatch: got %q want %q", got.ID, created.ID)
+	}
+	if got.UserID != uid {
+		t.Errorf("GetByID UserID = %q, want %q", got.UserID, uid)
 	}
 
-	if _, err := svc.GetByOIDCSubject(ctx, "sub-missing"); !errors.Is(err, ErrAccountNotFound) {
-		t.Errorf("missing subject error = %v, want ErrAccountNotFound", err)
-	}
 	if _, err := svc.GetByID(ctx, "id-missing"); !errors.Is(err, ErrAccountNotFound) {
 		t.Errorf("missing id error = %v, want ErrAccountNotFound", err)
 	}
 }
 
-func TestCreateDuplicateOIDCSubject(t *testing.T) {
+// TestUserCanCreateMultipleAccounts pins ADR-0010's central
+// affordance: one user owns N accounts. Two pending-Proton-setup rows
+// for the same user MUST be accepted (proton_user_id is NULL on both
+// and SQLite treats NULLs as distinct under UNIQUE).
+//
+// Governing: ADR-0010, SPEC-0001 REQ "Account Identity".
+func TestUserCanCreateMultipleAccounts(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	if _, err := svc.Create(ctx, CreateParams{OIDCSubject: "dup"}); err != nil {
+	uid := seedUser(t, st, "sub-multi-acct")
+
+	first, err := svc.Create(ctx, CreateParams{UserID: uid})
+	if err != nil {
 		t.Fatalf("first Create: %v", err)
 	}
-	_, err := svc.Create(ctx, CreateParams{OIDCSubject: "dup"})
-	if !errors.Is(err, ErrAccountAlreadyExists) {
-		t.Fatalf("dup Create error = %v, want ErrAccountAlreadyExists", err)
+	second, err := svc.Create(ctx, CreateParams{UserID: uid})
+	if err != nil {
+		t.Fatalf("second Create: %v", err)
+	}
+	if first.ID == second.ID {
+		t.Fatalf("Create returned the same ID twice: %q", first.ID)
+	}
+
+	got, err := svc.ListByUser(ctx, uid)
+	if err != nil {
+		t.Fatalf("ListByUser: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListByUser len = %d, want 2", len(got))
 	}
 }
 
-func TestIsAdminAllowlist(t *testing.T) {
+// TestCreateRejectsDuplicateProtonAccountForUser pins SPEC-0001's
+// "no duplicate Proton account per user" rule: the UNIQUE
+// (user_id, proton_user_id) constraint surfaces as
+// ErrAccountAlreadyExists at the service layer when a user attempts
+// to relay the same Proton mailbox twice.
+func TestCreateRejectsDuplicateProtonAccountForUser(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t, "sub-admin", "sub-other-admin")
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	admin, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-admin"})
-	if err != nil {
-		t.Fatalf("Create admin: %v", err)
-	}
-	if !admin.IsAdmin {
-		t.Error("admin row.IsAdmin should be true at create time")
-	}
-	if !svc.IsAdmin(admin) {
-		t.Error("Service.IsAdmin should return true for allowlisted subject")
-	}
-	if !admin.AdminBy([]string{"sub-admin"}) {
-		t.Error("Account.AdminBy should match exact subject")
-	}
+	uid := seedUser(t, st, "sub-dup-proton")
 
-	user, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-user"})
-	if err != nil {
-		t.Fatalf("Create user: %v", err)
+	if _, err := svc.Create(ctx, CreateParams{UserID: uid, ProtonUserID: "proton-1"}); err != nil {
+		t.Fatalf("first Create: %v", err)
 	}
-	if user.IsAdmin {
-		t.Error("non-admin row.IsAdmin should be false")
+	_, err := svc.Create(ctx, CreateParams{UserID: uid, ProtonUserID: "proton-1"})
+	if !errors.Is(err, ErrAccountAlreadyExists) {
+		t.Fatalf("dup proton Create error = %v, want ErrAccountAlreadyExists", err)
 	}
-	if svc.IsAdmin(user) {
-		t.Error("Service.IsAdmin should return false for non-allowlisted subject")
+}
+
+// TestDifferentUsersMaySharePollutedProtonID confirms the unique
+// constraint is per-user, not global -- two users may relay the same
+// Proton mailbox from independent accounts (per SPEC-0001).
+func TestDifferentUsersMaySharePollutedProtonID(t *testing.T) {
+	t.Parallel()
+	svc, st := newTestService(t)
+	ctx := context.Background()
+
+	u1 := seedUser(t, st, "sub-share-1")
+	u2 := seedUser(t, st, "sub-share-2")
+
+	if _, err := svc.Create(ctx, CreateParams{UserID: u1, ProtonUserID: "proton-shared"}); err != nil {
+		t.Fatalf("user1 Create: %v", err)
+	}
+	if _, err := svc.Create(ctx, CreateParams{UserID: u2, ProtonUserID: "proton-shared"}); err != nil {
+		t.Fatalf("user2 Create: %v", err)
 	}
 }
 
@@ -177,13 +234,10 @@ func TestTransitionTable(t *testing.T) {
 
 func TestTransitionEnforcement(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-trans"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-trans")
 
 	// Illegal: pending -> suspended.
 	if _, err := svc.Transition(ctx, a.ID, StateSuspended); !errors.Is(err, ErrInvalidTransition) {
@@ -248,13 +302,11 @@ func TestTransitionEnforcement(t *testing.T) {
 
 func TestList(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
 	for _, sub := range []string{"sub-a", "sub-b", "sub-c"} {
-		if _, err := svc.Create(ctx, CreateParams{OIDCSubject: sub}); err != nil {
-			t.Fatalf("Create %s: %v", sub, err)
-		}
+		_ = createTestAccount(t, svc, st, ctx, sub)
 	}
 	got, err := svc.List(ctx)
 	if err != nil {
@@ -267,13 +319,10 @@ func TestList(t *testing.T) {
 
 func TestSealOpenRoundTrip(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-seal"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-seal")
 
 	// Refresh token.
 	rt := []byte("proton-refresh-token-payload-deadbeef")
@@ -339,10 +388,7 @@ func TestSealUsesFreshNoncePerCall(t *testing.T) {
 	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-nonce"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-nonce")
 
 	pt := []byte("identical-plaintext")
 	if err := svc.SealRefreshToken(ctx, a.ID, pt); err != nil {
@@ -371,10 +417,7 @@ func TestRotateIMAPPassword(t *testing.T) {
 	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-rotate"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-rotate")
 
 	// First rotation.
 	pw1, err := svc.RotateIMAPPassword(ctx, a.ID)
@@ -432,13 +475,10 @@ func TestRotateIMAPPassword(t *testing.T) {
 
 func TestOpenWhenSecretAbsent(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-empty"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-empty")
 	if _, err := svc.OpenRefreshToken(ctx, a.ID); !errors.Is(err, ErrSecretNotPresent) {
 		t.Errorf("OpenRefreshToken on empty = %v, want ErrSecretNotPresent", err)
 	}
@@ -453,16 +493,16 @@ func TestOpenWhenSecretAbsent(t *testing.T) {
 	}
 }
 
-func TestCreateRequiresOIDCSubject(t *testing.T) {
+func TestCreateRequiresUserID(t *testing.T) {
 	t.Parallel()
 	svc, _ := newTestService(t)
 	ctx := context.Background()
 	if _, err := svc.Create(ctx, CreateParams{}); err == nil {
-		t.Fatal("Create with empty OIDCSubject should error")
+		t.Fatal("Create with empty UserID should error")
 	}
-	// Whitespace-only subject MUST also be rejected (TrimSpace + empty check).
-	if _, err := svc.Create(ctx, CreateParams{OIDCSubject: "   "}); err == nil {
-		t.Fatal("Create with whitespace-only OIDCSubject should error")
+	// Whitespace-only UserID MUST also be rejected (TrimSpace + empty check).
+	if _, err := svc.Create(ctx, CreateParams{UserID: "   "}); err == nil {
+		t.Fatal("Create with whitespace-only UserID should error")
 	}
 }
 
@@ -483,10 +523,7 @@ func TestSealAADPreventsCrossColumnSubstitution(t *testing.T) {
 	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-aad"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-aad")
 
 	// Seal a distinctive plaintext into the IMAP password column.
 	imapPT := []byte("imap-secret-do-not-leak")
@@ -554,10 +591,7 @@ func TestOpenWithTamperedCiphertext(t *testing.T) {
 	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-tamper"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-tamper")
 	if err := svc.SealRefreshToken(ctx, a.ID, []byte("real-token")); err != nil {
 		t.Fatalf("SealRefreshToken: %v", err)
 	}
@@ -591,10 +625,7 @@ func TestOpenWithWrongMasterKey(t *testing.T) {
 	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-wrong-key"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-wrong-key")
 	if err := svc.SealRefreshToken(ctx, a.ID, []byte("payload")); err != nil {
 		t.Fatalf("SealRefreshToken: %v", err)
 	}
@@ -605,7 +636,7 @@ func TestOpenWithWrongMasterKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateMasterKey: %v", err)
 	}
-	otherSvc := New(st, otherMaster, nil)
+	otherSvc := New(st, otherMaster)
 	if pt, err := otherSvc.OpenRefreshToken(ctx, a.ID); err == nil {
 		t.Fatalf("OpenRefreshToken under wrong master key returned %q; want envelope-open failure", pt)
 	}
@@ -617,13 +648,10 @@ func TestOpenWithWrongMasterKey(t *testing.T) {
 // passwords sharing a 72-byte prefix verify against the same hash.
 func TestSealIMAPPasswordRejectsOversizedInput(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-bcrypt-cap"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-bcrypt-cap")
 
 	oversized := bytes.Repeat([]byte("A"), bcryptMaxPasswordBytes+1)
 	if err := svc.SealIMAPPassword(ctx, a.ID, oversized); !errors.Is(err, ErrIMAPPasswordTooLong) {
@@ -662,13 +690,10 @@ func TestSealIMAPPasswordRejectsOversizedInput(t *testing.T) {
 // Governing: SPEC-0001 REQ "Account Lifecycle States".
 func TestTransitionIsAtomicUnderConcurrency(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-race"})
-	if err != nil {
-		t.Fatalf("Create: %v", err)
-	}
+	a := createTestAccount(t, svc, st, ctx, "sub-race")
 	if _, err := svc.Transition(ctx, a.ID, StateActive); err != nil {
 		t.Fatalf("seed active: %v", err)
 	}
@@ -792,23 +817,21 @@ func TestTransitionIsAtomicUnderConcurrency(t *testing.T) {
 	}
 }
 
-// TestCreateTrimsOIDCSubject confirms whitespace is stripped from the
-// stored subject so it matches the in-memory allowlist regardless of
-// operator paste hygiene.
-func TestCreateTrimsOIDCSubject(t *testing.T) {
+// TestCreateTrimsUserID confirms whitespace is stripped from the
+// supplied UserID so a value pasted with surrounding whitespace
+// resolves to the same row a clean value would.
+func TestCreateTrimsUserID(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t, "sub-paste")
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	a, err := svc.Create(ctx, CreateParams{OIDCSubject: "  sub-paste  "})
+	uid := seedUser(t, st, "sub-paste")
+	a, err := svc.Create(ctx, CreateParams{UserID: "  " + uid + "  "})
 	if err != nil {
-		t.Fatalf("Create: %v", err)
+		t.Fatalf("Create with whitespace-padded UserID: %v", err)
 	}
-	if a.OIDCSubject != "sub-paste" {
-		t.Errorf("OIDCSubject = %q, want trimmed %q", a.OIDCSubject, "sub-paste")
-	}
-	if !svc.IsAdmin(a) {
-		t.Error("IsAdmin should return true after subject is trimmed to match allowlist entry")
+	if a.UserID != uid {
+		t.Errorf("UserID = %q, want trimmed %q", a.UserID, uid)
 	}
 }
 
@@ -821,21 +844,15 @@ func TestCreateTrimsOIDCSubject(t *testing.T) {
 // Governing: SPEC-0003 REQ "SASL PLAIN With user@host Identity".
 func TestPrimaryAlias(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+	svc, st := newTestService(t)
 	ctx := context.Background()
 
 	// New accounts have an empty alias and are not findable.
-	a1, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-alias-1"})
-	if err != nil {
-		t.Fatalf("Create a1: %v", err)
-	}
+	a1 := createTestAccount(t, svc, st, ctx, "sub-alias-1")
 	if a1.PrimaryAlias != "" {
 		t.Errorf("new account PrimaryAlias = %q, want empty", a1.PrimaryAlias)
 	}
-	a2, err := svc.Create(ctx, CreateParams{OIDCSubject: "sub-alias-2"})
-	if err != nil {
-		t.Fatalf("Create a2: %v", err)
-	}
+	a2 := createTestAccount(t, svc, st, ctx, "sub-alias-2")
 	if _, err := svc.GetByPrimaryAlias(ctx, "joe@reduit.example"); !errors.Is(err, ErrAccountNotFound) {
 		t.Errorf("lookup before set = %v, want ErrAccountNotFound", err)
 	}
@@ -895,16 +912,7 @@ func TestPrimaryAlias(t *testing.T) {
 	}
 }
 
-// TestIsAdminRejectsEmptySubject locks in the empty-string defense:
-// even if OIDC_ADMIN_SUBS contains a stray empty entry (e.g. from
-// "OIDC_ADMIN_SUBS=,sub-foo"), an account with an empty subject must
-// not be elevated.
-func TestIsAdminRejectsEmptySubject(t *testing.T) {
-	t.Parallel()
-	svc, _ := newTestService(t, "", "sub-foo")
-
-	empty := &Account{OIDCSubject: ""}
-	if svc.IsAdmin(empty) {
-		t.Error("IsAdmin must reject accounts with empty OIDCSubject even if the allowlist contains \"\"")
-	}
-}
+// (Per ADR-0010 admin status is no longer an account attribute --
+// it's computed from OIDC_ADMIN_SUBS at session-bind time. The
+// equivalent empty-subject defense for the session layer is owned
+// by #61 and tested in internal/auth/session.)
