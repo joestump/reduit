@@ -46,6 +46,18 @@ type ServerConfig struct {
 type TLSConfig struct {
 	CertPath string `mapstructure:"cert_path"`
 	KeyPath  string `mapstructure:"key_path"`
+	// Disabled, when true, makes the HTTP admin/MCP listener serve
+	// plaintext instead of HTTPS. Use only when reduit sits behind a
+	// TLS-terminating reverse proxy (Caddy / Traefik / nginx) on the
+	// same host or trusted network -- the listener still expects
+	// browser sessions and OIDC redirects, so the upstream MUST be
+	// served over TLS to the public.
+	//
+	// IMAPS and SMTPS cannot be reverse-proxied (they're TCP, not
+	// HTTP), so the mail listeners still require real certs. Setting
+	// Disabled while imap_addr or smtp_addr is non-empty is a
+	// configuration error caught at Validate() time.
+	Disabled bool `mapstructure:"disabled"`
 }
 
 // MasterKeyConfig holds the path to the service master key file.
@@ -121,11 +133,21 @@ func (c Config) Validate() error {
 	if c.Server.HTTPAddr == "" && c.Server.IMAPAddr == "" && c.Server.SMTPAddr == "" {
 		errs = append(errs, errors.New("server: at least one of http_addr / imap_addr / smtp_addr must be set"))
 	}
-	if c.TLS.CertPath == "" {
-		errs = append(errs, errors.New("tls.cert_path is required"))
-	}
-	if c.TLS.KeyPath == "" {
-		errs = append(errs, errors.New("tls.key_path is required"))
+	// TLS is required for any listener that handles mail (IMAPS,
+	// SMTPS) -- those are TCP and cannot be reverse-proxied. The HTTP
+	// admin listener can opt out via tls.disabled when reduit sits
+	// behind a TLS-terminating proxy.
+	if c.TLS.Disabled {
+		if c.Server.IMAPAddr != "" || c.Server.SMTPAddr != "" {
+			errs = append(errs, errors.New("tls.disabled: imap_addr and smtp_addr require TLS; leave them empty when running behind a reverse proxy that does not terminate mail TLS"))
+		}
+	} else {
+		if c.TLS.CertPath == "" {
+			errs = append(errs, errors.New("tls.cert_path is required"))
+		}
+		if c.TLS.KeyPath == "" {
+			errs = append(errs, errors.New("tls.key_path is required"))
+		}
 	}
 	if c.MasterKey.Path == "" {
 		errs = append(errs, errors.New("master_key.path is required"))

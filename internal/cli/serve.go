@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -72,25 +73,32 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	}
 	logger.Info("store ready", slog.String("path", st.Path()))
 
-	// TLS loader.
-	loader, err := tlsloader.New(cfg.TLS.CertPath, cfg.TLS.KeyPath, logger)
-	if err != nil {
-		return fmt.Errorf("tls loader: %w", err)
-	}
-	logger.Info("tls cert loaded",
-		slog.String("cert_path", cfg.TLS.CertPath),
-		slog.String("key_path", cfg.TLS.KeyPath))
-
-	// Signal-driven graceful shutdown context.
+	// TLS loader. Skipped entirely when tls.disabled is set -- in that
+	// mode reduit serves plaintext HTTP from the admin/MCP listener
+	// and assumes a TLS-terminating reverse proxy (Caddy/Traefik) sits
+	// in front. Mail listeners (IMAPS/SMTPS) cannot run in this mode;
+	// config.Validate enforces that constraint.
+	var loader *tlsloader.Loader
 	ctx, cancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-
-	// Watcher in a goroutine.
-	go func() {
-		if err := loader.Watch(ctx); err != nil {
-			logger.Error("tls watcher exited", slog.String("error", err.Error()))
+	if cfg.TLS.Disabled {
+		logger.Info("tls disabled; admin/MCP listener will serve plaintext HTTP -- reverse proxy MUST terminate TLS in front")
+	} else {
+		loader, err = tlsloader.New(cfg.TLS.CertPath, cfg.TLS.KeyPath, logger)
+		if err != nil {
+			return fmt.Errorf("tls loader: %w", err)
 		}
-	}()
+		logger.Info("tls cert loaded",
+			slog.String("cert_path", cfg.TLS.CertPath),
+			slog.String("key_path", cfg.TLS.KeyPath))
+
+		// Watcher in a goroutine.
+		go func() {
+			if err := loader.Watch(ctx); err != nil {
+				logger.Error("tls watcher exited", slog.String("error", err.Error()))
+			}
+		}()
+	}
 
 	// Session manager — backed by the same SQLite handle as the rest
 	// of the store. The migration created the `sessions` table; the
@@ -150,10 +158,15 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	defer protonMgr.Close()
 	wizardSessions := server.NewWizardSessionStore(server.DefaultWizardIdleTimeout)
 
-	// HTTP server.
+	// HTTP server. GetCertificate is nil when tls.disabled — server.New
+	// detects that and skips ListenAndServeTLS in favor of plain HTTP.
+	var getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+	if loader != nil {
+		getCert = loader.GetCertificate
+	}
 	srv := server.New(cfg.Server.HTTPAddr, server.Deps{
 		Store:          st,
-		GetCertificate: loader.GetCertificate,
+		GetCertificate: getCert,
 		Logger:         logger,
 		Version:        Version,
 		SessionManager: scsMgr,
