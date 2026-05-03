@@ -1,14 +1,29 @@
 # ADR-0006: SQLite as the persistent store
 
-- **Status:** accepted
+- **Status:** accepted (refined by ADR-0010, 2026-05-03)
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
+
+> **Refined by [ADR-0010](ADR-0010-multi-account-per-user.md) (2026-05-03).**
+> The schema sketch in this ADR's Architecture Diagram predates the
+> users/accounts split. The `accounts` entity in the diagram below
+> shows `oidc_subject UK` and `bool is_admin` columns that the
+> rewritten migrations no longer carry; OIDC subject now lives on a
+> new `users` table and admin status is a session-bind-time computed
+> attribute, never persisted. The diagram in this ADR has been
+> updated in place to reflect the post-ADR-0010 shape; the
+> Decision Outcome (SQLite + WAL + goose, single file, app-layer
+> envelope encryption) is unchanged. See ADR-0010 and SPEC-0001 for
+> the canonical schema contract.
 
 ## Context and Problem Statement
 
 Reduit needs a persistent store for:
 
-- Account records (OIDC subject, Proton user ID, encrypted secrets).
+- User records (OIDC subject) and account records (Proton user ID,
+  encrypted secrets, FK to users). *(ADR-0010 split — original
+  bullet read "Account records (OIDC subject, Proton user ID,
+  encrypted secrets)".)*
 - IMAP UID assignments and UIDVALIDITY values per (account, mailbox).
 - Local message cache metadata (Proton message ID ↔ IMAP UID, flags,
   labels, sizes).
@@ -124,6 +139,7 @@ small team (≤50 accounts).
 
 ```mermaid
 erDiagram
+    users ||--o{ accounts : "owns"
     accounts ||--|{ mailboxes : "owns"
     accounts ||--|{ sync_state : "has"
     accounts ||--o{ sessions : "has"
@@ -131,11 +147,20 @@ erDiagram
     mailboxes ||--|{ messages : "contains"
     mailboxes ||--|{ uid_assignments : "stable UIDs"
 
-    accounts {
+    users {
         text id PK
         text oidc_subject UK
+        text email
+        text display_name
+        timestamp created_at
+        timestamp last_login_at
+    }
+    accounts {
+        text id PK
+        text user_id FK
+        text proton_user_id
+        text email
         text state
-        bool is_admin
         blob key_envelope
         blob refresh_token_ct
         blob mailbox_pass_ct
@@ -160,15 +185,25 @@ erDiagram
 ```
 
 One SQLite file. WAL mode for concurrent readers. `goose` drives
-migrations. Every per-account table carries `account_id` so isolation
-is a `WHERE` clause away. Sensitive columns are envelope-encrypted
-per ADR-0003 before insert.
+migrations. The `users` table is the OIDC-sourced identity root
+(per ADR-0010); `accounts.user_id` is the FK that scopes the 1:N
+ownership relation. Every per-account table carries `account_id` so
+isolation is a `WHERE` clause away; per-user lookups go through
+`accounts.user_id` either directly or transitively. The
+`(user_id, proton_user_id)` UNIQUE on `accounts` enforces "a user
+MUST NOT add the same Proton account twice" (per SPEC-0001). Admin
+status is NOT a column — it is computed at session-bind time from
+`OIDC_ADMIN_SUBS` (per SPEC-0001 "Admin Status"). Sensitive columns
+are envelope-encrypted per ADR-0003 before insert.
 
 ## References
 
 - ADR-0002 (multi-tenant) — every table carries `account_id`.
 - ADR-0003 (encryption-at-rest) — sensitive columns encrypted before
   insert.
+- ADR-0010 (multi-Proton-account per user) — refines the schema in
+  this ADR: introduces the `users` table and the `accounts.user_id`
+  FK; drops `oidc_subject` and `is_admin` from `accounts`.
 - SPEC-0001 (Account model) — concrete schema.
 - [`pressly/goose`](https://github.com/pressly/goose)
 - [`jmoiron/sqlx`](https://github.com/jmoiron/sqlx)
