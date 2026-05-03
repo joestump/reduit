@@ -2,22 +2,37 @@
 
 ## Architecture
 
-The account model is the top of the multi-tenant data hierarchy.
-Every other piece of state in Reduit (mailbox UID maps, sync cursors,
-sessions, MCP tokens, message metadata) hangs off an `account_id`
-foreign key.
+The account model has two top-level entities — `users` (sourced from
+OIDC) and `accounts` (sourced from Proton, FK to users 1:N) — and a
+single derived attribute (admin status, computed at session-bind time
+from the OIDC subjects allowlist; never persisted).
+
+Every per-account piece of state in Reduit (mailbox UID maps, sync
+cursors, sessions, MCP tokens, message metadata) hangs off an
+`account_id` foreign key. Every per-user lookup uses `users(id)`
+either directly (e.g., session lookup) or transitively via
+`accounts.user_id`.
 
 ```mermaid
 erDiagram
+    users ||--o{ accounts : "owns"
     accounts ||--|{ mailboxes : "owns"
     accounts ||--|{ sync_state : "has"
     accounts ||--o{ sessions : "has"
     accounts ||--o{ mcp_tokens : "issues"
     mailboxes ||--|{ messages : "contains"
     mailboxes ||--|{ uid_assignments : "assigns"
+    users {
+        text id PK
+        text oidc_subject UK
+        text email
+        text display_name
+        timestamp created_at
+        timestamp last_login_at
+    }
     accounts {
         text id PK
-        text owner_oidc_sub
+        text user_id FK
         text proton_user_id
         text email
         text state
@@ -32,20 +47,25 @@ erDiagram
     }
 ```
 
-`owner_oidc_sub` is `NOT NULL`. Uniqueness is on the composite
-`(owner_oidc_sub, proton_user_id)` — a given user MUST NOT add the
-same Proton account twice, but two distinct users MAY in principle
-each have a row referencing the same `proton_user_id` (access
-control lives at the per-account relay credentials and MCP tokens).
-There is no longer a uniqueness constraint on `oidc_subject` alone;
-that column has been replaced by `owner_oidc_sub` per ADR-0010. An
-index on `owner_oidc_sub` SHOULD exist for the hot "list my
-accounts" path.
+`users.oidc_subject` is `UNIQUE NOT NULL`. `accounts.user_id` is
+`NOT NULL` and references `users(id)` with `ON DELETE CASCADE`. The
+account-level uniqueness constraint is `(user_id, proton_user_id)` —
+a given user MUST NOT add the same Proton account twice, but two
+distinct users MAY in principle each have a row referencing the same
+`proton_user_id` (access control lives at the per-account relay
+credentials and MCP tokens). An index on `accounts(user_id)` is
+created for the hot "list my accounts" path.
 
-Admin status is no longer materialized as an `is_admin` column.
-It is computed at request time by checking
-`Principal.Subject ∈ OIDC_ADMIN_SUBS`. The schema-migration
-follow-up drops the column.
+Admin status is **not** a column. It is computed at session-bind
+time by checking `Principal.Subject ∈ OIDC_ADMIN_SUBS` and stored
+on the in-memory session record. The allowlist is read from env at
+startup; any future hot-reload path re-derives the contract at that
+time.
+
+The `accounts` table never carried an `oidc_subject` or `is_admin`
+column in the rewritten migrations — those columns are removed
+greenfield, not dropped via ALTER, because the project has not
+shipped (per ADR-0010 migration approach).
 
 ## Key data structures
 
@@ -114,12 +134,13 @@ the algorithm and key generation; the migration command lands in v0.5.
 
 - **Audit trail granularity**: state transitions are logged but not
   retained as queryable rows. v0.5 may add an `audit_events` table.
-- **Normalized `users` table**: deferred per ADR-0010. The current
-  shape (single `owner_oidc_sub` column on `accounts`) suffices at
-  ≤50-account scale. If user-level attributes ever accumulate
-  (preferences, secondary-OIDC linking, display name overrides),
-  backfill from `DISTINCT owner_oidc_sub` and add the FK as a
-  non-breaking forward migration.
+- **Multi-OIDC-subject linking**: orthogonal feature deferred. The
+  `users` table is a precondition; the linking semantics (primary vs.
+  secondary, IdP trust model, identity-merge UX) are out of scope for
+  this ADR.
+- **User-row removal UX**: v0.1 has no admin UI for deleting users;
+  it is an operator-tool action. The `ON DELETE CASCADE` from `users`
+  to `accounts` is the safety primitive when it does happen.
 
 ## References
 

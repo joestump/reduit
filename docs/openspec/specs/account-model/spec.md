@@ -2,31 +2,81 @@
 
 ## Overview
 
-Reduit distinguishes two concepts:
+Reduit distinguishes two persisted entities and one derived attribute:
 
-- A **user** is an OIDC-authenticated human, identified by the OIDC
-  `sub` claim. A user is not a row in any table; the OIDC subject is
-  the user identity, surfaced in-process as `Principal.Subject`.
+- A **user** is a row in the `users` table sourced from OIDC. The
+  `oidc_subject` column on `users` is `UNIQUE NOT NULL` and carries
+  the OIDC `sub` claim of the authenticated human. Optional attributes
+  (`email`, `display_name`) MAY be carried from the ID token's claims.
+  A user MAY own zero or more accounts.
 - An **account** is the unit of multi-tenancy: one Proton mailbox
   configuration (refresh token, mailbox passphrase, key envelope) plus
   the per-account relay credentials (IMAP/SMTP password) used by
-  email clients. Every account row is owned by exactly one user
-  (`owner_oidc_sub`); a user MAY own zero or more accounts.
+  email clients. Every account row is owned by exactly one user via a
+  `user_id` foreign key.
+- **Admin status** is a derived, computed attribute, not a column on
+  either table. At session-bind time the system checks whether the
+  authenticated `Principal.Subject` appears in the configured
+  `OIDC_ADMIN_SUBS` allowlist and tags the session accordingly.
 
-All account state is persisted in SQLite per ADR-0006; sensitive
+All persisted state is in SQLite per ADR-0006; sensitive account
 fields are envelope-encrypted per ADR-0003.
 
-Governing: ADR-0002 (multi-tenant), ADR-0003 (encryption), ADR-0004
-(OIDC), ADR-0006 (SQLite), ADR-0010 (multi-Proton-account per user).
+Governing: ADR-0002 (multi-tenant; "tenant" now means user),
+ADR-0003 (encryption), ADR-0004 (OIDC), ADR-0006 (SQLite),
+ADR-0010 (multi-Proton-account per user).
 
 ## Requirements
 
+### Requirement: User Identity
+
+Every authenticated human MUST be represented by exactly one row in
+the `users` table. The row is keyed by an internal UUIDv7 `id` and
+carries a `UNIQUE NOT NULL` `oidc_subject` column matching the OIDC
+`sub` claim. The user row is the canonical home for "who is the
+human"; `Principal.Subject` from the request context resolves to
+exactly one user row via this column.
+
+#### Scenario: User row created on first successful OIDC login
+
+- **WHEN** an OIDC login succeeds and no `users` row exists for the
+  authenticating `Principal.Subject`
+- **THEN** the system SHALL insert a new `users` row with a fresh
+  UUIDv7 `id`, `oidc_subject = Principal.Subject`, `created_at = now()`,
+  `last_login_at = now()`, and any optional ID-token claims
+  (`email`, `display_name`) the system chooses to mirror
+
+#### Scenario: Subsequent logins update last_login_at
+
+- **WHEN** an OIDC login succeeds and a `users` row already exists for
+  `Principal.Subject`
+- **THEN** the system SHALL update `last_login_at = now()` on the
+  existing row and bind the session to the existing `user_id`. No new
+  row SHALL be created
+
+#### Scenario: oidc_subject is unique
+
+- **WHEN** any code path attempts to insert a `users` row whose
+  `oidc_subject` matches an existing row
+- **THEN** the database SHALL reject the insert via the `UNIQUE`
+  constraint on `users(oidc_subject)`. The application SHALL never
+  rely on a second row to carry the same OIDC subject
+
+#### Scenario: User row exists with zero accounts
+
+- **WHEN** a user has authenticated but has not yet completed the
+  add-Proton-account wizard
+- **THEN** the `users` row SHALL exist with no corresponding rows in
+  `accounts`. This is a first-class, supported state. Any read query
+  that joins `users` to `accounts` SHALL use a LEFT JOIN where it
+  matters
+
 ### Requirement: Account Identity
 
-Every account MUST have a stable internal identifier. Account records
-MUST also store the Proton user ID once Proton login completes; that
-identifier disambiguates which Proton mailbox the account row
-represents.
+Every account MUST have a stable internal identifier and MUST be
+owned by exactly one user. Account records MUST also store the Proton
+user ID once Proton login completes; that identifier disambiguates
+which Proton mailbox the account row represents.
 
 #### Scenario: Account creation generates a stable ID
 
@@ -34,35 +84,30 @@ represents.
 - **THEN** the system SHALL assign a UUIDv7 (or similar
   monotonically-sortable ID) and persist it as the primary key
 
+#### Scenario: Account row carries a user_id foreign key
+
+- **WHEN** an account row is created
+- **THEN** the row MUST carry a `user_id` column referencing
+  `users(id)` with `ON DELETE CASCADE`. The column MUST be `NOT NULL`.
+  No code path SHALL create an `accounts` row without a resolved
+  `user_id`
+
 #### Scenario: Proton user ID recorded on first successful login
 
 - **WHEN** an account completes the Proton login flow for the first
   time
-- **THEN** the system SHALL persist the Proton user ID (`proton_user_id`)
-  on the account row. Subsequent logins for the same account MUST
-  observe the same Proton user ID; a mismatch SHALL be treated as an
-  error and SHALL NOT silently overwrite the stored value
-
-### Requirement: Account Ownership by OIDC Subject
-
-Every account row MUST carry an `owner_oidc_sub` column recording the
-OIDC subject of the user who created the account. Ownership MUST be
-immutable for the lifetime of the account row; reassignment is out of
-scope.
-
-#### Scenario: Account creation records the creator's OIDC subject
-
-- **WHEN** an authenticated user (OIDC `sub` = S) creates a new
-  account
-- **THEN** the system SHALL persist `owner_oidc_sub = S` on the new
-  row. The column MUST be `NOT NULL`
+- **THEN** the system SHALL persist the Proton user ID
+  (`proton_user_id`) on the account row. Subsequent logins for the
+  same account MUST observe the same Proton user ID; a mismatch SHALL
+  be treated as an error and SHALL NOT silently overwrite the stored
+  value
 
 #### Scenario: A user MAY own multiple accounts
 
 - **WHEN** an authenticated user with one or more existing accounts
   initiates the add-account flow
 - **THEN** the system SHALL permit creation of an additional account
-  row owned by the same OIDC subject. The system MUST NOT reject the
+  row owned by the same `user_id`. The system MUST NOT reject the
   creation on the grounds that the user already owns an account
 
 #### Scenario: A user MUST NOT add the same Proton account twice
@@ -70,49 +115,77 @@ scope.
 - **WHEN** an authenticated user attempts to create a second account
   whose `proton_user_id` matches an account they already own
 - **THEN** the database SHALL reject the insert with a uniqueness
-  constraint violation on `(owner_oidc_sub, proton_user_id)`. The
-  application layer SHALL surface this as a friendly "you already
-  added that Proton account" error, not a 500
+  constraint violation on `(user_id, proton_user_id)`. The application
+  layer SHALL surface this as a friendly "you already added that
+  Proton account" error, not a 500
 
 #### Scenario: Two distinct users MAY in principle reference the same Proton mailbox
 
-- **WHEN** two distinct OIDC subjects each create an account for the
-  same `proton_user_id`
+- **WHEN** two distinct users each create an account for the same
+  `proton_user_id`
 - **THEN** the database SHALL accept both rows. Access control at the
   relay (IMAP/SMTP credentials, MCP tokens) is per-account and
   remains the only authority on who can act on a given mailbox
 
 #### Scenario: Ownership is immutable
 
-- **WHEN** any code path attempts to update `owner_oidc_sub` on an
-  existing account row
+- **WHEN** any code path attempts to update `user_id` on an existing
+  account row
 - **THEN** the storage layer SHOULD reject the update (e.g., via a
   trigger or by virtue of no migration touching the column). At
-  minimum, no application code path SHALL issue such an update
+  minimum, no application code path SHALL issue such an update.
+  Reassignment of an account from one user to another is out of scope
 
-### Requirement: User Identity Exists Without an Account
+### Requirement: Admin Status
 
-Successful OIDC login MUST establish the user identity for the
-session regardless of whether the user owns any accounts. Account
-creation MUST be a separate, deliberate action.
+Admin status is a property of the **user**, computed at request
+time from the OIDC subjects allowlist (`OIDC_ADMIN_SUBS`). It MUST
+NOT be persisted as a column on `users` or `accounts`. The allowlist
+is the single source of truth.
 
-#### Scenario: First-time login does not create an account
+#### Scenario: Admin status is sourced from the OIDC subjects allowlist
 
-- **WHEN** a user logs in via OIDC for the first time and the
-  configured policy permits the login (allowlist or
-  `OIDC_AUTO_CREATE`-equivalent gate)
-- **THEN** the system SHALL establish a session bound to the OIDC
-  `sub` claim. The system MUST NOT create an `accounts` row as a
-  side effect of login
+- **WHEN** an authenticated session is bound (i.e., immediately after
+  successful OIDC login or successful session lookup)
+- **THEN** the system SHALL set the session's admin tag to `true` if
+  and only if the authenticated `Principal.Subject` appears in the
+  configured `OIDC_ADMIN_SUBS` allowlist (env var, comma-separated).
+  The check is performed against the user identity, never against any
+  per-account row
 
-#### Scenario: Authenticated user with zero accounts is allowed
+#### Scenario: Admin status is cached for the session lifetime
 
-- **WHEN** an authenticated request arrives from a user who owns
-  zero accounts
-- **THEN** the system SHALL accept the session as valid. Routes
-  that require an account in scope SHALL either redirect the user
-  to the add-account wizard or surface an explicit "no accounts
-  yet" state per SPEC-0005
+- **WHEN** a session has been bound with an admin tag
+- **THEN** subsequent requests within the same session MAY rely on
+  the cached tag without re-querying the allowlist on every request.
+  The allowlist is read from the process environment at startup and
+  is treated as static for the process lifetime; if hot-reload
+  becomes a requirement later, the contract SHALL be re-derived from
+  the allowlist at that time
+
+#### Scenario: No admin column exists on either users or accounts
+
+- **WHEN** any code path persists a user row or an account row
+- **THEN** the row SHALL NOT carry an `is_admin` column. Any code
+  attempting to read `is_admin` from either table SHALL fail at
+  compile / lint time
+
+#### Scenario: Non-admin cannot perform admin actions
+
+- **WHEN** a non-admin user attempts to suspend, delete, or list an
+  account they do not own
+- **THEN** the system SHALL respond with HTTP 403 Forbidden and SHALL
+  NOT mutate state
+
+#### Scenario: User MAY act on accounts they own without being admin
+
+- **WHEN** an authenticated, non-admin user initiates a management
+  action (rotate credentials, configure MCP token, view dashboard)
+  scoped to an account whose `user_id` equals their session's
+  `user_id`
+- **THEN** the system SHALL permit the action subject to the
+  per-action scenarios defined elsewhere in this spec and in
+  SPEC-0005
 
 ### Requirement: Per-Account Data Key
 
@@ -172,8 +245,8 @@ Every account MUST have a `state` field whose value is one of:
 
 #### Scenario: New account starts in pending_proton_setup
 
-- **WHEN** an account is created via OIDC login but Proton has not
-  yet been configured
+- **WHEN** an account is created via the add-account wizard but Proton
+  has not yet been configured
 - **THEN** the account state SHALL be `pending_proton_setup`
 
 #### Scenario: Successful Proton login transitions to active
@@ -198,38 +271,26 @@ Every account MUST have a `state` field whose value is one of:
   authentication. The row and ciphertexts MUST NOT be hard-deleted
   for the configured retention period (default 30 days)
 
-### Requirement: Admin Status
+### Requirement: User Lifecycle
 
-Admin status is a property of the **user** (OIDC subject), not of
-any one account row. Admin users MAY manage all accounts (create,
-suspend, delete) regardless of ownership and access system diagnostic
-routes.
+User rows have their own lifecycle, distinct from account lifecycle.
+A user row MAY be removed; removal SHALL cascade to that user's
+accounts via the `user_id` FK `ON DELETE CASCADE`.
 
-#### Scenario: Admin status is sourced from the OIDC subjects allowlist
+#### Scenario: User removal cascades to accounts
 
-- **WHEN** an authenticated request is dispatched
-- **THEN** the system SHALL treat the user as an admin if and only
-  if the request's OIDC subject (`Principal.Subject`) appears in
-  the configured admin-subjects allowlist (env: `OIDC_ADMIN_SUBS`,
-  comma-separated). The check is performed against the user
-  identity, not against any per-account row
+- **WHEN** a `users` row is deleted (operator action; no UI surface
+  in v0.1)
+- **THEN** all `accounts` rows whose `user_id` matches SHALL be
+  deleted by the FK cascade. Per-account state in dependent tables
+  SHALL further cascade per the `account_id` FK on those tables
 
-#### Scenario: Non-admin cannot perform admin actions
+#### Scenario: User row persists across logout
 
-- **WHEN** a non-admin user attempts to suspend, delete, or list
-  an account they do not own
-- **THEN** the system SHALL respond with HTTP 403 Forbidden and SHALL
-  NOT mutate state
-
-#### Scenario: User MAY act on accounts they own without being admin
-
-- **WHEN** an authenticated, non-admin user initiates a management
-  action (rotate credentials, configure MCP token, view dashboard)
-  scoped to an account where `owner_oidc_sub` equals their OIDC
-  subject
-- **THEN** the system SHALL permit the action subject to the
-  per-action scenarios defined elsewhere in this spec and in
-  SPEC-0005
+- **WHEN** a user logs out (session destroyed)
+- **THEN** the `users` row SHALL persist. Logout invalidates the
+  session, not the user identity. Re-authentication binds a new
+  session to the same `user_id`
 
 ### Requirement: Account-Scoped Data
 
@@ -243,7 +304,8 @@ queries against these tables MUST filter by `account_id`.
 - **WHEN** a per-account table is created
 - **THEN** its schema MUST include `account_id` with a foreign key
   reference to `accounts(id)` and `ON DELETE CASCADE` (cascade fires
-  only when the account is hard-deleted after the retention period)
+  when the account is hard-deleted after the retention period, or
+  when its owning user is deleted)
 
 #### Scenario: Application code never queries without account scope
 
@@ -263,11 +325,18 @@ retention period MUST be hard-deleted by a periodic sweep job.
   accounts with `deleted_at < now() - retention_period`
 - **THEN** the system SHALL delete those rows, which SHALL cascade to
   all per-account tables, and SHALL log the deletion at INFO level
-  with the account ID and OIDC subject (no other PII)
+  with the account ID and the owning user's `oidc_subject` (no other
+  PII)
 
 ## Out of Scope
 
 - OIDC group/role-based access control beyond the simple admin
   allowlist (deferred).
+- Multi-OIDC-subject linking (one user attaching multiple OIDC
+  identities) — orthogonal; the `users` table is a precondition,
+  but the linking semantics are not specified here.
 - Multi-instance / clustered deployment (single-host only for v1).
 - Account export / migration to another Reduit instance (deferred).
+- A user-management admin UI surface beyond the implicit "user is
+  created on first login" path — admin-driven user removal is an
+  operator-tool action in v0.1.
