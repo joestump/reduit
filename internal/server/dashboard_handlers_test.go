@@ -197,10 +197,3 @@ func TestDashboard_AdminSeesAllAccountsGroupedByOwner(t *testing.T) {
 		t.Errorf("admin subtitle wrong; body excerpt=%s", body[:min(len(body), 800)])
 	}
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

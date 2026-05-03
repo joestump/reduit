@@ -5,14 +5,26 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.Title}} — Reduit</title>
 <!--
-  v1 ships Tailwind via CDN play-mode. The proper build pipeline
-  (Tailwind 4 + DaisyUI 5 with PurgeCSS) lands when the asset
-  pipeline ADR is filed (tracked separately). Acceptable for the
-  pre-alpha MVP; the visible identity matches the mockups in
-  docs/mockups/spec-0005/.
+  v1 ships Tailwind 4 (browser-build mode) + DaisyUI 5 from a
+  versioned CDN with SRI integrity hashes. The proper build pipeline
+  (Tailwind compile-time PurgeCSS) lands when the asset-pipeline ADR
+  is filed (tracked separately). Acceptable for the pre-alpha MVP;
+  the visible identity matches the mockups in docs/mockups/spec-0005/.
+
+  Versions are pinned (Tailwind 4.2.4, DaisyUI 5.0.0) and the
+  integrity hashes are computed against the exact bytes those URLs
+  return, so a CDN compromise that swaps the file would be rejected
+  by the browser. Bumping versions REQUIRES recomputing the hash:
+
+    curl -sLf <url> | openssl dgst -sha384 -binary | openssl base64 -A
 -->
-<script src="https://cdn.tailwindcss.com"></script>
-<link href="https://cdn.jsdelivr.net/npm/daisyui@5.0.0/dist/full.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4"
+        integrity="sha384-yNSZBFvuOWcmww494a9+1zNuvgUGEXoWkein7cxP8wHUTi3iXCU4vJ7hr3tzBCml"
+        crossorigin="anonymous"></script>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@5.0.0/daisyui.min.css"
+      integrity="sha384-Ne25/KSd+//Kv4vLZMuZMKWVB4jxY83OCZAuPyyVrocKy+SDhJYefHuKJ92YkLux"
+      crossorigin="anonymous"
+      rel="stylesheet">
 <link rel="stylesheet" href="https://rsms.me/inter/inter.css">
 <style>
   :root { font-family: 'Inter', system-ui, sans-serif; }

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"unicode"
 
 	"github.com/joestump/reduit/internal/auth/session"
 )
@@ -69,16 +70,18 @@ func newIdentityView(id session.Identity) identityView {
 	}
 }
 
-// initialsFor returns at most two uppercase initials suitable for an
-// avatar disc. Falls back to "?" for an empty input rather than
-// rendering an empty disc.
+// initialsFor returns at most two initials suitable for an avatar
+// disc, with the first uppercased. Iterates RUNES rather than bytes
+// so non-ASCII names ("Söphia", "Łukasz", "名前") survive intact --
+// byte-indexing would emit a malformed leading byte for any
+// multi-byte UTF-8 codepoint. Falls back to "?" for empty input.
 func initialsFor(s string) string {
 	if s == "" {
 		return "?"
 	}
 	// Strip after @ so an email "joe@stump.rocks" becomes "joe".
-	for i := 0; i < len(s); i++ {
-		if s[i] == '@' {
+	for i, r := range s {
+		if r == '@' {
 			s = s[:i]
 			break
 		}
@@ -86,27 +89,23 @@ func initialsFor(s string) string {
 	if s == "" {
 		return "?"
 	}
-	out := []byte{}
-	upper := func(b byte) byte {
-		if b >= 'a' && b <= 'z' {
-			return b - 32
-		}
-		return b
-	}
-	out = append(out, upper(s[0]))
-	for i := 1; i < len(s) && len(out) < 2; i++ {
-		c := s[i]
-		// Take the byte after a separator as the second initial.
-		if c == '.' || c == '_' || c == '-' || c == ' ' {
-			if i+1 < len(s) {
-				out = append(out, upper(s[i+1]))
-				break
+	runes := []rune(s)
+	out := []rune{unicode.ToUpper(runes[0])}
+	// Look for a separator and take the next rune as the second
+	// initial, uppercased -- this picks up "Joe Stump" -> "JS",
+	// "joe.stump" -> "JS", "joe_stump" -> "JS", "joe-stump" -> "JS".
+	for i := 1; i < len(runes) && len(out) < 2; i++ {
+		switch runes[i] {
+		case '.', '_', '-', ' ':
+			if i+1 < len(runes) {
+				out = append(out, unicode.ToUpper(runes[i+1]))
 			}
 		}
 	}
-	if len(out) == 1 && len(s) > 1 {
-		// No separator -> use the next letter, lower-case.
-		out = append(out, s[1])
+	// No separator found -- fall back to the second rune lowercased
+	// so "Sophia" -> "So", "名前" -> "名前" (already 2 runes).
+	if len(out) == 1 && len(runes) > 1 {
+		out = append(out, runes[1])
 	}
 	return string(out)
 }
