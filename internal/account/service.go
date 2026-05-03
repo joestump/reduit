@@ -134,6 +134,19 @@ type Service interface {
 	// Governing: SPEC-0003 REQ "SASL PLAIN With user@host Identity".
 	SetPrimaryAlias(ctx context.Context, accountID, alias string) error
 
+	// SetProtonIdentity stamps the persistent Proton account
+	// identifier and login email onto an existing account row. Called
+	// once by the add-account wizard after the SRP login completes;
+	// the row is created with these columns NULL because ADR-0010
+	// pushes Proton identity discovery into the wizard flow rather
+	// than the OIDC callback. Returns ErrAccountAlreadyExists when
+	// the same Proton user is already bound to a different row owned
+	// by the same Reduit user (the unique index on (user_id,
+	// proton_user_id) enforces this).
+	//
+	// Governing: ADR-0010, SPEC-0005 REQ "Add-Proton-Account Wizard".
+	SetProtonIdentity(ctx context.Context, accountID, protonUserID, email string) error
+
 	// GetSyncState returns the persisted Proton event cursor for the
 	// account, or ErrNoSyncState if no successful sync has ever
 	// committed. The sync worker calls this on startup to decide
@@ -320,6 +333,22 @@ func (s *service) GetByPrimaryAlias(ctx context.Context, alias string) (*Account
 		return nil, err
 	}
 	return row.toAccount(), nil
+}
+
+// SetProtonIdentity implements Service.SetProtonIdentity. Empty
+// protonUserID is treated as a programmer error (the wizard always
+// has a value at the call site); empty email is permitted because
+// some Proton accounts use a non-email login name.
+func (s *service) SetProtonIdentity(ctx context.Context, accountID, protonUserID, email string) error {
+	protonUserID = strings.TrimSpace(protonUserID)
+	if protonUserID == "" {
+		return errors.New("account: empty protonUserID")
+	}
+	var emailNS sql.NullString
+	if email = strings.TrimSpace(email); email != "" {
+		emailNS = sql.NullString{String: email, Valid: true}
+	}
+	return s.repo.setProtonIdentity(ctx, accountID, sql.NullString{String: protonUserID, Valid: true}, emailNS, s.now().UTC())
 }
 
 // SetPrimaryAlias implements Service.SetPrimaryAlias.

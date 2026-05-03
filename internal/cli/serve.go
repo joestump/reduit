@@ -16,6 +16,7 @@ import (
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	authsession "github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/cryptenv"
+	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/server"
 	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/tlsloader"
@@ -138,6 +139,17 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	usersService := users.New(st)
 	accountService := account.New(st, masterKey)
 
+	// Proton client manager + wizard session store (#24). The manager
+	// is process-scoped (one resty client, many minted Clients); the
+	// wizard store keeps in-memory partial-credentials state with a
+	// 30-min idle TTL. Both are nil-safe in NewForTest fixtures that
+	// don't exercise /accounts/setup.
+	//
+	// Governing: ADR-0001, SPEC-0005 REQ "Add-Proton-Account Wizard".
+	protonMgr := proton.NewManager(proton.WithLogger(logger))
+	defer protonMgr.Close()
+	wizardSessions := server.NewWizardSessionStore(server.DefaultWizardIdleTimeout)
+
 	// HTTP server.
 	srv := server.New(cfg.Server.HTTPAddr, server.Deps{
 		Store:          st,
@@ -149,6 +161,8 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		PreSessions:    preSessions,
 		UsersService:   usersService,
 		AccountService: accountService,
+		ProtonManager:  protonMgr,
+		WizardSessions: wizardSessions,
 		AdminSubjects:  cfg.OIDC.AdminSubjects,
 	})
 

@@ -157,9 +157,10 @@ func (m *Manager) WithAccount(ctx context.Context, snap AccountSnapshot) (Client
 }
 
 // NewClientWithLogin runs the SRP login flow against Proton and returns
-// a Client carrying the new session, the AuthInfo result that drove
-// the SRP exchange (callers may inspect TwoFA to decide whether to
-// continue with AuthTOTP / AuthFIDO2), plus a non-nil error on failure.
+// a Client carrying the new session, the post-Auth bundle (UID, access
+// token, refresh token, the persistent Proton user ID, and the 2FA
+// configuration so callers can branch on TwoFA.Enabled), plus a non-
+// nil error on failure.
 //
 // On success, the registered RefreshTokenCallback is invoked once with
 // the initial refresh token so the account service can persist it
@@ -168,20 +169,17 @@ func (m *Manager) WithAccount(ctx context.Context, snap AccountSnapshot) (Client
 // non-nil error returned) so the caller cannot mistakenly believe a
 // session exists for which Reduit has no on-disk record.
 //
+// Callers that have NOT registered a Manager-level callback (the
+// wizard does not, because the callback is shape-locked to (ctx,
+// token) and cannot carry the account ID a per-account persist needs)
+// are expected to persist auth.RefreshToken themselves before treating
+// the login as durable.
+//
 // Governing: hostile-review Concern 4 of PR #37.
-func (m *Manager) NewClientWithLogin(ctx context.Context, username, password string) (Client, *AuthInfo, error) {
-	// We need AuthInfo separately so callers can branch on the
-	// returned 2FA configuration. The SRP exchange below uses the
-	// same /auth/v4/info call internally, so this is a single extra
-	// round-trip — acceptable for the login path.
-	info, err := m.up.AuthInfo(ctx, AuthInfoReq{Username: username})
-	if err != nil {
-		return nil, nil, err
-	}
-
+func (m *Manager) NewClientWithLogin(ctx context.Context, username, password string) (Client, *Auth, error) {
 	up, auth, err := m.up.NewClientWithLogin(ctx, username, []byte(password))
 	if err != nil {
-		return nil, &info, err
+		return nil, nil, err
 	}
 
 	c := &clientImpl{mgr: m}
@@ -193,10 +191,10 @@ func (m *Manager) NewClientWithLogin(ctx context.Context, username, password str
 		// which we swallow because we already have the more
 		// actionable cbErr to report.
 		_ = c.Logout(context.Background())
-		return nil, &info, cbErr
+		return nil, nil, cbErr
 	}
 
-	return c, &info, nil
+	return c, &auth, nil
 }
 
 // fireInitialRefreshCallback invokes the persistence callback exactly

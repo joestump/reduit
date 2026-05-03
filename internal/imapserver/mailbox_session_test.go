@@ -159,6 +159,10 @@ func (c *fakeProtonClient) AuthFIDO2(context.Context, proton.FIDO2Req) error {
 	return nil
 }
 func (c *fakeProtonClient) KeySalts(context.Context) (proton.Salts, error) { return nil, nil }
+func (c *fakeProtonClient) GetUser(context.Context) (proton.User, error)   { return proton.User{}, nil }
+func (c *fakeProtonClient) GetAddresses(context.Context) ([]proton.Address, error) {
+	return nil, nil
+}
 func (c *fakeProtonClient) Unlock(_ proton.User, _ []proton.Address, _ []byte) (*proton.KeyRing, map[string]*proton.KeyRing, error) {
 	return nil, nil, nil
 }
@@ -877,6 +881,12 @@ func (c *erroringProtonClient) AuthFIDO2(ctx context.Context, r proton.FIDO2Req)
 }
 func (c *erroringProtonClient) KeySalts(ctx context.Context) (proton.Salts, error) {
 	return c.wrapped.KeySalts(ctx)
+}
+func (c *erroringProtonClient) GetUser(ctx context.Context) (proton.User, error) {
+	return c.wrapped.GetUser(ctx)
+}
+func (c *erroringProtonClient) GetAddresses(ctx context.Context) ([]proton.Address, error) {
+	return c.wrapped.GetAddresses(ctx)
 }
 func (c *erroringProtonClient) Unlock(u proton.User, a []proton.Address, p []byte) (*proton.KeyRing, map[string]*proton.KeyRing, error) {
 	return c.wrapped.Unlock(u, a, p)

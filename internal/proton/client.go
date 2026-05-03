@@ -29,6 +29,12 @@ type (
 	Auth2FAReq = gpa.Auth2FAReq
 	// FIDO2Req is the FIDO2 second-factor payload nested in Auth2FAReq.
 	FIDO2Req = gpa.FIDO2Req
+	// TwoFAStatus enumerates the 2FA modes Proton has enabled on an
+	// account. The Auth.TwoFA.Enabled field is a bitfield; callers
+	// branch on `enabled & HasTOTP != 0` style checks.
+	TwoFAStatus = gpa.TwoFAStatus
+	// TwoFAInfo is the nested `2FA` payload on Auth/AuthInfo.
+	TwoFAInfo = gpa.TwoFAInfo
 	// Salt is one entry from /core/v4/keys/salts.
 	Salt = gpa.Salt
 	// Salts is the slice form of Salt.
@@ -79,6 +85,15 @@ const (
 	KeyStateActive  = gpa.KeyStateActive
 )
 
+// 2FA mode constants. Auth.TwoFA.Enabled is a bitfield; the wizard
+// branches on `enabled & HasTOTP != 0` etc. to decide which second-
+// factor screen to render.
+const (
+	HasTOTP         = gpa.HasTOTP
+	HasFIDO2        = gpa.HasFIDO2
+	HasFIDO2AndTOTP = gpa.HasFIDO2AndTOTP
+)
+
 // ErrNotAuthenticated is returned by methods that require a session
 // when the wrapping client was constructed without one (or the session
 // has been revoked via Logout).
@@ -116,6 +131,15 @@ type Client interface {
 	// KeySalts fetches the per-key salt list for the authenticated
 	// user. Required input to Unlock.
 	KeySalts(ctx context.Context) (Salts, error)
+
+	// GetUser fetches the authenticated Proton user payload (including
+	// Keys). Required input to Unlock.
+	GetUser(ctx context.Context) (User, error)
+
+	// GetAddresses fetches every address (and per-address keys) belonging
+	// to the authenticated user. Required input to Unlock; the returned
+	// slice drives the per-address keyring map Unlock returns.
+	GetAddresses(ctx context.Context) ([]Address, error)
 
 	// Unlock decrypts the user keyring with the salted mailbox
 	// password. Returns the user keyring and per-address keyrings.
@@ -302,6 +326,26 @@ func (c *clientImpl) KeySalts(ctx context.Context) (Salts, error) {
 	}
 	defer release()
 	return up.GetSalts(ctx)
+}
+
+// GetUser fetches the authenticated user.
+func (c *clientImpl) GetUser(ctx context.Context) (User, error) {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return User{}, err
+	}
+	defer release()
+	return up.GetUser(ctx)
+}
+
+// GetAddresses fetches the authenticated user's addresses.
+func (c *clientImpl) GetAddresses(ctx context.Context) ([]Address, error) {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return up.GetAddresses(ctx)
 }
 
 // Unlock is a pure operation upstream; we just forward.
