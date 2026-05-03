@@ -35,6 +35,7 @@ import (
 	gooidc "github.com/coreos/go-oidc/v3/oidc"
 	"github.com/coreos/go-oidc/v3/oidc/oidctest"
 
+	"github.com/joestump/reduit/internal/account"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	"github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/server"
@@ -251,22 +252,26 @@ func newTestServer(t *testing.T, adminSubs []string) (serverURL string, idp *fak
 	t.Helper()
 	st = openTempStore(t)
 	idp = newFakeIdP(t, "reduit-test-client")
+	usersSvc := users.New(st)
+	serverURL = mountTestServer(t, st, idp, adminSubs, nil, usersSvc)
+	return serverURL, idp, st
+}
 
+// mountTestServer is the shared per-test wiring that spins up a real
+// httptest.Server with the production routes + middleware chain.
+// Tests that need a specific account.Service / users.Service can
+// pass them in; pass nil for accSvc to skip the dashboard wiring.
+func mountTestServer(t *testing.T, st *store.Store, idp *fakeIdP, adminSubs []string, accSvc account.Service, usrSvc users.Service) string {
+	t.Helper()
 	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
 	if err != nil {
 		t.Fatalf("session.New: %v", err)
 	}
 	t.Cleanup(cleanup)
 
-	// We need the test server's URL to register as the redirect_uri,
-	// but we don't have the URL until httptest.NewServer returns. The
-	// usual two-pass pattern: build the OIDC client AFTER spinning up
-	// httptest with a placeholder, then rebuild deps. Easier: use a
-	// known port via a closure in the redirect, then patch.
-	//
-	// Cleanest in practice: spin up the test server first with a stub
-	// handler, capture its URL, build the OIDC client against that
-	// URL as the redirect, swap the handler in.
+	// Two-pass: spin up httptest with a placeholder mux, capture the
+	// URL, build the OIDC client against that URL as the redirect,
+	// then swap the production handler in.
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -284,7 +289,6 @@ func newTestServer(t *testing.T, adminSubs []string) (serverURL string, idp *fak
 		t.Fatalf("authoidc.New: %v", err)
 	}
 	preSessions := authoidc.NewPreSessionStore(0)
-	usersSvc := users.New(st)
 
 	deps := server.Deps{
 		Store:           st,
@@ -293,7 +297,8 @@ func newTestServer(t *testing.T, adminSubs []string) (serverURL string, idp *fak
 		SessionManager:  mgr,
 		OIDC:            oidcClient,
 		PreSessions:     preSessions,
-		UsersService:    usersSvc,
+		UsersService:    usrSvc,
+		AccountService:  accSvc,
 		AdminSubjects:   adminSubs,
 		InsecureCookies: true, // httptest is plain HTTP
 	}
@@ -301,7 +306,7 @@ func newTestServer(t *testing.T, adminSubs []string) (serverURL string, idp *fak
 	_, handler := server.NewForTest(deps)
 	mux.Handle("/", handler)
 
-	return srv.URL, idp, st
+	return srv.URL
 }
 
 // newClient returns a cookie-jarred client that does NOT auto-follow

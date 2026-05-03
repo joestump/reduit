@@ -12,12 +12,14 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"html/template"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/alexedwards/scs/v2"
 
+	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/auth"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	"github.com/joestump/reduit/internal/store"
@@ -45,6 +47,11 @@ type Deps struct {
 	// UsersService is the users repository the OIDC callback upserts
 	// against (per ADR-0010 / SPEC-0001 REQ "User Identity").
 	UsersService users.Service
+	// AccountService backs the dashboard's per-user account list +
+	// the wizard's create path (#24/#25). Required when the dashboard
+	// routes are mounted; nil in test fixtures that don't exercise
+	// /accounts.
+	AccountService account.Service
 	// AdminSubjects is the OIDC_ADMIN_SUBS allowlist. The callback's
 	// session-bind path checks Principal.Subject against this list at
 	// bind time per SPEC-0005 REQ "Session admin tag is computed at
@@ -63,6 +70,10 @@ type Server struct {
 	srv     *http.Server
 	deps    Deps
 	stopped chan struct{}
+	// tmpl is the parsed template tree shared by every HTML-rendering
+	// handler. Nil when templates fail to load -- handlers degrade to
+	// 500 rather than panic.
+	tmpl *template.Template
 }
 
 // New constructs a *Server bound to addr. Routes are mounted via the
@@ -128,6 +139,15 @@ func newWithHandler(deps Deps) (*Server, http.Handler) {
 		deps:    deps,
 		stopped: make(chan struct{}),
 	}
+	if tmpl, err := loadTemplates(); err != nil {
+		// A template-parse failure at boot is fatal-class -- the
+		// dashboard can't render -- but we don't want to panic the
+		// whole server when /healthz still works. Log loud, leave
+		// s.tmpl nil; the dashboard handler returns 500.
+		deps.Logger.Error("server: load templates: " + err.Error())
+	} else {
+		s.tmpl = tmpl
+	}
 	s.routes(mux)
 
 	var handler http.Handler = mux
@@ -177,6 +197,11 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /auth/callback", s.handleAuthCallback)
 	mux.HandleFunc("POST /auth/logout", s.handleAuthLogout)
 	mux.HandleFunc("GET /auth/logout", s.handleAuthLogout)
+
+	// Account dashboard per SPEC-0005 REQ "Account Dashboard".
+	// Sits behind RequireSession; authenticated users see their own
+	// accounts, admins see every account grouped by owner.
+	mux.HandleFunc("GET /accounts", s.handleAccountsDashboard)
 }
 
 // handleHealthz returns 200 OK if the process is up. It does not
