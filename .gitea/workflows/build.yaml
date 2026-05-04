@@ -7,24 +7,45 @@
 #   1. Source lives on github.com/joestump/reduit (source-of-truth).
 #   2. gitea.stump.rocks/stumpcloud/reduit is a pull mirror, syncing
 #      every 10 minutes.
-#   3. On push to main (after the mirror sync completes), this
-#      workflow runs on Gitea Actions: tests pass, image builds,
-#      Trivy scans, push to the local registry.
+#   3. THIS WORKFLOW polls main HEAD every 15 minutes via cron and
+#      builds + tests + scans + pushes when the head SHA hasn't
+#      already been built. Cache-from on a registry buildcache makes
+#      the no-op cycles fast (~30s).
 #   4. Stumpcloud's Ansible playbook references `:latest` with
-#      `pull: always`, so the next deploy on ie01 picks up HEAD.
+#      `pull: always`, so the next manual deploy on ie01 picks up
+#      HEAD.
 #
-# Modeled on stumpcloud/docker's docker.yaml. Tests run inside the
-# workflow rather than trusting GitHub's CI -- the Gitea-side gate
-# fails closed if a regression slips through.
+# Why cron and not `on: push`: Gitea pull mirrors update refs
+# directly via the SyncMirrors goroutine and emit
+# NotifySyncPushCommits, which the Actions notifier does NOT
+# subscribe to (it listens for NotifyPushCommits, the regular push
+# hook). End result: `on: push: branches: [main]` fires only on
+# direct Gitea-side commits, which never happen on a pull mirror.
+# `schedule:` runs against current main HEAD at trigger time, which
+# is exactly what we need.
+#
+# Test-gate honesty: GitHub Actions runs the comprehensive CI gate
+# (cross-OS test matrix, staticcheck, govulncheck) on every PR
+# before merge. This Gitea-side workflow runs `go test -race` on
+# Linux as a build-time smoke test; it is NOT a strict superset of
+# GitHub CI and will not catch staticcheck/govulncheck regressions
+# that bypassed GitHub (admin merge, branch-protection misconfig,
+# etc.). The image gate fails closed on race-condition regressions
+# and on the Trivy scan.
+#
+# Modeled on stumpcloud/docker's docker.yaml.
 
 name: build-and-push
 
 on:
-  push:
-    branches: [main]
-  # Allow manual re-runs from the Gitea Actions UI without waiting
-  # for a fresh push (useful for retrying flakes or rebuilding after
-  # a registry-side change).
+  # See header for why cron instead of push: pull mirrors don't
+  # trigger Actions on sync.
+  schedule:
+    - cron: '*/15 * * * *'
+  # Manual re-runs from the Gitea Actions UI for retrying flakes or
+  # rebuilding after a registry-side change. Also the way to fire a
+  # build immediately after a main merge if you don't want to wait
+  # up to 15 minutes for the next cron tick.
   workflow_dispatch:
 
 permissions:
@@ -91,10 +112,12 @@ jobs:
           username: ${{ vars.REGISTRY_USER }}
           password: ${{ secrets.REGISTRY_TOKEN }}
 
-      # Build amd64 first into a local-only "scan" tag so Trivy can
-      # inspect a real image instead of a manifest list. Failure here
-      # blocks the multi-arch push -- we don't ship images with
-      # critical/high CVEs that have a fix available.
+      # Build amd64 first into a run-scoped local-only "scan" tag so
+      # Trivy can inspect a real image instead of a manifest list.
+      # Tag scoped with `${{ gitea.run_id }}` so concurrent dispatches
+      # sharing a runner's docker daemon don't race on the same scan
+      # tag. Failure here blocks the multi-arch push -- we don't ship
+      # images with critical/high CVEs that have a fix available.
       - name: Build amd64 image for Trivy scan
         uses: docker/build-push-action@v5
         with:
@@ -102,15 +125,20 @@ jobs:
           file: deploy/docker/Dockerfile
           platforms: linux/amd64
           load: true
-          tags: ${{ vars.LOCAL_REGISTRY }}/${{ vars.REGISTRY_NAMESPACE }}/reduit:scan
+          tags: ${{ vars.LOCAL_REGISTRY }}/${{ vars.REGISTRY_NAMESPACE }}/reduit:scan-${{ gitea.run_id }}
           build-args: |
             VERSION=${{ gitea.sha }}
           cache-from: type=registry,ref=${{ vars.LOCAL_REGISTRY }}/${{ vars.REGISTRY_NAMESPACE }}/reduit:buildcache
 
+      # Trivy floating tag matches stumpcloud/mirror's docker.yaml
+      # convention (governed by that repo's ADR-0005). Severity floor
+      # is HIGH+CRITICAL with --ignore-unfixed, so MEDIUM CVEs ship
+      # silently -- by design, since "no upstream fix available" means
+      # there's nothing actionable for us to do.
       - name: Trivy image scan
         uses: docker://aquasec/trivy:latest
         with:
-          args: image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --format table ${{ vars.LOCAL_REGISTRY }}/${{ vars.REGISTRY_NAMESPACE }}/reduit:scan
+          args: image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --format table ${{ vars.LOCAL_REGISTRY }}/${{ vars.REGISTRY_NAMESPACE }}/reduit:scan-${{ gitea.run_id }}
 
       # Build for amd64 only at first -- ie01 is the only deploy
       # target today. Add linux/arm64 (or arm/v8) when reduit is
