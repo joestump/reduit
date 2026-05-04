@@ -13,7 +13,7 @@ toolchain go1.26.2
 
 require (
 	github.com/ProtonMail/go-proton-api v0.4.1-0.20260424150947-6bf7f5a61eb8
-	github.com/ProtonMail/gopenpgp/v2 v2.10.0-proton
+	github.com/ProtonMail/gopenpgp/v2 v2.10.0
 	github.com/alexedwards/scs/sqlite3store v0.0.0-20251002162104-209de6e426de
 	github.com/alexedwards/scs/v2 v2.9.0
 	github.com/coreos/go-oidc/v3 v3.18.0
@@ -36,7 +36,7 @@ require (
 require (
 	github.com/ProtonMail/bcrypt v0.0.0-20211005172633-e235017c1baf // indirect
 	github.com/ProtonMail/gluon v0.17.1-0.20260225115619-c0f05c033a4a // indirect
-	github.com/ProtonMail/go-crypto v1.4.1-proton // indirect
+	github.com/ProtonMail/go-crypto v1.4.1 // indirect
 	github.com/ProtonMail/go-mime v0.0.0-20230322103455-7d82a3887f2f // indirect
 	github.com/ProtonMail/go-srp v0.0.7 // indirect
 	github.com/PuerkitoBio/goquery v1.12.0 // indirect
