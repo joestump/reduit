@@ -98,7 +98,10 @@ type Server struct {
 }
 
 // New constructs a *Server bound to addr. Routes are mounted via the
-// returned Server's mux. TLS is wired through deps.GetCertificate.
+// returned Server's mux. TLS is wired through deps.GetCertificate;
+// passing a nil GetCertificate puts the server in plaintext mode --
+// Start uses ListenAndServe (HTTP) instead of ListenAndServeTLS. Use
+// only when reduit sits behind a TLS-terminating reverse proxy.
 func New(addr string, deps Deps) *Server {
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
@@ -106,19 +109,20 @@ func New(addr string, deps Deps) *Server {
 	s, handler := newWithHandler(deps)
 	s.addr = addr
 
-	tlsCfg := &tls.Config{
-		GetCertificate: deps.GetCertificate,
-		MinVersion:     tls.VersionTLS12,
-	}
 	s.srv = &http.Server{
 		Addr:              addr,
 		Handler:           handler,
-		TLSConfig:         tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          slog.NewLogLogger(deps.Logger.Handler(), slog.LevelError),
+	}
+	if deps.GetCertificate != nil {
+		s.srv.TLSConfig = &tls.Config{
+			GetCertificate: deps.GetCertificate,
+			MinVersion:     tls.VersionTLS12,
+		}
 	}
 	return s
 }
@@ -189,15 +193,29 @@ func newWithHandler(deps Deps) (*Server, http.Handler) {
 
 // Start begins serving. It returns when the listener exits (typically
 // after Shutdown). Start blocks; run it from a dedicated goroutine.
+//
+// If a TLSConfig is wired (deps.GetCertificate was non-nil at New
+// time) the listener uses ListenAndServeTLS; otherwise it falls
+// back to ListenAndServe for the reverse-proxy-fronted deployment
+// (tls.disabled = true).
 func (s *Server) Start() error {
 	defer close(s.stopped)
-	s.deps.Logger.Info("http server starting",
+	if s.srv.TLSConfig != nil {
+		s.deps.Logger.Info("https server starting",
+			slog.String("addr", s.addr))
+		err := s.srv.ListenAndServeTLS("", "") // certs come from GetCertificate
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("server: ListenAndServeTLS: %w", err)
+	}
+	s.deps.Logger.Info("http server starting (plaintext; expect a TLS-terminating reverse proxy in front)",
 		slog.String("addr", s.addr))
-	err := s.srv.ListenAndServeTLS("", "") // certs come from GetCertificate
+	err := s.srv.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
-	return fmt.Errorf("server: ListenAndServeTLS: %w", err)
+	return fmt.Errorf("server: ListenAndServe: %w", err)
 }
 
 // Shutdown asks the underlying http.Server to gracefully stop. It

@@ -95,6 +95,42 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 }
 
+func TestValidateTLSDisabledAcceptsHTTPOnly(t *testing.T) {
+	t.Parallel()
+	cfg := Defaults()
+	cfg.TLS.Disabled = true
+	cfg.TLS.CertPath = ""
+	cfg.TLS.KeyPath = ""
+	cfg.Server.IMAPAddr = ""
+	cfg.Server.SMTPAddr = ""
+	cfg.OIDC.IssuerURL = "https://idp.example.com"
+	cfg.OIDC.ClientID = "reduit"
+	cfg.OIDC.RedirectURL = "https://reduit.example.com/auth/callback"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("tls.disabled HTTP-only config should validate, got %v", err)
+	}
+}
+
+func TestValidateTLSDisabledRejectsMailListeners(t *testing.T) {
+	t.Parallel()
+	cfg := Defaults()
+	cfg.TLS.Disabled = true
+	cfg.TLS.CertPath = ""
+	cfg.TLS.KeyPath = ""
+	cfg.OIDC.IssuerURL = "https://idp.example.com"
+	cfg.OIDC.ClientID = "reduit"
+	cfg.OIDC.RedirectURL = "https://reduit.example.com/auth/callback"
+	// Defaults() leaves IMAPAddr=":993" and SMTPAddr=":465" set, so the
+	// disabled-TLS check should reject the combination.
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("expected tls.disabled+mail-listeners to fail validation")
+	}
+	if !strings.Contains(err.Error(), "tls.disabled") {
+		t.Fatalf("expected error to mention tls.disabled, got %q", err)
+	}
+}
+
 func TestResolveConfigPathPrecedence(t *testing.T) {
 	t.Parallel()
 	if got := ResolveConfigPath("/explicit/flag.yaml"); got != "/explicit/flag.yaml" {

@@ -15,6 +15,22 @@ tls:
   # certbot, Caddy, Traefik, etc. Reduit doesn't do ACME.
   cert_path: /etc/reduit/tls/fullchain.pem
   key_path:  /etc/reduit/tls/privkey.pem
+  # Set `disabled: true` ONLY when reduit sits behind a TLS-
+  # terminating reverse proxy on the same host or trusted network.
+  # The admin/MCP listener will serve plaintext HTTP; the proxy
+  # MUST handle TLS for inbound connections.
+  #
+  # CRITICAL: the public-facing URL (what the browser sees) MUST
+  # still be HTTPS. The session cookie and the __Host-Reduit-Bind
+  # cookie are written with Secure=true; browsers silently drop
+  # them when the page is served over HTTP, breaking login with
+  # no useful error. If you expose reduit's plaintext port directly
+  # to clients, login fails. Always proxy.
+  #
+  # IMAPS and SMTPS cannot be reverse-proxied (they're TCP, not
+  # HTTP). When tls.disabled is true, server.imap_addr and
+  # server.smtp_addr MUST be empty.
+  # disabled: false
 
 master_key:
   # Service master key (ADR-0003). Generated once with:
