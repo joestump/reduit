@@ -56,6 +56,7 @@ func bindDefaults(v *viper.Viper, cfg Config) error {
 		"server.metrics_addr":  cfg.Server.MetricsAddr,
 		"tls.cert_path":        cfg.TLS.CertPath,
 		"tls.key_path":         cfg.TLS.KeyPath,
+		"tls.disabled":         cfg.TLS.Disabled,
 		"master_key.path":      cfg.MasterKey.Path,
 		"store.path":           cfg.Store.Path,
 		"store.migrations_dir": cfg.Store.MigrationsDir,

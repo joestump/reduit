@@ -1,6 +1,6 @@
 # ADR-0009: TLS via on-disk cert files with hot-reload
 
-- **Status:** accepted
+- **Status:** accepted (amended by [ADR-0011](ADR-0011-http-mode-for-reverse-proxy-fronting.md), 2026-05-04 — adds an opt-in HTTP-only mode for the admin/MCP listener; mail listeners still follow this ADR)
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
 

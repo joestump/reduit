@@ -9,7 +9,10 @@ because those are the operations that motivate building a Proton
 relay rather than using a generic IMAP MCP.
 
 Transport: HTTP+SSE (Streamable HTTP per the MCP spec) on the same
-HTTPS listener as the admin UI, mounted at `/mcp`.
+TLS-terminated listener as the admin UI, mounted at `/mcp`. TLS
+termination MAY happen in-process (per ADR-0009) or upstream of a
+fronting reverse proxy (per ADR-0011, `tls.disabled: true`); MCP
+clients see HTTPS regardless of which path the operator chose.
 
 Governing: ADR-0001 (go-proton-api), ADR-0008 (embedded MCP),
 ADR-0010 (multi-Proton-account per user), SPEC-0001 (Account Model),

@@ -83,6 +83,16 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	defer cancel()
 	if cfg.TLS.Disabled {
 		logger.Info("tls disabled; admin/MCP listener will serve plaintext HTTP -- reverse proxy MUST terminate TLS in front")
+		// SCS session cookie + the OIDC bind cookie (`__Host-Reduit-
+		// Bind`) are both written with Secure=true. Browsers honor that
+		// only when the page is served over HTTPS. With tls.disabled
+		// set, that's the upstream proxy's job: the public URL MUST be
+		// HTTPS or the browser silently drops the cookie and login
+		// fails with no useful error. Loud warning here so the
+		// operator sees it on every restart -- there is no programmatic
+		// signal we can interlock against without parsing the proxy's
+		// inbound headers.
+		logger.Warn("tls.disabled: the upstream reverse proxy MUST present HTTPS to the browser -- HTTP-direct access will silently drop session cookies (Secure flag) and break login")
 	} else {
 		loader, err = tlsloader.New(cfg.TLS.CertPath, cfg.TLS.KeyPath, logger)
 		if err != nil {
