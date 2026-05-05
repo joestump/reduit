@@ -176,6 +176,22 @@ type Service interface {
 	// Governing: SPEC-0002 REQ "Event Cursor Persistence" — atomic
 	// commit of cursor and state changes derived from the same batch.
 	SetSyncState(ctx context.Context, accountID, cursor string, txWork SyncStateTxWork) error
+
+	// SoftDeleteOldPending soft-deletes every account row stuck in
+	// state pending_proton_setup whose created_at is older than
+	// `olderThan` ago. Returns the number of rows affected. Intended
+	// to be called periodically (hourly) by a retention sweep so
+	// orphan pending rows -- created when a wizard session expires
+	// from the in-memory store before Proton login completes -- do
+	// not accumulate forever.
+	//
+	// The cutoff is computed against the service clock (s.now) so
+	// tests that inject a fake clock can exercise the sweep without
+	// real-time waits.
+	//
+	// Governing: SPEC-0001 REQ "Account Lifecycle States"; ADR-0010,
+	// SPEC-0005 REQ "Add-Proton-Account Wizard"; issue #82.
+	SoftDeleteOldPending(ctx context.Context, olderThan time.Duration) (int64, error)
 }
 
 // CreateParams collects the inputs to Service.Create. ProtonUserID
@@ -488,6 +504,26 @@ func allowedPrevStates(next State) []State {
 
 func (s *service) Delete(ctx context.Context, id string) (*Account, error) {
 	return s.Transition(ctx, id, StateSoftDeleted)
+}
+
+// SoftDeleteOldPending implements Service.SoftDeleteOldPending. The
+// underlying repository UPDATE is unconditional on previous state
+// other than `pending_proton_setup`, so it bypasses the per-row
+// transitionState helper -- the sweep is a maintenance op that
+// reasons in bulk and never needs to know the prior state of each
+// row. We do NOT fire transition callbacks for swept rows: the
+// supervisor only cares about transitions out of `active`, and
+// pending rows have no worker to stop.
+//
+// Governing: SPEC-0001 REQ "Account Lifecycle States" (pending ->
+// soft_deleted is a legal terminal transition); issue #82.
+func (s *service) SoftDeleteOldPending(ctx context.Context, olderThan time.Duration) (int64, error) {
+	if olderThan <= 0 {
+		return 0, errors.New("account: SoftDeleteOldPending: olderThan must be positive")
+	}
+	now := s.now().UTC()
+	cutoff := now.Add(-olderThan)
+	return s.repo.softDeleteOldPending(ctx, cutoff, now)
 }
 
 // zeroDataKey best-effort wipes a data key from memory after use. Go

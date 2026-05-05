@@ -395,6 +395,36 @@ func (r *repository) updateIMAPPassword(ctx context.Context, id string, sealed [
 	return checkOneRow(res, "update imap password")
 }
 
+// softDeleteOldPending issues a single UPDATE that flips every
+// `pending_proton_setup` row whose created_at is strictly older than
+// `cutoff` to `soft_deleted` and stamps deleted_at. Returns the number
+// of rows affected so the caller can log meaningful counts. Used by
+// the periodic retention sweep started in cli.runServe to clear orphan
+// rows left behind when a wizard expires from the in-memory session
+// store before completing Proton login.
+//
+// Governing: SPEC-0001 REQ "Account Lifecycle States" (soft_deleted is
+// terminal); ADR-0010, SPEC-0005 REQ "Add-Proton-Account Wizard"
+// (pending rows accumulate when wizard idles past TTL); issue #82.
+func (r *repository) softDeleteOldPending(ctx context.Context, cutoff, now time.Time) (int64, error) {
+	const q = `
+		UPDATE accounts
+		SET state = ?, updated_at = ?, deleted_at = ?
+		WHERE state = ? AND created_at < ? AND deleted_at IS NULL`
+	res, err := r.db.ExecContext(ctx, q,
+		string(StateSoftDeleted), now, now,
+		string(StatePendingProtonSetup), cutoff,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("account: soft-delete old pending: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("account: soft-delete old pending rows affected: %w", err)
+	}
+	return n, nil
+}
+
 func checkOneRow(res sql.Result, op string) error {
 	n, err := res.RowsAffected()
 	if err != nil {

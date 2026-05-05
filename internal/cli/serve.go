@@ -172,6 +172,22 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	usersService := users.New(st)
 	accountService := account.New(st, masterKey)
 
+	// Pending-account retention sweep. The wizard creates a row in
+	// state pending_proton_setup before Proton login completes; if
+	// the wizard's in-memory session expires (or the operator never
+	// finishes the flow), the row stays in the DB indefinitely. This
+	// goroutine runs hourly and soft-deletes any pending row older
+	// than pendingProtonSetupRetention. Pre-alpha: hardcoded; lift
+	// to config when retention windows become operator-tunable.
+	//
+	// The first sweep fires immediately so a freshly-restarted
+	// daemon clears accumulated orphans without waiting an hour;
+	// subsequent sweeps follow the ticker.
+	//
+	// Governing: SPEC-0001 REQ "Account Lifecycle States"; SPEC-0005
+	// REQ "Add-Proton-Account Wizard"; issue #82.
+	go runPendingAccountSweep(ctx, accountService, logger)
+
 	// Proton client manager + wizard session store (#24). The manager
 	// is process-scoped (one resty client, many minted Clients); the
 	// wizard store keeps in-memory partial-credentials state with a
@@ -245,3 +261,76 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 // overrides applied at startup so operators can debug "why is the
 // config not what I expect".
 var _ = os.Getenv
+
+// pendingAccountSweepInterval is how often the retention sweep runs.
+// One hour gives the system rapid-enough cleanup that orphan rows do
+// not pile up between restarts, while keeping the per-tick query
+// volume trivial against a single bulk UPDATE.
+const pendingAccountSweepInterval = time.Hour
+
+// pendingProtonSetupRetention is the age past which an account row
+// stuck in state pending_proton_setup is considered abandoned and
+// gets soft-deleted. 24h gives a generous human window for an
+// operator to resume an interrupted wizard (e.g., started Friday
+// evening, finished Monday morning) while still bounding orphan
+// growth. Pre-alpha: hardcoded; lift to config when retention
+// windows become operator-tunable.
+//
+// Governing: SPEC-0005 REQ "Add-Proton-Account Wizard"; issue #82.
+const pendingProtonSetupRetention = 24 * time.Hour
+
+// runPendingAccountSweep is the goroutine body for the sweep
+// scheduled out of runServe. It exits when ctx is cancelled (i.e.,
+// SIGINT/SIGTERM during shutdown). Errors from the sweep itself are
+// logged-and-swallowed: a transient DB error here MUST NOT take
+// down the daemon, and the next tick will pick up the same backlog.
+//
+// Each sweep runs against context.Background() with a 30s timeout
+// so a slow query cannot stall shutdown -- the parent ctx cancellation
+// is observed between ticks, not inside the SQL call. 30s is generous
+// for a single bulk UPDATE on the accounts table.
+//
+// Governing: SPEC-0001 REQ "Account Lifecycle States"; SPEC-0005 REQ
+// "Add-Proton-Account Wizard"; issue #82.
+func runPendingAccountSweep(ctx context.Context, svc account.Service, logger *slog.Logger) {
+	tick := time.NewTicker(pendingAccountSweepInterval)
+	defer tick.Stop()
+
+	sweep := func() {
+		// Derive from parent ctx so a SIGINT mid-query cancels the
+		// SQL call instead of letting it linger past defer st.Close()
+		// in runServe. 30s is generous for a single bulk UPDATE; the
+		// deadline only matters if the DB is wedged.
+		opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		n, err := svc.SoftDeleteOldPending(opCtx, pendingProtonSetupRetention)
+		if err != nil {
+			// Cancellation during shutdown is expected; demote to debug
+			// so we don't pollute shutdown logs.
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			logger.Warn("pending-account sweep failed",
+				slog.String("error", err.Error()))
+			return
+		}
+		if n > 0 {
+			logger.Info("pending-account sweep soft-deleted orphans",
+				slog.Int64("count", n),
+				slog.Duration("older_than", pendingProtonSetupRetention))
+		}
+	}
+
+	// First sweep runs immediately so a freshly-restarted daemon
+	// clears accumulated orphans without waiting a full interval.
+	sweep()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			sweep()
+		}
+	}
+}
