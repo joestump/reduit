@@ -234,6 +234,15 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
+	// Root path: 302 to /accounts. Without this, an authenticated
+	// browser landing on `/` (e.g., after a login that captured
+	// `?return_to=/` from a stale link, or an operator typing the
+	// hostname) gets a 404 because no other handler claims `/`.
+	// /accounts is the canonical dashboard per SPEC-0005.
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/accounts", http.StatusFound)
+	})
+
 	// OIDC login flow per SPEC-0005 REQ "OIDC Login Flow".
 	// All three paths are allowlisted (auth.Allowlist) so the
 	// RequireSession gate doesn't 302-loop them.
