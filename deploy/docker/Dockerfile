@@ -4,7 +4,7 @@
 # ships only the binary, embedded migrations, and CA certificates.
 # Image is roughly 25–35 MiB depending on Go version.
 
-ARG GO_VERSION=1.25
+ARG GO_VERSION=1.26
 
 # ---- build -----------------------------------------------------------------
 FROM golang:${GO_VERSION}-alpine AS build
