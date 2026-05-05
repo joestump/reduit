@@ -54,8 +54,27 @@ an MCP server for AI agents.`,
 }
 
 // loadConfig returns the resolved config and a logger ready for use
-// by a subcommand.
+// by a subcommand. Runs full Validate() -- callers that need a
+// minimum-viable config (e.g. `master-key generate`, which only
+// needs master_key.path) should call loadConfigUnchecked instead.
 func loadConfig(cfgPathPtr *string, verbosePtr *bool) (config.Config, *slog.Logger, error) {
+	cfg, logger, err := loadConfigUnchecked(cfgPathPtr, verbosePtr)
+	if err != nil {
+		return config.Config{}, nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return config.Config{}, nil, fmt.Errorf("invalid config: %w", err)
+	}
+	return cfg, logger, nil
+}
+
+// loadConfigUnchecked is loadConfig minus the Validate() call.
+// Bootstrap-time subcommands (master-key generate / migrate) only
+// care about a small subset of the config (master_key.path, store
+// .path) and shouldn't be blocked by missing serve-time fields like
+// oidc.issuer_url -- the bootstrap typically runs BEFORE the OIDC
+// client has been provisioned.
+func loadConfigUnchecked(cfgPathPtr *string, verbosePtr *bool) (config.Config, *slog.Logger, error) {
 	path := config.ResolveConfigPath(*cfgPathPtr)
 	cfg, err := config.Load(path)
 	if err != nil {
@@ -63,9 +82,6 @@ func loadConfig(cfgPathPtr *string, verbosePtr *bool) (config.Config, *slog.Logg
 	}
 	if *verbosePtr {
 		cfg.Logger.Level = "debug"
-	}
-	if err := cfg.Validate(); err != nil {
-		return config.Config{}, nil, fmt.Errorf("invalid config: %w", err)
 	}
 	logger := buildLogger(cfg.Logger)
 	if path != "" {

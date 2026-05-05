@@ -28,7 +28,10 @@ func newMasterKeyGenerateCmd(cfgPath *string, verbose *bool) *cobra.Command {
 accidental rotation that would orphan every account's data key.
 Use the (deferred) rotate subcommand for a controlled rotation.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, logger, err := loadConfig(cfgPath, verbose)
+			// loadConfigUnchecked: master-key generate runs at
+			// bootstrap, before OIDC client + endpoints exist.
+			// Only master_key.path is needed.
+			cfg, logger, err := loadConfigUnchecked(cfgPath, verbose)
 			if err != nil {
 				return err
 			}

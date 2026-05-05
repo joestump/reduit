@@ -16,7 +16,9 @@ func newMigrateCmd(cfgPath *string, verbose *bool) *cobra.Command {
 		Long: `Opens the configured SQLite database and runs all pending goose
 migrations. Idempotent — safe to run on every deploy.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, logger, err := loadConfig(cfgPath, verbose)
+			// migrate runs at bootstrap; OIDC client + endpoints
+			// don't exist yet. Only store.path is needed.
+			cfg, logger, err := loadConfigUnchecked(cfgPath, verbose)
 			if err != nil {
 				return err
 			}
