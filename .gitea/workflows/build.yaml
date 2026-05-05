@@ -91,14 +91,14 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: gitea.stump.rocks
-          # `gitea.actor` is the user that triggered the workflow;
-          # `secrets.GITEA_TOKEN` is the per-run ephemeral token
-          # auto-issued with packages:write on the running repo's
-          # owner namespace (joestump/*). No external PAT needed
-          # because the image lands in the same namespace as the
-          # source repo.
-          username: ${{ gitea.actor }}
-          password: ${{ secrets.GITEA_TOKEN }}
+          # The per-run `secrets.GITEA_TOKEN` works for the Gitea API
+          # but NOT for the container registry (which expects a real
+          # user PAT with the `write:package` scope -- regular API
+          # auth is rejected with 401). `secrets.REGISTRY_TOKEN` is a
+          # purpose-scoped PAT named "reduit-actions-registry-push"
+          # set on this repo only, with no other privileges.
+          username: joestump
+          password: ${{ secrets.REGISTRY_TOKEN }}
 
       # Build amd64 first into a run-scoped local-only "scan" tag so
       # Trivy can inspect a real image instead of a manifest list.
