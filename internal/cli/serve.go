@@ -164,17 +164,21 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// don't exercise /accounts/setup.
 	//
 	// Governing: ADR-0001, SPEC-0005 REQ "Add-Proton-Account Wizard".
-	// Proton's API rejects unknown X-Pm-Appversion values with
-	// "Platform `go` is not valid" (Code=2064). The go-proton-api
-	// default is "go-proton-api" which is NOT on Proton's
-	// allowlist. We identify as a Bridge variant -- semantically
-	// honest (Reduit is bridge-like: relays a Proton mailbox to
-	// IMAP/SMTP clients) and Bridge is on Proton's accept list.
-	// Suffixing with the build-time Version makes upstream issues
-	// traceable to a specific reduit revision.
+	// Proton's API rejects unknown X-Pm-Appversion values:
+	//   - "go-proton-api" (the lib default) -> Code=2064 platform
+	//     not valid
+	//   - "Bridge_<sha>" -> Code=5002 invalid app version
+	// Proton expects Bridge_<semver>+<suffix> -- they regex-match
+	// the semver shape, then check the prefix is a known platform.
+	// We identify as a Bridge variant (semantically honest: Reduit
+	// is bridge-like, relays a Proton mailbox to IMAP/SMTP
+	// clients). The +reduit suffix records the client identity.
+	// Pin a fixed semver -- bumping it on every release is
+	// pointless because Proton doesn't accept arbitrary versions
+	// on the manifest anyway.
 	protonMgr := proton.NewManager(
 		proton.WithLogger(logger),
-		proton.WithAppVersion("Bridge_"+Version),
+		proton.WithAppVersion("Bridge_3.0.0+reduit"),
 	)
 	defer protonMgr.Close()
 	wizardSessions := server.NewWizardSessionStore(server.DefaultWizardIdleTimeout)
