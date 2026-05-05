@@ -30,7 +30,7 @@ RUN CGO_ENABLED=0 \
         ./cmd/reduit
 
 # ---- runtime ---------------------------------------------------------------
-FROM alpine:3.20
+FROM alpine:3.23
 
 # Non-root user. UID/GID 10000 to avoid colliding with host UIDs that
 # self-hosters often use.
