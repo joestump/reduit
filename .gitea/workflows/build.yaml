@@ -1,51 +1,31 @@
 # Gitea Actions: build + test + push the reduit container image to
 # gitea.stump.rocks/self-hosted/reduit.
 #
-# This file is recognized only on the Gitea side. github.com silently
-# ignores `.gitea/` (GitHub Actions reads `.github/`). The flow:
+# Source-of-truth lives at gitea.stump.rocks/joestump/reduit. On
+# every push to main, this workflow runs:
+#   - go test -race
+#   - docker build (amd64)
+#   - Trivy scan (fail-closed on HIGH/CRITICAL)
+#   - push to gitea.stump.rocks/self-hosted/reduit:{latest,main,sha-<short>}
+# Stumpcloud's Ansible playbook references `:latest` with
+# `pull: always`, so the next ie01 redeploy picks up HEAD.
 #
-#   1. Source lives on github.com/joestump/reduit (source-of-truth).
-#   2. gitea.stump.rocks/stumpcloud/reduit is a pull mirror, syncing
-#      every 10 minutes.
-#   3. THIS WORKFLOW polls main HEAD every 15 minutes via cron and
-#      builds + tests + scans + pushes when the head SHA hasn't
-#      already been built. Cache-from on a registry buildcache makes
-#      the no-op cycles fast (~30s).
-#   4. Stumpcloud's Ansible playbook references `:latest` with
-#      `pull: always`, so the next manual deploy on ie01 picks up
-#      HEAD.
-#
-# Why cron and not `on: push`: Gitea pull mirrors update refs
-# directly via the SyncMirrors goroutine and emit
-# NotifySyncPushCommits, which the Actions notifier does NOT
-# subscribe to (it listens for NotifyPushCommits, the regular push
-# hook). End result: `on: push: branches: [main]` fires only on
-# direct Gitea-side commits, which never happen on a pull mirror.
-# `schedule:` runs against current main HEAD at trigger time, which
-# is exactly what we need.
-#
-# Test-gate honesty: GitHub Actions runs the comprehensive CI gate
-# (cross-OS test matrix, staticcheck, govulncheck) on every PR
-# before merge. This Gitea-side workflow runs `go test -race` on
-# Linux as a build-time smoke test; it is NOT a strict superset of
-# GitHub CI and will not catch staticcheck/govulncheck regressions
-# that bypassed GitHub (admin merge, branch-protection misconfig,
-# etc.). The image gate fails closed on race-condition regressions
-# and on the Trivy scan.
+# Test-gate scope: this is a build-time smoke test (race-detected
+# unit tests on the canonical Linux build). The comprehensive CI
+# gate -- cross-OS test matrix, staticcheck, govulncheck -- runs on
+# the GitHub-side mirror at github.com/joestump/reduit (kept as an
+# external-visibility push target). If you bypass GitHub CI, this
+# workflow will not catch staticcheck/govulncheck regressions.
 #
 # Modeled on stumpcloud/docker's docker.yaml.
 
 name: build-and-push
 
 on:
-  # See header for why cron instead of push: pull mirrors don't
-  # trigger Actions on sync.
-  schedule:
-    - cron: '*/15 * * * *'
-  # Manual re-runs from the Gitea Actions UI for retrying flakes or
-  # rebuilding after a registry-side change. Also the way to fire a
-  # build immediately after a main merge if you don't want to wait
-  # up to 15 minutes for the next cron tick.
+  push:
+    branches: [main]
+  # Manual re-runs from the Gitea Actions UI -- retrying a flaky
+  # Trivy scan, rebuilding after a registry-side change, etc.
   workflow_dispatch:
 
 permissions:
