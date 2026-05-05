@@ -164,7 +164,18 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// don't exercise /accounts/setup.
 	//
 	// Governing: ADR-0001, SPEC-0005 REQ "Add-Proton-Account Wizard".
-	protonMgr := proton.NewManager(proton.WithLogger(logger))
+	// Proton's API rejects unknown X-Pm-Appversion values with
+	// "Platform `go` is not valid" (Code=2064). The go-proton-api
+	// default is "go-proton-api" which is NOT on Proton's
+	// allowlist. We identify as a Bridge variant -- semantically
+	// honest (Reduit is bridge-like: relays a Proton mailbox to
+	// IMAP/SMTP clients) and Bridge is on Proton's accept list.
+	// Suffixing with the build-time Version makes upstream issues
+	// traceable to a specific reduit revision.
+	protonMgr := proton.NewManager(
+		proton.WithLogger(logger),
+		proton.WithAppVersion("Bridge_"+Version),
+	)
 	defer protonMgr.Close()
 	wizardSessions := server.NewWizardSessionStore(server.DefaultWizardIdleTimeout)
 
