@@ -1,12 +1,16 @@
 # Gitea Actions: build + test + push the reduit container image to
-# gitea.stump.rocks/self-hosted/reduit.
+# gitea.stump.rocks/joestump/reduit.
 #
 # Source-of-truth lives at gitea.stump.rocks/joestump/reduit. On
 # every push to main, this workflow runs:
 #   - go test -race
 #   - docker build (amd64)
 #   - Trivy scan (fail-closed on HIGH/CRITICAL)
-#   - push to gitea.stump.rocks/self-hosted/reduit:{latest,main,sha-<short>}
+#   - push to gitea.stump.rocks/joestump/reduit:{latest,main,sha-<short>}
+# Source repo and image registry path live in the same namespace
+# (joestump) so the per-run `gitea.token` (auto-issued with
+# packages:write on the running repo's owner) authenticates without
+# needing a cross-namespace PAT.
 # Stumpcloud's Ansible playbook references `:latest` with
 # `pull: always`, so the next ie01 redeploy picks up HEAD.
 #
@@ -69,10 +73,8 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # vars.LOCAL_REGISTRY = gitea.stump.rocks
-          # vars.REGISTRY_NAMESPACE = self-hosted
           images: |
-            ${{ vars.LOCAL_REGISTRY }}/${{ vars.REGISTRY_NAMESPACE }}/reduit
+            gitea.stump.rocks/joestump/reduit
           # Tagging strategy:
           #   - :latest -- tracks main HEAD (consumed by stumpcloud
           #     ansible playbook with `pull: always`)
@@ -88,16 +90,22 @@ jobs:
       - name: Login to Gitea container registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ vars.LOCAL_REGISTRY }}
-          username: ${{ vars.REGISTRY_USER }}
-          password: ${{ secrets.REGISTRY_TOKEN }}
+          registry: gitea.stump.rocks
+          # `gitea.actor` is the user that triggered the workflow;
+          # `secrets.GITEA_TOKEN` is the per-run ephemeral token
+          # auto-issued with packages:write on the running repo's
+          # owner namespace (joestump/*). No external PAT needed
+          # because the image lands in the same namespace as the
+          # source repo.
+          username: ${{ gitea.actor }}
+          password: ${{ secrets.GITEA_TOKEN }}
 
       # Build amd64 first into a run-scoped local-only "scan" tag so
       # Trivy can inspect a real image instead of a manifest list.
       # Tag scoped with `${{ gitea.run_id }}` so concurrent dispatches
       # sharing a runner's docker daemon don't race on the same scan
-      # tag. Failure here blocks the multi-arch push -- we don't ship
-      # images with critical/high CVEs that have a fix available.
+      # tag. Failure here blocks the push -- we don't ship images
+      # with critical/high CVEs that have a fix available.
       - name: Build amd64 image for Trivy scan
         uses: docker/build-push-action@v5
         with:
@@ -105,10 +113,10 @@ jobs:
           file: deploy/docker/Dockerfile
           platforms: linux/amd64
           load: true
-          tags: ${{ vars.LOCAL_REGISTRY }}/${{ vars.REGISTRY_NAMESPACE }}/reduit:scan-${{ gitea.run_id }}
+          tags: gitea.stump.rocks/joestump/reduit:scan-${{ gitea.run_id }}
           build-args: |
             VERSION=${{ gitea.sha }}
-          cache-from: type=registry,ref=${{ vars.LOCAL_REGISTRY }}/${{ vars.REGISTRY_NAMESPACE }}/reduit:buildcache
+          cache-from: type=registry,ref=gitea.stump.rocks/joestump/reduit:buildcache
 
       # Trivy floating tag matches stumpcloud/mirror's docker.yaml
       # convention (governed by that repo's ADR-0005). Severity floor
@@ -118,7 +126,7 @@ jobs:
       - name: Trivy image scan
         uses: docker://aquasec/trivy:latest
         with:
-          args: image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --format table ${{ vars.LOCAL_REGISTRY }}/${{ vars.REGISTRY_NAMESPACE }}/reduit:scan-${{ gitea.run_id }}
+          args: image --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 --format table gitea.stump.rocks/joestump/reduit:scan-${{ gitea.run_id }}
 
       # Build for amd64 only at first -- ie01 is the only deploy
       # target today. Add linux/arm64 (or arm/v8) when reduit is
@@ -134,5 +142,5 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ gitea.sha }}
-          cache-from: type=registry,ref=${{ vars.LOCAL_REGISTRY }}/${{ vars.REGISTRY_NAMESPACE }}/reduit:buildcache
-          cache-to: type=registry,ref=${{ vars.LOCAL_REGISTRY }}/${{ vars.REGISTRY_NAMESPACE }}/reduit:buildcache,mode=max
+          cache-from: type=registry,ref=gitea.stump.rocks/joestump/reduit:buildcache
+          cache-to: type=registry,ref=gitea.stump.rocks/joestump/reduit:buildcache,mode=max
