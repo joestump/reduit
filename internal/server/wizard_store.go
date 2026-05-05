@@ -12,13 +12,24 @@
 // discarded from memory" scenario.
 //
 // Sweep cadence: a janitor goroutine runs at TTL/4. Drops every
-// session whose IdleAt is older than now - TTL. The Drop path also
-// best-effort-Logouts the proton.Client so any active Proton session
-// is revoked server-side (failure tolerated; the upstream session
-// will time out on its own within minutes).
+// session whose IdleAt is older than now - TTL. The sweep does NOT
+// call Logout on the held proton.Client: the upstream Proton access
+// token expires on its own (~30min) and a Logout call here would
+// race against any in-flight handler still holding the per-session
+// lock. Letting the upstream session time out on its own keeps the
+// janitor's per-tick work O(map iteration) and avoids fanning out
+// N concurrent HTTP calls to Proton on a single tick.
+//
+// If a future change wants to revoke upstream sessions on TTL
+// eviction (e.g., to release Proton-side rate-limit budget faster),
+// the fan-out MUST be bounded by a goroutine pool / semaphore
+// (suggest 4 concurrent) so a thundering herd of evictions cannot
+// saturate the Proton API or the local resty pool. Punted until
+// that need is real rather than speculative.
 //
 // Governing: SPEC-0005 REQ "Add-Proton-Account Wizard" (idle
-// expiry); ADR-0010 (per-account state).
+// expiry); ADR-0010 (per-account state); issue #81 (bounded fan-out
+// design note).
 
 package server
 
