@@ -110,6 +110,21 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		}()
 	}
 
+	// Defense-in-depth: refuse to start mail listeners when the TLS
+	// loader is nil. config.Validate already enforces the
+	// tls.disabled + (imap_addr|smtp_addr) mutual exclusion at config
+	// load, but a future code path that constructs the IMAPS/SMTPS
+	// servers here without consulting `loader` would silently bypass
+	// that check. Keep this guard adjacent to the loader construction
+	// so the invariant is local to anyone wiring up new mail
+	// listeners.
+	//
+	// Governing: config.Validate companion (tls.disabled + mail-addr
+	// exclusion in internal/config/config.go); issue #86.
+	if loader == nil && (cfg.Server.IMAPAddr != "" || cfg.Server.SMTPAddr != "") {
+		return errors.New("runServe: refusing to start mail listeners without TLS; tls.disabled=true forbids imap_addr and smtp_addr")
+	}
+
 	// Session manager — backed by the same SQLite handle as the rest
 	// of the store. The migration created the `sessions` table; the
 	// scs sweep goroutine owns expiry cleanup.
