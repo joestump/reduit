@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/joestump/reduit/internal/cryptenv"
 	"github.com/joestump/reduit/internal/store"
@@ -916,3 +917,105 @@ func TestPrimaryAlias(t *testing.T) {
 // it's computed from OIDC_ADMIN_SUBS at session-bind time. The
 // equivalent empty-subject defense for the session layer is owned
 // by #61 and tested in internal/auth/session.)
+
+// TestSoftDeleteOldPending exercises the retention sweep that #82
+// added so orphan pending_proton_setup rows (created when a wizard
+// expires from the in-memory store before Proton login completes) do
+// not accumulate forever.
+//
+// We seed three accounts with different shapes:
+//   - stale-pending: state=pending_proton_setup, created_at > cutoff
+//     (must be soft-deleted)
+//   - fresh-pending: state=pending_proton_setup, created_at < cutoff
+//     (must be left alone)
+//   - active: state=active, created_at older than cutoff
+//     (must be left alone -- only pending rows are swept)
+//
+// Then we call SoftDeleteOldPending with a 24h horizon and assert
+// only the stale row was flipped.
+//
+// Governing: SPEC-0001 REQ "Account Lifecycle States"; SPEC-0005 REQ
+// "Add-Proton-Account Wizard"; issue #82.
+func TestSoftDeleteOldPending(t *testing.T) {
+	t.Parallel()
+	svc, st := newTestService(t)
+	ctx := context.Background()
+
+	stale := createTestAccount(t, svc, st, ctx, "sub-stale")
+	fresh := createTestAccount(t, svc, st, ctx, "sub-fresh")
+	activeAcc := createTestAccount(t, svc, st, ctx, "sub-active")
+
+	// Backdate the stale row's created_at to 48h ago and the active
+	// row's created_at to 72h ago. Goose migrations stamp created_at
+	// at NOW() on insert; we rewrite directly to simulate clock
+	// drift past the sweep horizon. The active row is backdated too
+	// to confirm the sweep filters by state, not by age alone.
+	if _, err := st.DB.Exec(
+		`UPDATE accounts SET created_at = datetime('now', '-48 hours') WHERE id = ?`,
+		stale.ID,
+	); err != nil {
+		t.Fatalf("backdate stale: %v", err)
+	}
+	if _, err := st.DB.Exec(
+		`UPDATE accounts SET created_at = datetime('now', '-72 hours'), state = 'active' WHERE id = ?`,
+		activeAcc.ID,
+	); err != nil {
+		t.Fatalf("backdate active: %v", err)
+	}
+
+	n, err := svc.SoftDeleteOldPending(ctx, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("SoftDeleteOldPending: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("SoftDeleteOldPending rows affected = %d, want 1", n)
+	}
+
+	// stale: must now be soft_deleted with deleted_at set.
+	got, err := svc.GetByID(ctx, stale.ID)
+	if err != nil {
+		t.Fatalf("GetByID stale: %v", err)
+	}
+	if got.State != StateSoftDeleted {
+		t.Errorf("stale.State = %q, want %q", got.State, StateSoftDeleted)
+	}
+	if got.DeletedAt == nil {
+		t.Error("stale.DeletedAt must be set after sweep")
+	}
+
+	// fresh: must remain pending.
+	got, err = svc.GetByID(ctx, fresh.ID)
+	if err != nil {
+		t.Fatalf("GetByID fresh: %v", err)
+	}
+	if got.State != StatePendingProtonSetup {
+		t.Errorf("fresh.State = %q, want %q (sweep should not touch fresh rows)",
+			got.State, StatePendingProtonSetup)
+	}
+
+	// active: must remain active even though older than cutoff.
+	got, err = svc.GetByID(ctx, activeAcc.ID)
+	if err != nil {
+		t.Fatalf("GetByID active: %v", err)
+	}
+	if got.State != StateActive {
+		t.Errorf("active.State = %q, want %q (sweep must filter by state)",
+			got.State, StateActive)
+	}
+
+	// Idempotent: a second sweep with the same horizon affects 0 rows
+	// because the previously-stale row is now soft_deleted (filtered
+	// out by `state = 'pending_proton_setup'`).
+	n, err = svc.SoftDeleteOldPending(ctx, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("SoftDeleteOldPending second pass: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("second sweep rows affected = %d, want 0", n)
+	}
+
+	// Negative horizon is a programmer error.
+	if _, err := svc.SoftDeleteOldPending(ctx, 0); err == nil {
+		t.Error("SoftDeleteOldPending(0) must error")
+	}
+}
