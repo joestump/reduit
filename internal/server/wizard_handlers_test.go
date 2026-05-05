@@ -115,8 +115,18 @@ type stubProtonClient struct {
 	logoutCalls int
 }
 
+// AuthInfo returns a zero-value AuthInfo. The wizard handlers do not
+// call AuthInfo on the per-session client (Manager.NewClientWithLogin
+// routes the SRP info exchange through gpa internally), so this stub
+// is unreachable in production test paths. We keep the method (rather
+// than dropping it) to satisfy the proton.Client interface and return
+// a typed sentinel instead of panicking so any future call site that
+// quietly starts touching AuthInfo gets a debuggable empty response
+// rather than crashing the test binary.
+//
+// Governing: issue #81 (dead AuthInfo stub cleanup).
 func (c *stubProtonClient) AuthInfo(context.Context, proton.AuthInfoReq) (proton.AuthInfo, error) {
-	panic("stubProtonClient.AuthInfo: unexpected")
+	return proton.AuthInfo{}, nil
 }
 
 func (c *stubProtonClient) AuthTOTP(_ context.Context, code string) error {
