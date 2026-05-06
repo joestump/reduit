@@ -856,3 +856,96 @@ func TestWizard_Cancel_SoftDeletesPendingAccount(t *testing.T) {
 		t.Errorf("state = %s, want soft_deleted", accts[0].State)
 	}
 }
+
+// TestWizard_Repeatable_SecondRun covers the SPEC-0005 scenario where
+// a user with one active Proton account runs the wizard a second time
+// to add another. The implementation supports this naturally
+// (handleWizardStart picks up an existing pending row owned by the
+// user or creates a new one; the unique (user_id, proton_user_id)
+// constraint only fires on truly-duplicate Proton bindings), but the
+// other tests only exercise first-run shapes. This test pre-seeds an
+// active account and asserts the second run lands a *distinct*
+// second active account with the new proton_user_id.
+//
+// Governing: SPEC-0005 REQ "Add-Proton-Account Wizard" (a user with
+// one or more active Proton accounts MAY run the wizard again to
+// add another); issue #80.
+func TestWizard_Repeatable_SecondRun(t *testing.T) {
+	t.Parallel()
+	f := newWizardFixture(t, 0)
+	c, userID := f.makeUser(t, "sub-second-run", "joe@example.com", "Joe")
+
+	// Pre-seed an active "first" account bound to proton_user_id="first".
+	// The wizard's second run will bind to "second" and the unique
+	// (user_id, proton_user_id) index MUST NOT fire because the pair
+	// is distinct.
+	pre, err := f.accSvc.Create(t.Context(), account.CreateParams{
+		UserID:       userID,
+		ProtonUserID: "first",
+		Email:        "first@protonmail.com",
+	})
+	if err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	if _, err := f.accSvc.Transition(t.Context(), pre.ID, account.StateActive); err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+
+	// Stub the second-run Proton login. UserID="second" so the
+	// SetProtonIdentity write picks a fresh slot in the unique index.
+	stubClient := readyClient()
+	f.stub.push(stubLoginResult{
+		client: stubClient,
+		auth: &proton.Auth{
+			UserID:       "second",
+			UID:          "proton-uid-2",
+			AccessToken:  "proton-access-2",
+			RefreshToken: "proton-refresh-2",
+		},
+	})
+
+	// Run the wizard end-to-end.
+	resp, err := c.Get(f.url + "/accounts/setup")
+	if err != nil {
+		t.Fatalf("GET setup: %v", err)
+	}
+	resp.Body.Close()
+	post(t, c, f.url+"/accounts/setup/auth", url.Values{
+		"username": {"joe-second@protonmail.com"},
+		"password": {"hunter2"},
+	}).Body.Close()
+	resp = post(t, c, f.url+"/accounts/setup/unlock", url.Values{
+		"passphrase": {"my-mailbox-passphrase"},
+	})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("unlock status = %d, want 303", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Location"); got != "/accounts" {
+		t.Errorf("redirect = %q, want /accounts", got)
+	}
+
+	// User now owns two active accounts, one per proton_user_id.
+	// Soft-deleted rows are excluded from this assertion: we want
+	// the second-run path to leave NO collateral pending/soft rows.
+	accts, err := f.accSvc.ListByUser(t.Context(), userID)
+	if err != nil {
+		t.Fatalf("ListByUser: %v", err)
+	}
+	var active []*account.Account
+	for _, a := range accts {
+		if a.State == account.StateActive {
+			active = append(active, a)
+		}
+	}
+	if len(active) != 2 {
+		t.Fatalf("expected 2 active accounts after second-run wizard, got %d (all=%d)", len(active), len(accts))
+	}
+	seen := map[string]bool{}
+	for _, a := range active {
+		seen[a.ProtonUserID] = true
+	}
+	if !seen["first"] || !seen["second"] {
+		t.Errorf("active proton_user_ids = %v, want both first and second", seen)
+	}
+}
