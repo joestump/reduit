@@ -274,6 +274,17 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /accounts/setup/unlock", s.handleWizardUnlock)
 	mux.HandleFunc("POST /accounts/setup/complete", s.handleWizardComplete)
 	mux.HandleFunc("POST /accounts/setup/cancel", s.handleWizardCancel)
+
+	// Per-account actions on the dashboard cards. Each handler
+	// verifies session-bound ownership (or admin) before any state
+	// change. See dashboard_actions.go.
+	//
+	// Governing: SPEC-0005 REQ "Account Dashboard" (Scenario "User
+	// manages account state"); issues #102, #103.
+	mux.HandleFunc("POST /accounts/{id}/delete", s.handleAccountDelete)
+	mux.HandleFunc("POST /accounts/{id}/suspend", s.handleAccountSuspend)
+	mux.HandleFunc("POST /accounts/{id}/reactivate", s.handleAccountReactivate)
+	mux.HandleFunc("POST /accounts/{id}/imap-password/rotate", s.handleAccountIMAPRotate)
 }
 
 // handleHealthz returns 200 OK if the process is up. It does not

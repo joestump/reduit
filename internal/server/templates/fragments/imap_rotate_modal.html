@@ -1,0 +1,63 @@
+{{define "imap_rotate_modal"}}
+<!-- IMAP password rotation result modal. Returned by HTMX from
+     POST /accounts/{id}/imap-password/rotate; the dashboard's
+     hx-target swaps it into <div id="modal-host">. The dialog uses
+     DaisyUI's <dialog class="modal modal-open"> idiom so the modal
+     opens immediately on swap and closes via the form's POST that
+     replaces this fragment with an empty <div id="modal-host">.
+
+     Governing: SPEC-0001 REQ "Per-Account IMAP Password" (rotation
+     plaintext returned for one-time admin-UI display); issues #102,
+     #103. -->
+<div id="modal-host">
+  <dialog class="modal modal-open" id="imap-rotate-dialog">
+    <div class="modal-box max-w-2xl bg-slate-800 border border-slate-700">
+      <div class="flex items-start justify-between mb-4">
+        <div>
+          <h3 class="text-xl font-semibold text-slate-100">New IMAP password</h3>
+          <p class="text-sm text-slate-400 mt-1">{{.AccountLabel}}</p>
+        </div>
+        <span class="badge badge-success">Rotated</span>
+      </div>
+
+      <div class="bg-amber-950/40 border-l-4 border-amber-500 rounded-r-md px-4 py-3 mb-4 text-sm text-slate-200 flex items-start gap-3">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#F59E0B" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="flex-shrink-0 mt-0.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span>Copy this now &mdash; Reduit only stores a one-way hash, so this plaintext is your single chance. Existing IMAP/SMTP sessions for this account will fail at the next auth boundary; clients must re-enter the new password.</span>
+      </div>
+
+      <div class="rounded-lg border border-slate-700 bg-slate-900/60 divide-y divide-slate-700 mb-4">
+        <div class="px-4 py-3 grid grid-cols-3 gap-4 items-baseline">
+          <div class="text-xs uppercase tracking-wide text-slate-500">IMAP server</div>
+          <div class="col-span-2 font-mono text-slate-100">{{.IMAPHost}}<span class="text-slate-500">&nbsp;:&nbsp;</span>{{.IMAPPort}}</div>
+        </div>
+        <div class="px-4 py-3 grid grid-cols-3 gap-4 items-baseline">
+          <div class="text-xs uppercase tracking-wide text-slate-500">SMTP server</div>
+          <div class="col-span-2 font-mono text-slate-100">{{.IMAPHost}}<span class="text-slate-500">&nbsp;:&nbsp;</span>{{.SMTPPort}}</div>
+        </div>
+        <div class="px-4 py-3 grid grid-cols-3 gap-4 items-baseline">
+          <div class="text-xs uppercase tracking-wide text-slate-500">Username</div>
+          <div class="col-span-2 font-mono text-slate-100">{{if .Username}}{{.Username}}{{else}}<span class="text-slate-500">unset</span>{{end}}</div>
+        </div>
+        <div class="px-4 py-3 grid grid-cols-3 gap-4 items-baseline">
+          <div class="text-xs uppercase tracking-wide text-slate-500">Password</div>
+          <div class="col-span-2 font-mono text-slate-100 break-all select-all" data-imap-password>{{.Plaintext}}</div>
+        </div>
+      </div>
+
+      <div class="modal-action">
+        <button type="button"
+                class="btn btn-sm border-slate-700 bg-slate-900 text-slate-200 hover:bg-slate-700"
+                onclick="navigator.clipboard.writeText(this.closest('.modal-box').querySelector('[data-imap-password]').textContent.trim())">
+          Copy password
+        </button>
+        <button type="button"
+                class="btn btn-sm font-semibold text-white"
+                style="background:#4F46E5"
+                onclick="this.closest('#modal-host').innerHTML=''">
+          I've saved this
+        </button>
+      </div>
+    </div>
+  </dialog>
+</div>
+{{end}}
