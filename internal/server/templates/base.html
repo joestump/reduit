@@ -95,3 +95,35 @@
 {{define "icon_logout"}}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>{{end}}
 {{define "icon_plus"}}<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>{{end}}
 {{define "icon_check_shield"}}<svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#4F46E5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L4 5v6c0 5 3.5 9.5 8 11 4.5-1.5 8-6 8-11V5l-8-3z"/><path d="M9 12l2 2 4-4"/></svg>{{end}}
+
+{{/*
+  icon_shield_mountains is the empty-state hero icon used on the
+  /accounts dashboard when the user has zero Proton accounts. It
+  composites the indigo shield-with-checkmark mark in the centre with
+  faint slate-grey mountain silhouettes flanking it -- tying the
+  alpine motif called out in CLAUDE.md's Visual Identity to the
+  brand mark (per the SPEC-0005 mockup at
+  docs/mockups/spec-0005/25-dashboard-empty-first-run.png).
+
+  Wider 0..56 viewBox (vs the bare shield's 0..24) so the mountains
+  can extend beyond the shield's footprint without being clipped.
+  Mountain fill is `slate-700` (#334155) at full opacity -- the same
+  shade as base.html's .surface border, deliberately quiet so the
+  shield reads as the focal element. Heroicons does not ship a
+  composite mark like this, hence the hand-authored SVG (per the
+  issue's "Suggested fix" guidance).
+
+  Governing: SPEC-0005 REQ "Account Dashboard"; PR #72 review (N4).
+*/}}
+{{define "icon_shield_mountains"}}<svg width="160" height="100" viewBox="0 0 56 35" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <!-- Left mountain range -->
+  <path d="M0 30 L8 18 L13 24 L18 14 L24 30 Z" fill="#334155"/>
+  <!-- Right mountain range -->
+  <path d="M32 30 L38 14 L43 24 L48 18 L56 30 Z" fill="#334155"/>
+  <!-- Shield outline (indigo) -->
+  <path d="M28 4 L20 7 V13 C20 18 23.5 22.5 28 24 C32.5 22.5 36 18 36 13 V7 L28 4 Z"
+        stroke="#4F46E5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Checkmark inside shield -->
+  <path d="M25 13 L27 15 L31 11"
+        stroke="#4F46E5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>{{end}}
