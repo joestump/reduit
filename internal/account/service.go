@@ -230,6 +230,12 @@ type transitionReg struct {
 // attribute, so the admin allowlist is not passed here -- it lives
 // at the session layer (computed at session-bind time from
 // OIDC_ADMIN_SUBS per SPEC-0001 REQ "Admin Status").
+//
+// Panics if s or s.DB is nil. New is a boot-time call (wiring in
+// main); a missing store is a programmer error the caller cannot
+// meaningfully recover from, so this returns no error and crashes
+// loudly at startup rather than threading a (Service, error) pair
+// through every call site.
 func New(s *store.Store, master cryptenv.MasterKey) Service {
 	if s == nil || s.DB == nil {
 		panic("account: New called with nil store")

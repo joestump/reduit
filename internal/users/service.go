@@ -76,6 +76,12 @@ type service struct {
 
 // New constructs a Service backed by the given store. The Service
 // does not take ownership of the store -- the caller closes it.
+//
+// Panics if s or s.DB is nil. New is a boot-time call (wiring in
+// main); a missing store is a programmer error the caller cannot
+// meaningfully recover from, so this returns no error and crashes
+// loudly at startup rather than threading a (Service, error) pair
+// through every call site.
 func New(s *store.Store) Service {
 	if s == nil || s.DB == nil {
 		panic("users: New called with nil store")
