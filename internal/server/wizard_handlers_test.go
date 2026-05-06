@@ -431,16 +431,22 @@ func TestWizard_HappyPath_NoTwoFA(t *testing.T) {
 		t.Errorf("expected unlock screen; got body excerpt=%s", body[:min(len(body), 500)])
 	}
 
-	// Step 3 submit: passphrase -> success -> redirect to /accounts.
+	// Step 3 submit: passphrase -> success -> Done page (issue #104).
+	// The wizard now renders the IMAP password before redirecting; a
+	// follow-up POST /accounts/setup/complete drops the session and
+	// redirects to /accounts.
 	resp = post(t, c, f.url+"/accounts/setup/unlock", url.Values{
 		"passphrase": {"my-mailbox-passphrase"},
 	})
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("unlock status = %d, want 303", resp.StatusCode)
+	body = readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unlock status = %d, body=%s", resp.StatusCode, body)
 	}
-	if got := resp.Header.Get("Location"); got != "/accounts" {
-		t.Errorf("redirect = %q, want /accounts", got)
+	if !strings.Contains(body, "Set up your mail client") {
+		t.Errorf("expected Done page; body excerpt=%s", body[:min(len(body), 600)])
+	}
+	if !strings.Contains(body, "data-imap-password") {
+		t.Errorf("expected IMAP password block on Done page; body excerpt=%s", body[:min(len(body), 600)])
 	}
 
 	accts, _ := f.accSvc.ListByUser(t.Context(), userID)
@@ -479,10 +485,33 @@ func TestWizard_HappyPath_NoTwoFA(t *testing.T) {
 
 	// Wizard commit-success path doesn't fire upstream Logout (we
 	// keep the session alive so the supervisor can adopt the tokens).
-	// What we DO want is that the wizard store no longer holds the
-	// session.
+	// Issue #104: the wizard session is held open across the Done
+	// step so the IMAP password stays renderable across a refresh;
+	// it gets dropped when the user POSTs to /complete.
+	if _, ok := f.wizards.Get(a.ID); !ok {
+		t.Error("wizard session dropped before Done step; want still in store")
+	}
+
+	// IMAP password was generated and persisted; the alias is set.
+	if !a.HasIMAPPassword {
+		t.Error("IMAP password not persisted")
+	}
+	if a.PrimaryAlias == "" {
+		t.Error("primary alias not assigned at commit time")
+	}
+
+	// Now complete the wizard. The session should be dropped and
+	// the user redirected to the dashboard.
+	resp = post(t, c, f.url+"/accounts/setup/complete", url.Values{})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("complete status = %d, want 303", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Location"); got != "/accounts" {
+		t.Errorf("redirect = %q, want /accounts", got)
+	}
 	if _, ok := f.wizards.Get(a.ID); ok {
-		t.Error("wizard session still in store after commit; want dropped")
+		t.Error("wizard session still in store after complete; want dropped")
 	}
 }
 
@@ -551,18 +580,28 @@ func TestWizard_HappyPath_WithTOTP(t *testing.T) {
 		t.Errorf("totpCalls = %v, want [123456]", got)
 	}
 
-	// Unlock submit -> redirect.
+	// Unlock submit -> Done page (issue #104).
 	resp = post(t, c, f.url+"/accounts/setup/unlock", url.Values{
 		"passphrase": {"my-mailbox-passphrase"},
 	})
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("unlock status = %d, want 303", resp.StatusCode)
+	body = readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unlock status = %d, body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "Set up your mail client") {
+		t.Errorf("expected Done page; body excerpt=%s", body[:min(len(body), 600)])
 	}
 
 	accts, _ := f.accSvc.ListByUser(t.Context(), userID)
 	if len(accts) != 1 || accts[0].State != account.StateActive {
 		t.Errorf("expected one active account, got %v", accts)
+	}
+
+	// Complete the wizard.
+	resp = post(t, c, f.url+"/accounts/setup/complete", url.Values{})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("complete status = %d, want 303", resp.StatusCode)
 	}
 }
 
@@ -917,9 +956,18 @@ func TestWizard_Repeatable_SecondRun(t *testing.T) {
 	resp = post(t, c, f.url+"/accounts/setup/unlock", url.Values{
 		"passphrase": {"my-mailbox-passphrase"},
 	})
+	body := readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unlock status = %d, body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(body, "Set up your mail client") {
+		t.Errorf("expected Done page; body excerpt=%s", body[:min(len(body), 600)])
+	}
+	// Complete to drop the wizard session and land on the dashboard.
+	resp = post(t, c, f.url+"/accounts/setup/complete", url.Values{})
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("unlock status = %d, want 303", resp.StatusCode)
+		t.Fatalf("complete status = %d, want 303", resp.StatusCode)
 	}
 	if got := resp.Header.Get("Location"); got != "/accounts" {
 		t.Errorf("redirect = %q, want /accounts", got)

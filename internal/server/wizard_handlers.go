@@ -89,11 +89,20 @@ const maxFormFieldBytes = 4096
 type wizardPageData struct {
 	pageData
 	Step          int
-	Stage         string // "credentials", "totp", "unlock", "aborted"
+	Stage         string // "credentials", "totp", "unlock", "done", "aborted"
 	Email         string
 	ErrorMessage  string
 	StateExpires  string
 	StepIndicator []wizardStepIndicator
+	// Done-stage fields. Populated only when Stage == "done"; the
+	// template branches on .Stage so they're zero-valued otherwise.
+	// IMAPPassword is the freshly-generated plaintext for one-time
+	// display per SPEC-0001 REQ "Per-Account IMAP Password".
+	IMAPPassword string
+	IMAPUsername string
+	IMAPHost     string
+	IMAPPort     int
+	SMTPPort     int
 }
 
 type wizardStepIndicator struct {
@@ -103,12 +112,15 @@ type wizardStepIndicator struct {
 	Last  bool   // true on the rightmost step; the template skips its trailing connector
 }
 
-// stepIndicatorFor renders the 3-step header given the current stage.
+// stepIndicatorFor renders the 4-step header given the current stage.
 // The spec/mockup show 5 visual steps (Credentials → Two-factor →
-// Mailbox key → Label sync → Done), but this PR only ships handlers
-// for the first three and redirects to /accounts on success. Render
-// only the steps that match real handler stages so the indicator
-// doesn't dangle on "step 3 of 5" forever.
+// Mailbox key → Label sync → Done); the Label-sync visual step is
+// still future work, but issue #104 introduces the Done step so the
+// operator sees the freshly generated IMAP password before the wizard
+// closes. Render only the steps that match real handler stages so the
+// indicator doesn't dangle on "step 4 of 5" forever.
+//
+// Governing: SPEC-0005 REQ "Add-Proton-Account Wizard"; issue #104.
 func stepIndicatorFor(stage WizardStage) []wizardStepIndicator {
 	cur := 1
 	switch stage {
@@ -118,8 +130,10 @@ func stepIndicatorFor(stage WizardStage) []wizardStepIndicator {
 		cur = 2
 	case WizardStageUnlock:
 		cur = 3
+	case WizardStageDone:
+		cur = 4
 	}
-	labels := []string{"Credentials", "Two-factor", "Mailbox key"}
+	labels := []string{"Credentials", "Two-factor", "Mailbox key", "Mail client"}
 	out := make([]wizardStepIndicator, len(labels))
 	for i, label := range labels {
 		state := "pending"
@@ -229,9 +243,34 @@ func (s *Server) renderWizard(w http.ResponseWriter, r *http.Request, sess *Wiza
 	}
 	stage := WizardStageCredentials
 	username := ""
+	imapPassword := ""
+	imapUsername := ""
+	imapHost := ""
 	if sess != nil {
+		// renderWizard is invoked from two shapes: handlers that
+		// already hold sess.Lock() across a read-modify-write
+		// sequence, and handlers (handleWizardStart, the resume
+		// path) that arrive with no lock. The Mutex is reentrant-
+		// hostile, so we cannot blindly Lock here. Snapshot via a
+		// separate helper that only acquires when the caller is
+		// holding the lock externally is overkill -- the races we
+		// care about (concurrent /complete dropping the session)
+		// are protected by the wizard store's own map mutex (Drop
+		// removes the entry before we'd ever read stale fields,
+		// and Get returns the same pointer pre-Drop). The fields
+		// we read are only ever mutated inside the per-session
+		// lock by handlers that have just resolved the same
+		// pointer; once a handler sets stage and calls Put the
+		// state is stable until the next handler. This race
+		// surface is identical to what the pre-#104 wizard
+		// already shipped with for Username/Stage; #104 just
+		// adds three more fields (IMAPPassword, PrimaryAlias,
+		// MailHost) with the same lifecycle.
 		stage = sess.Stage
 		username = sess.Username
+		imapPassword = sess.IMAPPassword
+		imapUsername = sess.PrimaryAlias
+		imapHost = sess.MailHost
 	}
 	stageName := "credentials"
 	switch stage {
@@ -239,6 +278,8 @@ func (s *Server) renderWizard(w http.ResponseWriter, r *http.Request, sess *Wiza
 		stageName = "totp"
 	case WizardStageUnlock:
 		stageName = "unlock"
+	case WizardStageDone:
+		stageName = "done"
 	}
 	data := wizardPageData{
 		pageData: pageData{
@@ -252,6 +293,11 @@ func (s *Server) renderWizard(w http.ResponseWriter, r *http.Request, sess *Wiza
 		ErrorMessage:  errMsg,
 		StateExpires:  "Session expires in 30 min",
 		StepIndicator: stepIndicatorFor(stage),
+		IMAPPassword:  imapPassword,
+		IMAPUsername:  imapUsername,
+		IMAPHost:      imapHost,
+		IMAPPort:      993,
+		SMTPPort:      465,
 	}
 	s.renderPage(w, r, "wizard", data)
 }
@@ -600,16 +646,143 @@ func (s *Server) handleWizardUnlock(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Commit success: the live proton session is no longer needed.
-	// Drop wizard state, clear the SCS key, redirect home.
-	s.deps.WizardSessions.Drop(accountID)
-	s.deps.SessionManager.Remove(r.Context(), wizardSessionKey)
-
+	// Commit succeeded: the account is now StateActive and the
+	// supervisor callback has fired. Before redirecting we generate
+	// the per-account IMAP/SMTP password and pin a SASL primary
+	// alias so the operator can copy them into a mail client. The
+	// wizard session is held open across the Done step so a refresh
+	// renders the same plaintext rather than re-rotating; the
+	// transition to active happened above so a re-rotation here
+	// would only be a UI annoyance, but keeping the plaintext stable
+	// across refresh is also what the spec calls for.
+	//
+	// Governing: SPEC-0001 REQ "Per-Account IMAP Password";
+	// SPEC-0005 REQ "Add-Proton-Account Wizard"; issue #104.
 	s.deps.Logger.Info("wizard/unlock: account active",
 		slog.String("account_id", accountID),
 		slog.String("user_id", id.UserID))
 
+	if err := s.finishWizardSetup(r, sess); err != nil {
+		s.deps.Logger.Error("wizard/unlock: finish setup",
+			slog.String("account_id", accountID),
+			slog.String("error", err.Error()))
+		// The account is already active; drop the wizard so the
+		// operator can recover via the dashboard's rotate-password
+		// action instead of getting stuck on a half-rendered Done
+		// screen. The dashboard recovery path is issue #103.
+		s.deps.WizardSessions.Drop(accountID)
+		s.deps.SessionManager.Remove(r.Context(), wizardSessionKey)
+		http.Redirect(w, r, "/accounts", http.StatusSeeOther)
+		return
+	}
+
+	sess.Stage = WizardStageDone
+	s.deps.WizardSessions.Put(sess)
+	s.renderWizard(w, r, sess, "")
+}
+
+// finishWizardSetup runs the post-active provisioning step: generate
+// + persist the IMAP password and assign the SASL primary alias. The
+// plaintext password is captured on the *WizardSession and returned
+// (logically) to the rendering path; we never log or write it
+// elsewhere. Idempotent on the alias side (collision returns the
+// account already exists error and we surface it as a server-side
+// failure since the alias is derived deterministically from the Proton
+// email -- a true collision would mean two different Proton accounts
+// sharing the same local part, which is a future-multi-tenancy issue
+// outside this scope).
+//
+// Governing: SPEC-0001 REQ "Per-Account IMAP Password" (rotation
+// returns the plaintext for one-time display); SPEC-0003 REQ
+// "SASL PLAIN With user@host Identity"; issue #104.
+func (s *Server) finishWizardSetup(r *http.Request, sess *WizardSession) error {
+	// Derive the primary alias from the Proton email's local part
+	// and the host portion of the request's Host header. r.Host is
+	// the operator's chosen Reduit hostname (e.g.
+	// "reduit.family.tld"), which matches the visual-identity
+	// mockup convention. We strip any port and lower-case both
+	// sides; SetPrimaryAlias normalises again so this is belt-and-
+	// suspenders.
+	local := localPartOf(sess.Username)
+	host := mailHostFromRequest(r)
+	alias := ""
+	if local != "" && host != "" {
+		alias = local + "@" + host
+		if err := s.deps.AccountService.SetPrimaryAlias(r.Context(), sess.AccountID, alias); err != nil {
+			return fmt.Errorf("set primary alias: %w", err)
+		}
+	}
+
+	pw, err := s.deps.AccountService.RotateIMAPPassword(r.Context(), sess.AccountID)
+	if err != nil {
+		return fmt.Errorf("rotate imap password: %w", err)
+	}
+	sess.IMAPPassword = pw
+	sess.PrimaryAlias = alias
+	sess.MailHost = host
+	return nil
+}
+
+// handleWizardComplete handles POST /accounts/setup/complete. Drops
+// the wizard session (clearing the in-memory plaintext IMAP password)
+// and redirects to the dashboard. Idempotent: if no Done-stage
+// session is in flight we still redirect, so a stale tab POST does
+// not surface as an error.
+//
+// Governing: SPEC-0005 REQ "Add-Proton-Account Wizard"; issue #104.
+func (s *Server) handleWizardComplete(w http.ResponseWriter, r *http.Request) {
+	if !s.wizardReady(w) {
+		return
+	}
+	id, ok := s.requireUser(w, r)
+	if !ok {
+		return
+	}
+	accountID, sess, hasSession := s.resolveWizardSession(r, id.UserID)
+	if hasSession && sess.Stage == WizardStageDone {
+		// Wipe the in-memory plaintext before dropping the entry
+		// so a future heap dump can't recover it from the *Session
+		// even after the map slot is freed.
+		sess.Lock()
+		sess.IMAPPassword = ""
+		sess.Unlock()
+	}
+	if hasSession || accountID != "" {
+		s.deps.WizardSessions.Drop(accountID)
+		s.deps.SessionManager.Remove(r.Context(), wizardSessionKey)
+	}
 	http.Redirect(w, r, "/accounts", http.StatusSeeOther)
+}
+
+// localPartOf returns the substring of email before the first '@',
+// or the empty string if email contains no '@'.
+func localPartOf(email string) string {
+	at := strings.IndexByte(email, '@')
+	if at <= 0 {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(email[:at]))
+}
+
+// mailHostFromRequest returns the bare host portion of r.Host (i.e.
+// strip any ":port" suffix), lower-cased. This is the operator's
+// chosen Reduit hostname -- the same value the operator types into
+// their browser to reach this wizard -- which matches the SASL
+// "user@host" identity that mail clients will use against the IMAPS/
+// SMTPS listeners.
+//
+// Falls back to the empty string when r.Host is empty (which would
+// indicate a misbehaving HTTP/1.0 client; the wizard handler caller
+// will skip alias assignment in that case).
+func mailHostFromRequest(r *http.Request) string {
+	host := r.Host
+	if host == "" {
+		return ""
+	}
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(host))
 }
 
 // errWizardUnlock is the sentinel returned by commitWizard when the

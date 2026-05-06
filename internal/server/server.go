@@ -272,6 +272,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /accounts/setup/auth", s.handleWizardAuth)
 	mux.HandleFunc("POST /accounts/setup/2fa", s.handleWizardTOTP)
 	mux.HandleFunc("POST /accounts/setup/unlock", s.handleWizardUnlock)
+	mux.HandleFunc("POST /accounts/setup/complete", s.handleWizardComplete)
 	mux.HandleFunc("POST /accounts/setup/cancel", s.handleWizardCancel)
 }
 
