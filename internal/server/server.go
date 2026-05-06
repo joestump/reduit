@@ -234,6 +234,15 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /readyz", s.handleReadyz)
 
+	// Favicon, served from the embedded static FS. Allowlisted (see
+	// auth.Allowlist) so a logged-out browser hitting /auth/login can
+	// fetch the brand mark without 302-looping through the session
+	// gate. Cosmetic asset; long Cache-Control acceptable per the
+	// issue's "Suggested fix" guidance.
+	//
+	// Governing: SPEC-0005 REQ "Authentication Gating"; issue #77.
+	mux.HandleFunc("GET /favicon.svg", s.handleFavicon)
+
 	// Root path: 302 to /accounts. Without this, an authenticated
 	// browser landing on `/` (e.g., after a login that captured
 	// `?return_to=/` from a stale link, or an operator typing the
@@ -288,4 +297,18 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = fmt.Fprintln(w, "ready")
+}
+
+// handleFavicon serves the embedded brand-mark SVG. The bytes are
+// loaded into memory at package init so the hot path is a single
+// Write. Cache-Control: 24h is plenty for a near-static brand mark
+// and lets browsers re-use the cached copy across navigations
+// without revalidation.
+//
+// Method match (`GET /favicon.svg`) is enforced by the mux pattern
+// itself in Go 1.22+; no method check needed in the handler.
+func (s *Server) handleFavicon(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "image/svg+xml")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write(faviconBytes)
 }

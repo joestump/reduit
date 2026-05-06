@@ -43,6 +43,14 @@ func TestIsAllowlisted(t *testing.T) {
 		{"/static/img/logo.svg", true},
 		{"/static", true},
 		{"/static/", true}, // edge: bare prefix with slash
+		{"/favicon.svg", true},
+		// /favicon.ico (no SVG suffix) is NOT allowlisted -- the
+		// brand mark ships as SVG only; a request for the .ico
+		// variant should bounce through the auth gate like any
+		// other unknown path. Pinning the absence of an exact .ico
+		// match catches a future regression that broadens the
+		// allowlist to a /favicon* prefix.
+		{"/favicon.ico", false},
 		{"/", false},
 		{"/accounts", false},
 		{"/healthz.json", false},  // exact match required for non-prefix entries

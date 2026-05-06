@@ -333,3 +333,42 @@ func TestDashboard_AdminViewPaginatesWhenOverThreshold(t *testing.T) {
 func fmtSeedID(prefix string, i int) string {
 	return prefix + string(rune('0'+i/10)) + string(rune('0'+i%10))
 }
+
+// TestFavicon_ServedUnauthenticatedWithSvgContentType pins the
+// allowlisted brand-mark route. The favicon must be reachable by an
+// unauthenticated browser (so /auth/login can render with the brand
+// mark visible) and must serve image/svg+xml so browsers actually
+// render the embedded SVG rather than treating it as text/plain.
+//
+// Governing: SPEC-0005 REQ "Authentication Gating"; issue #77.
+func TestFavicon_ServedUnauthenticatedWithSvgContentType(t *testing.T) {
+	t.Parallel()
+	baseURL, _, _, _ := dashboardTestServer(t, nil)
+
+	// Redirect-disabled client so a regression that drops the
+	// allowlist surfaces as the gate's 302 rather than a transparent
+	// follow-through that ends in a 200 from the login page.
+	c := newClient(t)
+	c.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := c.Get(baseURL + "/favicon.svg")
+	if err != nil {
+		t.Fatalf("GET /favicon.svg: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 (a 302 here means the allowlist regressed)", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Type"); got != "image/svg+xml" {
+		t.Errorf("Content-Type = %q, want image/svg+xml", got)
+	}
+	if got := resp.Header.Get("Cache-Control"); !strings.Contains(got, "max-age=") {
+		t.Errorf("Cache-Control = %q, want a max-age directive", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "<svg") {
+		t.Errorf("body does not look like SVG (first 80 bytes: %q)", string(body[:min(len(body), 80)]))
+	}
+}
