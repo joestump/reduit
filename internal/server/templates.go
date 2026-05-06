@@ -31,6 +31,41 @@ import (
 //go:embed templates/*.html
 var templateFS embed.FS
 
+// staticFS embeds the small set of brand-mark assets the layout
+// needs (favicon, etc.). Lives in this file because //go:embed
+// directives compile against the surrounding package; there is no
+// separate static subpackage today.
+//
+// Routes that serve from staticFS (currently /favicon.svg) are
+// allowlisted so an unauthenticated browser can fetch them on the
+// login page -- mirrors how auth.Allowlist handles /static/*.
+//
+// Governing: SPEC-0005 REQ "Authentication Gating" (Allowlist
+// bypasses auth -- the favicon is unprivileged brand-mark content).
+//
+//go:embed static/favicon.svg
+var staticFS embed.FS
+
+// faviconBytes is the favicon payload read once at package init so
+// the handler hot path is a single Write rather than an embed.FS
+// round trip per request. The asset is small (a couple hundred
+// bytes) and the same bytes for every request, so caching the slice
+// is cheap and keeps the handler trivially correct.
+var faviconBytes []byte
+
+func init() {
+	b, err := staticFS.ReadFile("static/favicon.svg")
+	if err != nil {
+		// embed.FS reports "file not found" only when the //go:embed
+		// pattern matched no files -- a build-time wiring error. If
+		// we hit it at runtime the binary is corrupt; the favicon is
+		// non-load-bearing for service correctness, but the panic
+		// message is loud enough to surface quickly.
+		panic("server: read embedded favicon: " + err.Error())
+	}
+	faviconBytes = b
+}
+
 // templateSet holds one parsed *template.Template per page. Each tree
 // contains base.html plus one page-specific file, so each page's
 // {{define "content"}} block is the only one in its tree -- we don't

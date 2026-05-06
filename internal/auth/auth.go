@@ -56,6 +56,13 @@ var Allowlist = []string{
 	// stale browser tab would redirect-loop through /auth/login.
 	"/auth/logout",
 	"/static/*",
+	// /favicon.svg is allowlisted so the brand mark loads on the
+	// pre-login /auth/login page without 302-looping through the
+	// gate. Cosmetic, unprivileged asset; same treatment as
+	// /static/*.
+	//
+	// Governing: SPEC-0005 REQ "Authentication Gating"; issue #77.
+	"/favicon.svg",
 }
 
 // IsAllowlisted reports whether path is exempt from auth gating.
