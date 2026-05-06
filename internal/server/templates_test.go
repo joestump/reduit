@@ -55,16 +55,23 @@ func TestInitialsFor(t *testing.T) {
 func TestFormatLastSync(t *testing.T) {
 	t.Parallel()
 	now := time.Now()
+	ptr := func(t time.Time) *time.Time { return &t }
 	for _, tc := range []struct {
 		name string
-		in   time.Time
+		in   *time.Time
 		want string
 	}{
-		{"zero", time.Time{}, "Never"},
-		{"30s ago", now.Add(-30 * time.Second), "just now"},
-		{"5m ago", now.Add(-5 * time.Minute), "5 min ago"},
-		{"3h ago", now.Add(-3 * time.Hour), "3 hr ago"},
-		{"5d ago", now.Add(-5 * 24 * time.Hour), "5 days ago"},
+		// nil and the zero value both render as "Never": a fresh row
+		// has not yet been synced, and -- until the sync worker (#19)
+		// lands -- every row has nil here. Pinning both inputs to the
+		// same string makes a future regression that confuses the two
+		// fail loudly.
+		{"nil", nil, "Never"},
+		{"zero", ptr(time.Time{}), "Never"},
+		{"30s ago", ptr(now.Add(-30 * time.Second)), "just now"},
+		{"5m ago", ptr(now.Add(-5 * time.Minute)), "5 min ago"},
+		{"3h ago", ptr(now.Add(-3 * time.Hour)), "3 hr ago"},
+		{"5d ago", ptr(now.Add(-5 * 24 * time.Hour)), "5 days ago"},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {

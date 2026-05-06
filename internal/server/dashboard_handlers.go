@@ -197,7 +197,7 @@ func toCard(a *account.Account) accountCard {
 		State:           string(a.State),
 		StateLabel:      stateLabel,
 		StateBadgeClass: badge,
-		LastSync:        formatLastSync(a.UpdatedAt),
+		LastSync:        formatLastSync(a.LastSyncAt),
 	}
 }
 
@@ -216,17 +216,26 @@ func stateBadge(s account.State) (label, class string) {
 	}
 }
 
-// formatLastSync renders an account's UpdatedAt as a coarse "X min
-// ago" string. Used by the cards' "Last sync" stat. We use UpdatedAt
-// rather than a dedicated last_sync_at column because the existing
-// schema mutates updated_at on every sync-state advance (per
-// internal/account.SetSyncState). When a per-account last_sync_at
-// column lands, swap this over.
-func formatLastSync(t time.Time) string {
-	if t.IsZero() {
+// formatLastSync renders an account's LastSyncAt as a coarse "X min
+// ago" string. Used by the cards' "Last sync" stat.
+//
+// nil (and the zero value, defensively) renders as "Never": the sync
+// worker has not yet committed a cursor for this account, which is
+// the expected state on a fresh row -- and on every row until the
+// sync worker (#19) lands and starts populating last_sync_at via
+// account.SetSyncState. Showing "Never" until then is the correct,
+// honest display; the previous implementation read account.UpdatedAt
+// as a stand-in and showed misleadingly recent timestamps for any
+// row touched by a non-sync write (suspend, alias change, IMAP-password
+// rotation, ...).
+//
+// Governing: SPEC-0005 REQ "Account Dashboard"
+// ("Last sync" stat reflects last cursor advance, not last row mutation).
+func formatLastSync(t *time.Time) string {
+	if t == nil || t.IsZero() {
 		return "Never"
 	}
-	d := time.Since(t)
+	d := time.Since(*t)
 	switch {
 	case d < time.Minute:
 		return "just now"

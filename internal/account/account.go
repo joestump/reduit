@@ -75,5 +75,21 @@ type Account struct {
 	Crashed      bool
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
-	DeletedAt    *time.Time
+	// LastSyncAt is the wall-clock time of the most recent successful
+	// sync-cursor advance for this account. nil means the sync worker
+	// has never committed a cursor for the account since it was
+	// created -- e.g. a freshly-provisioned row, or any row that
+	// predates the sync worker landing (#19).
+	//
+	// The sync worker (SPEC-0002) bumps this column atomically with
+	// the cursor write in account.SetSyncState. UpdatedAt is NOT a
+	// substitute: it is touched by every state change (suspend,
+	// alias change, IMAP-password rotation, ...) and would otherwise
+	// show a misleadingly recent "Last sync" on the dashboard for an
+	// account that hasn't actually synced in days.
+	//
+	// Governing: SPEC-0005 REQ "Account Dashboard", SPEC-0002 REQ
+	// "Event Cursor Persistence".
+	LastSyncAt *time.Time
+	DeletedAt  *time.Time
 }
