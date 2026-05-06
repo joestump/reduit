@@ -28,7 +28,7 @@ import (
 	"github.com/joestump/reduit/internal/auth/session"
 )
 
-//go:embed templates/*.html
+//go:embed templates/*.html templates/fragments/*.html
 var templateFS embed.FS
 
 // staticFS embeds the small set of brand-mark assets the layout
@@ -72,11 +72,17 @@ func init() {
 // have to fight Go's "last-define-wins" semantics when more than one
 // page wants its own content slot.
 //
+// Fragments live in templates/fragments/ and are parsed standalone
+// (no base.html wrap) so HTMX endpoints can return targeted HTML
+// snippets without the chrome. Lookup is by file basename (sans
+// .html) for both pages and fragments.
+//
 // Lookup is by page name (the bare filename, sans .html). renderPage
 // takes the page name explicitly so a typo surfaces as a 500 with a
 // log line, not as the wrong page rendering silently.
 type templateSet struct {
-	pages map[string]*template.Template
+	pages     map[string]*template.Template
+	fragments map[string]*template.Template
 }
 
 func (ts *templateSet) get(name string) (*template.Template, bool) {
@@ -84,6 +90,16 @@ func (ts *templateSet) get(name string) (*template.Template, bool) {
 		return nil, false
 	}
 	t, ok := ts.pages[name]
+	return t, ok
+}
+
+// getFragment returns a parsed fragment (no base wrap) by basename.
+// Used by HTMX endpoints that respond with a partial HTML snippet.
+func (ts *templateSet) getFragment(name string) (*template.Template, bool) {
+	if ts == nil {
+		return nil, false
+	}
+	t, ok := ts.fragments[name]
 	return t, ok
 }
 
@@ -97,7 +113,10 @@ func loadTemplates() (*templateSet, error) {
 	if err != nil {
 		return nil, fmt.Errorf("server: read templates dir: %w", err)
 	}
-	ts := &templateSet{pages: make(map[string]*template.Template)}
+	ts := &templateSet{
+		pages:     make(map[string]*template.Template),
+		fragments: make(map[string]*template.Template),
+	}
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -113,6 +132,27 @@ func loadTemplates() (*templateSet, error) {
 		}
 		ts.pages[page] = t
 	}
+
+	// Fragments: standalone HTMX snippets, no base wrap.
+	fragEntries, err := fs.ReadDir(templateFS, "templates/fragments")
+	if err == nil {
+		for _, e := range fragEntries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if !strings.HasSuffix(name, ".html") {
+				continue
+			}
+			frag := strings.TrimSuffix(name, ".html")
+			t, err := template.New("").ParseFS(templateFS, "templates/fragments/"+name)
+			if err != nil {
+				return nil, fmt.Errorf("server: parse fragment %s: %w", name, err)
+			}
+			ts.fragments[frag] = t
+		}
+	}
+
 	return ts, nil
 }
 

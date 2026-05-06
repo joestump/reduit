@@ -1,4 +1,9 @@
 {{define "content"}}
+<!-- HTMX swap target for the rotate-IMAP-password modal fragment.
+     Empty by default; populated by POST /accounts/{id}/imap-password/
+     rotate. Issues #102, #103. -->
+<div id="modal-host"></div>
+
 {{if .Empty}}
   <!-- Empty state per SPEC-0005 REQ "Account Dashboard" Scenario
        "User with zero accounts lands on the wizard or empty state". -->
@@ -82,6 +87,104 @@
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
               </a>
             </div>
+          {{else if eq .State "active"}}
+            <!-- Active card actions per SPEC-0005 REQ "Account Dashboard"
+                 Scenario "User manages account state". The Rotate IMAP
+                 password button uses HTMX to swap the result modal into
+                 #modal-host without a full-page reload; Discard and
+                 Suspend each open a confirm <dialog> first since they
+                 are irreversible-ish. Issues #102, #103. -->
+            <div class="flex flex-wrap items-center justify-end gap-3 pt-4 mt-4 border-t border-slate-700 text-sm">
+              <button type="button"
+                      class="px-3 py-1.5 rounded-md text-slate-300 hover:bg-slate-700"
+                      hx-post="/accounts/{{.ID}}/imap-password/rotate"
+                      hx-target="#modal-host"
+                      hx-swap="outerHTML">
+                Rotate IMAP password
+              </button>
+              <button type="button"
+                      class="px-3 py-1.5 rounded-md text-slate-300 hover:bg-slate-700"
+                      onclick="document.getElementById('suspend-{{.ID}}').showModal()">
+                Suspend
+              </button>
+              <button type="button"
+                      class="px-3 py-1.5 rounded-md text-rose-300 hover:bg-rose-950/30"
+                      onclick="document.getElementById('discard-{{.ID}}').showModal()">
+                Discard
+              </button>
+            </div>
+            <dialog id="suspend-{{.ID}}" class="modal">
+              <div class="modal-box bg-slate-800 border border-slate-700">
+                <h3 class="text-lg font-semibold text-slate-100 mb-2">Suspend this account?</h3>
+                <p class="text-sm text-slate-400 mb-4 leading-relaxed">
+                  Suspending {{.Label}} drops every IMAP/SMTP session and stops
+                  syncing new mail until you reactivate. Existing mail stays
+                  in place; nothing is deleted.
+                </p>
+                <form method="POST" action="/accounts/{{.ID}}/suspend" class="flex items-center justify-end gap-3">
+                  <button type="button"
+                          class="px-3 py-1.5 rounded-md text-slate-400 hover:text-slate-200"
+                          onclick="document.getElementById('suspend-{{.ID}}').close()">Cancel</button>
+                  <button type="submit"
+                          class="px-3 py-1.5 rounded-md font-medium text-white"
+                          style="background:#F59E0B">Suspend</button>
+                </form>
+              </div>
+              <form method="dialog" class="modal-backdrop"><button>close</button></form>
+            </dialog>
+            <dialog id="discard-{{.ID}}" class="modal">
+              <div class="modal-box bg-slate-800 border border-slate-700">
+                <h3 class="text-lg font-semibold text-slate-100 mb-2">Remove this account?</h3>
+                <p class="text-sm text-slate-400 mb-4 leading-relaxed">
+                  Discarding {{.Label}} soft-deletes the row. Mail and credentials
+                  are kept until the retention sweep purges them; the account
+                  stops syncing immediately and disappears from this dashboard.
+                </p>
+                <form method="POST" action="/accounts/{{.ID}}/delete" class="flex items-center justify-end gap-3">
+                  <button type="button"
+                          class="px-3 py-1.5 rounded-md text-slate-400 hover:text-slate-200"
+                          onclick="document.getElementById('discard-{{.ID}}').close()">Cancel</button>
+                  <button type="submit"
+                          class="px-3 py-1.5 rounded-md font-medium text-white"
+                          style="background:#F43F5E">Discard</button>
+                </form>
+              </div>
+              <form method="dialog" class="modal-backdrop"><button>close</button></form>
+            </dialog>
+          {{else if eq .State "suspended"}}
+            <!-- Suspended card actions: reactivate or discard. Issue #102. -->
+            <div class="flex items-center justify-end gap-3 pt-4 mt-4 border-t border-slate-700 text-sm">
+              <button type="button"
+                      class="px-3 py-1.5 rounded-md text-rose-300 hover:bg-rose-950/30"
+                      onclick="document.getElementById('discard-{{.ID}}').showModal()">
+                Discard
+              </button>
+              <form method="POST" action="/accounts/{{.ID}}/reactivate" class="m-0">
+                <button type="submit"
+                        class="px-3 py-1.5 rounded-md font-medium text-white inline-flex items-center gap-1.5"
+                        style="background:#10B981">
+                  Reactivate
+                </button>
+              </form>
+            </div>
+            <dialog id="discard-{{.ID}}" class="modal">
+              <div class="modal-box bg-slate-800 border border-slate-700">
+                <h3 class="text-lg font-semibold text-slate-100 mb-2">Remove this account?</h3>
+                <p class="text-sm text-slate-400 mb-4 leading-relaxed">
+                  Discarding {{.Label}} soft-deletes the row. Mail and credentials
+                  are kept until the retention sweep purges them.
+                </p>
+                <form method="POST" action="/accounts/{{.ID}}/delete" class="flex items-center justify-end gap-3">
+                  <button type="button"
+                          class="px-3 py-1.5 rounded-md text-slate-400 hover:text-slate-200"
+                          onclick="document.getElementById('discard-{{.ID}}').close()">Cancel</button>
+                  <button type="submit"
+                          class="px-3 py-1.5 rounded-md font-medium text-white"
+                          style="background:#F43F5E">Discard</button>
+                </form>
+              </div>
+              <form method="dialog" class="modal-backdrop"><button>close</button></form>
+            </dialog>
           {{end}}
         </div>
       {{end}}
