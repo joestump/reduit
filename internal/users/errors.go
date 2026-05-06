@@ -10,3 +10,15 @@ import "errors"
 //
 // Governing: SPEC-0005 REQ "OIDC Login Flow".
 var ErrUserNotFound = errors.New("users: not found")
+
+// ErrUserAlreadyExists is returned by repository.insert when the
+// users.oidc_subject UNIQUE constraint trips. Service.Upsert uses
+// this as the explicit signal to take the lookup-and-update race
+// fallback path -- any OTHER insert error is a real driver/FK
+// problem and propagates directly so logs distinguish "race lost"
+// (expected, frequent during concurrent first logins) from "real
+// failure" (alert-worthy).
+//
+// Governing: SPEC-0005 REQ "OIDC Login Flow"; mirrors the typed
+// error pattern in internal/account/repository.go.
+var ErrUserAlreadyExists = errors.New("users: already exists")

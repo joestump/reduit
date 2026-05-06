@@ -143,21 +143,35 @@ func (s *service) Upsert(ctx context.Context, params UpsertParams) (*User, error
 		row.DisplayName = sql.NullString{String: displayName, Valid: true}
 	}
 	if err := s.repo.insert(ctx, row); err != nil {
+		// Only the typed UNIQUE-collision signal counts as "race
+		// lost". Any other error (FK, IO, driver bug, ...) is real
+		// and propagates directly so logs and alerts distinguish
+		// expected concurrent-first-login from genuine failure.
+		//
+		// Governing: SPEC-0005 REQ "OIDC Login Flow"; issue #64.
+		if !errors.Is(err, ErrUserAlreadyExists) {
+			return nil, err
+		}
 		// Race lost -- another caller inserted between our SELECT
 		// and INSERT. Re-read the canonical row and apply the login
 		// update against it so the timestamps reflect this attempt
 		// rather than the racer's.
-		if existing, lookupErr := s.repo.getByOIDCSubject(ctx, sub); lookupErr == nil {
-			if upErr := s.repo.updateLogin(ctx, existing.ID, email, displayName, now); upErr != nil {
-				return nil, upErr
-			}
-			refreshed, refreshErr := s.repo.getByID(ctx, existing.ID)
-			if refreshErr != nil {
-				return nil, refreshErr
-			}
-			return refreshed.toUser(), nil
+		existing, lookupErr := s.repo.getByOIDCSubject(ctx, sub)
+		if lookupErr != nil {
+			// The row that triggered our UNIQUE collision should be
+			// readable; if it isn't, surface the lookup error rather
+			// than the original ErrUserAlreadyExists -- the lookup
+			// error is the more actionable signal for an operator.
+			return nil, lookupErr
 		}
-		return nil, err
+		if upErr := s.repo.updateLogin(ctx, existing.ID, email, displayName, now); upErr != nil {
+			return nil, upErr
+		}
+		refreshed, refreshErr := s.repo.getByID(ctx, existing.ID)
+		if refreshErr != nil {
+			return nil, refreshErr
+		}
+		return refreshed.toUser(), nil
 	}
 	return row.toUser(), nil
 }
