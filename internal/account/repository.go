@@ -45,7 +45,14 @@ type accountRow struct {
 	Crashed                     int64          `db:"crashed"`
 	CreatedAt                   time.Time      `db:"created_at"`
 	UpdatedAt                   time.Time      `db:"updated_at"`
-	DeletedAt                   sql.NullTime   `db:"deleted_at"`
+	// LastSyncAt mirrors the nullable `last_sync_at` column added in
+	// migration 20260503000001. NULL on every row until the sync
+	// worker (#19) starts populating it via SetSyncState.
+	//
+	// Governing: SPEC-0005 REQ "Account Dashboard", SPEC-0002 REQ
+	// "Event Cursor Persistence".
+	LastSyncAt sql.NullTime `db:"last_sync_at"`
+	DeletedAt  sql.NullTime `db:"deleted_at"`
 }
 
 func (r accountRow) toAccount() *Account {
@@ -66,6 +73,10 @@ func (r accountRow) toAccount() *Account {
 		CreatedAt:            r.CreatedAt,
 		UpdatedAt:            r.UpdatedAt,
 	}
+	if r.LastSyncAt.Valid {
+		t := r.LastSyncAt.Time
+		a.LastSyncAt = &t
+	}
 	if r.DeletedAt.Valid {
 		t := r.DeletedAt.Time
 		a.DeletedAt = &t
@@ -77,7 +88,7 @@ const accountColumns = `
     id, user_id, proton_user_id, email, state,
     key_envelope, refresh_token_ciphertext, mailbox_passphrase_ciphertext,
     imap_password_ciphertext, imap_password_hash, primary_alias,
-    last_event_id, crashed, created_at, updated_at, deleted_at
+    last_event_id, crashed, created_at, updated_at, last_sync_at, deleted_at
 `
 
 // insert persists a brand-new account row. The unique constraint on
@@ -94,12 +105,12 @@ func (r *repository) insert(ctx context.Context, row *accountRow) error {
         id, user_id, proton_user_id, email, state,
         key_envelope, refresh_token_ciphertext, mailbox_passphrase_ciphertext,
         imap_password_ciphertext, imap_password_hash, primary_alias,
-        last_event_id, crashed, created_at, updated_at, deleted_at
+        last_event_id, crashed, created_at, updated_at, last_sync_at, deleted_at
     ) VALUES (
         :id, :user_id, :proton_user_id, :email, :state,
         :key_envelope, :refresh_token_ciphertext, :mailbox_passphrase_ciphertext,
         :imap_password_ciphertext, :imap_password_hash, :primary_alias,
-        :last_event_id, :crashed, :created_at, :updated_at, :deleted_at
+        :last_event_id, :crashed, :created_at, :updated_at, :last_sync_at, :deleted_at
     )`
 	_, err := r.db.NamedExecContext(ctx, q, row)
 	if err != nil {

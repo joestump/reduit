@@ -69,6 +69,21 @@ type SyncStateTxWork func(*sqlx.Tx) error
 // inside an already-open transaction. Extracted so SetSyncState can
 // share the same SQL with any future migration helper that needs to
 // seed cursors during a back-fill.
+//
+// Also stamps `accounts.last_sync_at` from the same `syncedAt` value
+// so the dashboard's per-card "Last sync" stat reflects the cursor
+// advance rather than `accounts.updated_at` (which is bumped on every
+// state change -- suspend, alias change, IMAP-password rotation, ...).
+// Both writes happen inside the same transaction the caller opened so
+// a rollback drops both; the cursor and the dashboard timestamp can
+// never diverge.
+//
+// We deliberately do NOT touch `accounts.updated_at` here -- the
+// dashboard column exists precisely because updated_at was too noisy
+// for the "last successful sync" stat.
+//
+// Governing: SPEC-0002 REQ "Event Cursor Persistence", SPEC-0005 REQ
+// "Account Dashboard".
 func upsertSyncStateInTx(ctx context.Context, tx *sqlx.Tx, accountID, cursor string, syncedAt time.Time) error {
 	const q = `
         INSERT INTO sync_state (account_id, last_event_id, last_synced_at)
@@ -79,6 +94,10 @@ func upsertSyncStateInTx(ctx context.Context, tx *sqlx.Tx, accountID, cursor str
     `
 	if _, err := tx.ExecContext(ctx, q, accountID, cursor, syncedAt); err != nil {
 		return fmt.Errorf("account: upsert sync state: %w", err)
+	}
+	const accountQ = `UPDATE accounts SET last_sync_at = ? WHERE id = ?`
+	if _, err := tx.ExecContext(ctx, accountQ, syncedAt, accountID); err != nil {
+		return fmt.Errorf("account: upsert last_sync_at: %w", err)
 	}
 	return nil
 }
