@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/store"
@@ -510,6 +511,100 @@ func TestBindSessionToAccount_RequiresUserBindFirst(t *testing.T) {
 
 	if bindErr == nil {
 		t.Fatal("BindSessionToAccount succeeded without a prior user bind")
+	}
+}
+
+// TestSweepOrphanSessionOwners pins the contract for issue #70's
+// orphan cleanup: rows in session_owners whose token is no longer in
+// sessions must be deleted; rows whose token is still live must be
+// preserved; the operation must be idempotent (a second pass with no
+// new orphans returns 0).
+//
+// We insert two sessions and three session_owners rows directly via
+// SQL: one bound to a live token, one bound to a different live
+// token, one bound to a token that has no matching sessions row
+// (the canonical orphan, simulating what a re-login leaves behind
+// after SCS's RenewToken). The sweep must remove exactly the orphan.
+//
+// Governing: ADR-0010, SPEC-0005 REQ "OIDC Login Flow"; issue #70.
+func TestSweepOrphanSessionOwners(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	defer st.Close()
+
+	// FK constraint requires a users row first.
+	if _, err := st.DB.ExecContext(t.Context(),
+		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
+		"user-sweep", "sub-sweep",
+	); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+
+	// Two live sessions. The data column must be non-empty bytes
+	// because sqlite3store treats it as raw bytes; actual contents
+	// don't matter for the sweep.
+	for _, tok := range []string{"live-1", "live-2"} {
+		if _, err := st.DB.ExecContext(t.Context(),
+			`INSERT INTO sessions (token, data, expiry) VALUES (?, ?, ?)`,
+			tok, []byte{0}, time.Now().Add(time.Hour),
+		); err != nil {
+			t.Fatalf("insert session %s: %v", tok, err)
+		}
+	}
+
+	// Three session_owners rows: two live, one orphan.
+	for _, tok := range []string{"live-1", "live-2", "orphan-1"} {
+		if _, err := st.DB.ExecContext(t.Context(),
+			`INSERT INTO session_owners (token, user_id) VALUES (?, ?)`,
+			tok, "user-sweep",
+		); err != nil {
+			t.Fatalf("insert session_owners %s: %v", tok, err)
+		}
+	}
+
+	n, err := session.SweepOrphanSessionOwners(t.Context(), st.DB.DB)
+	if err != nil {
+		t.Fatalf("SweepOrphanSessionOwners: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("rows affected = %d, want 1 (only the orphan)", n)
+	}
+
+	// The two live owner rows must still be present.
+	for _, tok := range []string{"live-1", "live-2"} {
+		var got string
+		err := st.DB.QueryRowxContext(t.Context(),
+			`SELECT token FROM session_owners WHERE token = ?`, tok,
+		).Scan(&got)
+		if err != nil {
+			t.Errorf("expected live owner %q to survive sweep: %v", tok, err)
+		}
+	}
+
+	// The orphan must be gone.
+	var orphanLeft string
+	err = st.DB.QueryRowxContext(t.Context(),
+		`SELECT token FROM session_owners WHERE token = ?`, "orphan-1",
+	).Scan(&orphanLeft)
+	if err == nil {
+		t.Errorf("orphan owner still present after sweep: %q", orphanLeft)
+	}
+
+	// Idempotent: a second pass with no new orphans is a no-op.
+	n, err = session.SweepOrphanSessionOwners(t.Context(), st.DB.DB)
+	if err != nil {
+		t.Fatalf("second sweep: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("second sweep rows affected = %d, want 0", n)
+	}
+}
+
+// TestSweepOrphanSessionOwners_GuardsBadInput pins the nil-db guard.
+func TestSweepOrphanSessionOwners_GuardsBadInput(t *testing.T) {
+	t.Parallel()
+	if _, err := session.SweepOrphanSessionOwners(t.Context(), nil); err == nil {
+		t.Error("nil db: expected error, got nil")
 	}
 }
 
