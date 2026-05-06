@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/joestump/reduit/internal/account"
@@ -25,12 +26,41 @@ import (
 // accountsPageData composes the base pageData with dashboard-
 // specific fields. The template branches on Empty vs Groups; admins
 // also branch on IsAdmin to render the per-user grouping headers.
+//
+// Pagination fields (Page, HasPrev, HasNext, PrevURL, NextURL) are
+// populated only on the admin view when total accounts exceed the
+// page size; non-admin views (which list one user's accounts) and
+// admin views with a single short page leave them zeroed and the
+// template skips the prev/next strip.
 type accountsPageData struct {
 	pageData
 	Empty    bool
 	Subtitle string
 	Groups   []accountGroup
+
+	// Pagination controls -- admin view only, non-zero when there is
+	// more than one page of accounts. PrevURL / NextURL are pre-built
+	// query strings ("/accounts?page=N") so the template doesn't have
+	// to do arithmetic; HasPrev/HasNext gate rendering.
+	//
+	// Governing: SPEC-0005 REQ "Account Dashboard"; PR #72 review (N3).
+	Page    int
+	HasPrev bool
+	HasNext bool
+	PrevURL string
+	NextURL string
 }
+
+// adminPageSize is the number of account cards rendered per admin
+// dashboard page. The "Page size 20, basic prev/next" shape per the
+// PR-72 N3 follow-up; comfortable for a multi-card grid at 1080p
+// without spilling far below the fold, and small enough that even a
+// 1000-account fleet pages in well under 100ms of in-memory join.
+//
+// Tracked-separately: a streaming-render approach (per-user `<details>`
+// groups) for fleets > 1000 accounts. Present scope is the
+// pre-alpha-friendly version.
+const adminPageSize = 20
 
 // accountGroup is a single owner-grouped slice of cards. For
 // non-admin views there is exactly one group (the user's own); the
@@ -97,8 +127,23 @@ func (s *Server) handleAccountsDashboard(w http.ResponseWriter, r *http.Request)
 		if len(groups) == 0 || allEmpty(groups) {
 			data.Empty = true
 		} else {
-			data.Groups = groups
-			data.Subtitle = adminSubtitle(groups)
+			// Subtitle reflects the unpaginated total -- "N accounts
+			// across M users" should not change as the operator pages,
+			// otherwise the count is meaningless.
+			fullSubtitle := adminSubtitle(groups)
+			page := parsePage(r.URL.Query().Get("page"))
+			pageGroups, pg := paginateAdminGroups(groups, page, adminPageSize)
+			data.Groups = pageGroups
+			data.Subtitle = fullSubtitle
+			data.Page = pg.page
+			data.HasPrev = pg.hasPrev
+			data.HasNext = pg.hasNext
+			if pg.hasPrev {
+				data.PrevURL = fmt.Sprintf("/accounts?page=%d", pg.page-1)
+			}
+			if pg.hasNext {
+				data.NextURL = fmt.Sprintf("/accounts?page=%d", pg.page+1)
+			}
 		}
 	} else {
 		accounts, err := s.deps.AccountService.ListByUser(r.Context(), id.UserID)
@@ -283,4 +328,104 @@ func allEmpty(groups []accountGroup) bool {
 		}
 	}
 	return true
+}
+
+// paginationState collects the after-slicing pagination metadata the
+// handler needs to render prev/next controls.
+type paginationState struct {
+	page    int
+	hasPrev bool
+	hasNext bool
+}
+
+// parsePage normalises the ?page= query parameter to a 1-indexed page
+// number. Empty / non-numeric / non-positive values fall back to page
+// 1; the handler does NOT 400 on a bad page so a stale browser tab
+// pointed at /accounts?page=foo still renders the first page rather
+// than an error.
+func parsePage(raw string) int {
+	if raw == "" {
+		return 1
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 1
+	}
+	return n
+}
+
+// paginateAdminGroups slices the flat admin grouping into a single
+// page worth of accountCards, preserving the per-owner grouping
+// shape so the template renders identical card-grid markup. Inputs
+// (groups) are assumed already-sorted by owner label per
+// adminAllAccountsGrouped's contract.
+//
+// Strategy: flatten the (owner, card) pairs into a global slice, take
+// the page's window, and re-bucket. This keeps the wire-format
+// invariant (groups stay sorted; cards within a group keep their
+// relative order) without requiring a paginated repository API. When
+// fleet sizes outgrow this approach the SQL-side ListPaged from issue
+// #75's "Suggested fix" becomes the natural next step.
+//
+// Page numbers beyond the last populated page snap to the last page
+// rather than 404 -- the alternative would let a stale browser tab
+// dead-end on a refresh after another admin's account-create that
+// shifted boundaries.
+//
+// Governing: SPEC-0005 REQ "Account Dashboard"; PR #72 review (N3).
+func paginateAdminGroups(groups []accountGroup, page, pageSize int) ([]accountGroup, paginationState) {
+	if pageSize <= 0 {
+		// Defensive: a misconfigured pageSize would otherwise divide
+		// by zero below. Treat as "show everything, no controls".
+		return groups, paginationState{page: 1}
+	}
+	type ownerCard struct {
+		owner string
+		card  accountCard
+	}
+	flat := make([]ownerCard, 0)
+	for _, g := range groups {
+		for _, c := range g.Accounts {
+			flat = append(flat, ownerCard{owner: g.Owner, card: c})
+		}
+	}
+	total := len(flat)
+	if total <= pageSize {
+		// Single-page case: render unmodified, no prev/next chrome.
+		return groups, paginationState{page: 1}
+	}
+	totalPages := (total + pageSize - 1) / pageSize
+	if page > totalPages {
+		page = totalPages
+	}
+	start := (page - 1) * pageSize
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	window := flat[start:end]
+
+	// Re-bucket the window. We walk in order so the rebuilt groups
+	// preserve the same owner-sort order as the input; an owner that
+	// straddles a page boundary appears in both pages with only their
+	// in-window accounts -- matches what the operator expects from a
+	// "next page" button.
+	out := make([]accountGroup, 0)
+	var (
+		curOwner string
+		curIdx   = -1
+	)
+	for _, oc := range window {
+		if curIdx < 0 || oc.owner != curOwner {
+			out = append(out, accountGroup{Owner: oc.owner})
+			curOwner = oc.owner
+			curIdx = len(out) - 1
+		}
+		out[curIdx].Accounts = append(out[curIdx].Accounts, oc.card)
+	}
+	return out, paginationState{
+		page:    page,
+		hasPrev: page > 1,
+		hasNext: page < totalPages,
+	}
 }
