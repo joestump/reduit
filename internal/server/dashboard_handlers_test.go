@@ -233,3 +233,103 @@ func TestDashboard_AdminSeesAllAccountsGroupedByOwner(t *testing.T) {
 		t.Errorf("admin subtitle wrong; body excerpt=%s", body[:min(len(body), 800)])
 	}
 }
+
+// TestDashboard_AdminViewPaginatesWhenOverThreshold seeds enough
+// accounts to span multiple admin pages and exercises the prev/next
+// strip + the "subtitle stays at the unpaginated total" contract.
+//
+// Governing: SPEC-0005 REQ "Account Dashboard"; PR #72 review (N3).
+func TestDashboard_AdminViewPaginatesWhenOverThreshold(t *testing.T) {
+	t.Parallel()
+	baseURL, idp, accSvc, usrSvc := dashboardTestServer(t, []string{"sub-admin"})
+	ctx := context.Background()
+
+	uAdmin, err := usrSvc.Upsert(ctx, users.UpsertParams{OIDCSubject: "sub-admin", Email: "admin@example.com"})
+	if err != nil {
+		t.Fatalf("upsert admin: %v", err)
+	}
+	// Seed 25 accounts under one user -- comfortably above the 20-per-
+	// page threshold so page 1 has 20 cards and page 2 has 5.
+	const total = 25
+	for i := 0; i < total; i++ {
+		params := account.CreateParams{
+			UserID:       uAdmin.ID,
+			ProtonUserID: fmtSeedID("p-admin-", i),
+			Email:        fmtSeedID("seed-", i) + "@proton.me",
+		}
+		if _, err := accSvc.Create(ctx, params); err != nil {
+			t.Fatalf("create account %d: %v", i, err)
+		}
+	}
+
+	c := loginAndFollow(t, baseURL, idp, "sub-admin", "admin@example.com", "Admin")
+
+	// Page 1: subtitle reflects unpaginated total (25), Next is
+	// present, Previous is absent.
+	status, body := fetch(t, c, baseURL+"/accounts")
+	if status != http.StatusOK {
+		t.Fatalf("page 1 status = %d, want 200", status)
+	}
+	if !strings.Contains(body, "25 accounts across 1 user") {
+		t.Errorf("page 1 subtitle should reflect unpaginated total; body excerpt=%s", body[:min(len(body), 1200)])
+	}
+	if !strings.Contains(body, ">Next<") {
+		t.Error("page 1 missing Next control")
+	}
+	if strings.Contains(body, ">Previous<") {
+		t.Error("page 1 should not have Previous control")
+	}
+	// Page-1 spot-check: the FIRST seeded account is on the page; the
+	// 21st (which lives on page 2) is NOT.
+	if !strings.Contains(body, "seed-00@proton.me") {
+		t.Error("page 1 missing first seeded account")
+	}
+	if strings.Contains(body, "seed-20@proton.me") {
+		t.Error("page 1 should not contain 21st account (lives on page 2)")
+	}
+
+	// Page 2: Previous is present, Next is absent (5 of 25 shown).
+	status, body = fetch(t, c, baseURL+"/accounts?page=2")
+	if status != http.StatusOK {
+		t.Fatalf("page 2 status = %d, want 200", status)
+	}
+	if !strings.Contains(body, ">Previous<") {
+		t.Error("page 2 missing Previous control")
+	}
+	if strings.Contains(body, ">Next<") {
+		t.Error("page 2 should not have Next control (last page)")
+	}
+	if !strings.Contains(body, "seed-20@proton.me") {
+		t.Error("page 2 missing 21st seeded account")
+	}
+	if strings.Contains(body, "seed-00@proton.me") {
+		t.Error("page 2 should not contain first account (lives on page 1)")
+	}
+
+	// Out-of-range page (page=99) snaps to the last populated page
+	// rather than 404 -- a stale browser tab pointed at a now-trimmed
+	// fleet should still render usefully.
+	status, body = fetch(t, c, baseURL+"/accounts?page=99")
+	if status != http.StatusOK {
+		t.Fatalf("page 99 status = %d, want 200", status)
+	}
+	if !strings.Contains(body, "seed-20@proton.me") {
+		t.Error("page 99 (snapped to last) missing expected page-2 account")
+	}
+
+	// Bad page param falls back to page 1 silently (no 400).
+	status, body = fetch(t, c, baseURL+"/accounts?page=junk")
+	if status != http.StatusOK {
+		t.Fatalf("page=junk status = %d, want 200", status)
+	}
+	if !strings.Contains(body, "seed-00@proton.me") {
+		t.Error("page=junk should fall back to page 1 (first account missing)")
+	}
+}
+
+// fmtSeedID is a small zero-padding helper local to the pagination
+// test so seed-00..seed-24 sort lexicographically (which matches
+// the accounts.List ordering by created_at and stable card order).
+func fmtSeedID(prefix string, i int) string {
+	return prefix + string(rune('0'+i/10)) + string(rune('0'+i%10))
+}
