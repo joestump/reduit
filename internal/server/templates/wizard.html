@@ -50,14 +50,16 @@
       {{template "wizard_step_totp" .}}
     {{else if eq .Stage "unlock"}}
       {{template "wizard_step_unlock" .}}
+    {{else if eq .Stage "done"}}
+      {{template "wizard_step_done" .}}
     {{else if eq .Stage "aborted"}}
       {{template "wizard_step_aborted" .}}
     {{end}}
   </div>
 
-  {{if ne .Stage "aborted"}}
+  {{if and (ne .Stage "aborted") (ne .Stage "done")}}
     <p class="text-center text-sm text-slate-500 mt-4">
-      Step {{.Step}} of 3 &middot; {{.StateExpires}}
+      Step {{.Step}} of 4 &middot; {{.StateExpires}}
     </p>
   {{end}}
 </div>
@@ -161,6 +163,47 @@
       Unlock
     </button>
   </div>
+</form>
+{{end}}
+
+{{define "wizard_step_done"}}
+<h2 class="text-xl font-semibold mb-2">Set up your mail client</h2>
+<p class="text-slate-400 mb-6 leading-relaxed flex items-start gap-2">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#10B981" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="flex-shrink-0 mt-0.5"><polyline points="20 6 9 17 4 12"/></svg>
+  <span>Your Proton account is wired up. Use these settings in Apple Mail, Thunderbird, K-9, or any standard IMAP/SMTP client.</span>
+</p>
+
+<div class="rounded-lg border border-slate-700 bg-slate-900/60 divide-y divide-slate-700 mb-6">
+  <div class="px-4 py-3 grid grid-cols-3 gap-4 items-baseline">
+    <div class="text-xs uppercase tracking-wide text-slate-500">IMAP server</div>
+    <div class="col-span-2 font-mono text-slate-100">{{.IMAPHost}}<span class="text-slate-500">&nbsp;:&nbsp;</span>{{.IMAPPort}}</div>
+  </div>
+  <div class="px-4 py-3 grid grid-cols-3 gap-4 items-baseline">
+    <div class="text-xs uppercase tracking-wide text-slate-500">SMTP server</div>
+    <div class="col-span-2 font-mono text-slate-100">{{.IMAPHost}}<span class="text-slate-500">&nbsp;:&nbsp;</span>{{.SMTPPort}}</div>
+  </div>
+  <div class="px-4 py-3 grid grid-cols-3 gap-4 items-baseline">
+    <div class="text-xs uppercase tracking-wide text-slate-500">Username</div>
+    <div class="col-span-2 font-mono text-slate-100">{{if .IMAPUsername}}{{.IMAPUsername}}{{else}}<span class="text-slate-500">unset</span>{{end}}</div>
+  </div>
+  <div class="px-4 py-3 grid grid-cols-3 gap-4 items-baseline">
+    <div class="text-xs uppercase tracking-wide text-slate-500">Password</div>
+    <div class="col-span-2 font-mono text-slate-100 break-all select-all" data-imap-password>{{.IMAPPassword}}</div>
+  </div>
+</div>
+
+<div class="bg-amber-950/40 border-l-4 border-amber-500 rounded-r-md px-4 py-3 mb-6 text-sm text-slate-200 flex items-start gap-3">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#F59E0B" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" class="flex-shrink-0 mt-0.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+  <span>Copy the password now — Reduit only stores a one-way hash, so this plaintext is your single chance. You can rotate it anytime from the dashboard.</span>
+</div>
+
+<form method="POST" action="/accounts/setup/complete" class="flex items-center justify-end gap-3">
+  <button type="submit"
+          class="px-5 py-2 rounded-lg font-semibold text-white inline-flex items-center gap-2"
+          style="background:#4F46E5">
+    Continue to dashboard
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+  </button>
 </form>
 {{end}}
 
