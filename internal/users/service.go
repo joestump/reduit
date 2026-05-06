@@ -68,12 +68,28 @@ type service struct {
 // New constructs a Service backed by the given store. The Service
 // does not take ownership of the store -- the caller closes it.
 func New(s *store.Store) Service {
+	return newWithClock(s, time.Now)
+}
+
+// newWithClock is the test seam for deterministic timestamps:
+// production callers use New (which wires now=time.Now); tests
+// drive a controlled clock so assertions on LastLoginAt advancement
+// don't need a real time.Sleep to clear SQLite's timestamp resolution.
+//
+// Unexported on purpose: the only legitimate callers live in the
+// users package's own tests (via export_test.go). Keeping the
+// constructor surface narrow (one public New) avoids inviting
+// production callers to inject a fake clock.
+func newWithClock(s *store.Store, now func() time.Time) *service {
 	if s == nil || s.DB == nil {
 		panic("users: New called with nil store")
 	}
+	if now == nil {
+		panic("users: newWithClock called with nil now")
+	}
 	return &service{
 		repo:  &repository{db: s.DB},
-		now:   time.Now,
+		now:   now,
 		newID: newUUIDv7,
 	}
 }

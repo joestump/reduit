@@ -126,20 +126,54 @@ func TestUpsertPreservesClaimsWhenSubsequentLoginDropsThem(t *testing.T) {
 
 func TestUpsertAdvancesLastLoginAt(t *testing.T) {
 	t.Parallel()
-	svc, _ := newTestService(t)
+
+	// Driven by an injected clock instead of time.Sleep: the
+	// repository persists s.now() on every login, so two calls
+	// against a clock that ticks deterministically between them
+	// give us exact, race-free assertions. This avoids the prior
+	// 2ms time.Sleep that flaked under contended CI runners.
+	//
+	// Governing: issue #66 (clock injection so the test doesn't
+	// need a real-time pause to clear SQLite's timestamp resolution).
+	dbPath := filepath.Join(t.TempDir(), "reduit-test.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	migrateMu.Lock()
+	err = st.Migrate("")
+	migrateMu.Unlock()
+	if err != nil {
+		t.Fatalf("store.Migrate: %v", err)
+	}
+
+	t0 := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	t1 := t0.Add(5 * time.Second)
+	calls := 0
+	clock := func() time.Time {
+		calls++
+		if calls == 1 {
+			return t0
+		}
+		return t1
+	}
+	svc := users.NewWithClock(st, clock)
 	ctx := context.Background()
 
 	first, err := svc.Upsert(ctx, users.UpsertParams{OIDCSubject: "sub-login-time"})
 	if err != nil {
 		t.Fatalf("first Upsert: %v", err)
 	}
-	// Sleep a couple of ms so the second timestamp is observably later.
-	// This is the only sleep in the package and is bounded below the
-	// usual jitter floor for SQLite timestamp resolution.
-	time.Sleep(2 * time.Millisecond)
+	if !first.LastLoginAt.Equal(t0) {
+		t.Errorf("first LastLoginAt = %v, want %v", first.LastLoginAt, t0)
+	}
 	second, err := svc.Upsert(ctx, users.UpsertParams{OIDCSubject: "sub-login-time"})
 	if err != nil {
 		t.Fatalf("second Upsert: %v", err)
+	}
+	if !second.LastLoginAt.Equal(t1) {
+		t.Errorf("second LastLoginAt = %v, want %v", second.LastLoginAt, t1)
 	}
 	if !second.LastLoginAt.After(first.LastLoginAt) {
 		t.Errorf("LastLoginAt did not advance: first=%v second=%v", first.LastLoginAt, second.LastLoginAt)
