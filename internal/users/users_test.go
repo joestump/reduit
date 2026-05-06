@@ -203,6 +203,99 @@ func TestUpsertRejectsEmptySubject(t *testing.T) {
 	}
 }
 
+// TestUpsertCollapsesConcurrentFirstLogins drives the race window
+// in Service.Upsert: two goroutines call Upsert with the same OIDC
+// subject simultaneously, both observe ErrUserNotFound from the
+// initial SELECT, and both attempt the INSERT. SQLite's per-conn
+// mutex serializes the writes so one INSERT lands and the other
+// trips the UNIQUE constraint on oidc_subject; the loser MUST take
+// the lookup-and-update fallback and return the same user row the
+// winner created.
+//
+// This pins three contracts:
+//   - Both calls return the SAME user.ID (no split-brain)
+//   - Neither call surfaces an error to the caller
+//   - The race-fallback path classifies SQLITE_CONSTRAINT_UNIQUE
+//     correctly (any other error type would propagate as a failure
+//     and one of the goroutines would see a non-nil err)
+//
+// Governing: SPEC-0005 REQ "OIDC Login Flow"; issue #64.
+func TestUpsertCollapsesConcurrentFirstLogins(t *testing.T) {
+	t.Parallel()
+	svc, _ := newTestService(t)
+	ctx := context.Background()
+
+	const sub = "sub-race"
+	const N = 8
+	results := make([]*users.User, N)
+	errs := make([]error, N)
+
+	// A WaitGroup gate keeps every goroutine parked until Done() is
+	// called on the start barrier; this maximises the chance that
+	// multiple calls hit getByOIDCSubject before any of them commits
+	// the INSERT, which is the precise race window the race-fallback
+	// branch exists to handle.
+	var start sync.WaitGroup
+	start.Add(1)
+	var wg sync.WaitGroup
+	wg.Add(N)
+	for i := 0; i < N; i++ {
+		go func(i int) {
+			defer wg.Done()
+			start.Wait()
+			u, err := svc.Upsert(ctx, users.UpsertParams{
+				OIDCSubject: sub,
+				Email:       "joe@example.com",
+				DisplayName: "Joe",
+			})
+			results[i] = u
+			errs[i] = err
+		}(i)
+	}
+	start.Done()
+	wg.Wait()
+
+	// Every goroutine must succeed; the race fallback path must NOT
+	// surface ErrUserAlreadyExists (or any other error) to the caller.
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: Upsert err = %v, want nil", i, err)
+		}
+		if results[i] == nil {
+			t.Fatalf("goroutine %d: Upsert returned nil user", i)
+		}
+	}
+
+	// All goroutines must observe the same canonical user row -- the
+	// UNIQUE constraint on oidc_subject is the safety net and the
+	// race-fallback branch is what makes both callers agree on which
+	// row won.
+	canonical := results[0].ID
+	if canonical == "" {
+		t.Fatal("first result has empty ID")
+	}
+	for i, u := range results {
+		if u.ID != canonical {
+			t.Errorf("goroutine %d: ID = %q, want %q (split-brain on concurrent first login)", i, u.ID, canonical)
+		}
+	}
+
+	// Final state: exactly one row exists with this subject.
+	all, err := svc.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	matches := 0
+	for _, u := range all {
+		if u.OIDCSubject == sub {
+			matches++
+		}
+	}
+	if matches != 1 {
+		t.Errorf("rows with subject %q = %d, want exactly 1", sub, matches)
+	}
+}
+
 func TestList(t *testing.T) {
 	t.Parallel()
 	svc, _ := newTestService(t)

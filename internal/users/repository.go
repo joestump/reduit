@@ -9,9 +9,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	sqlite "modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // repository is the sqlx-backed CRUD layer for the users table. It is
@@ -50,11 +53,32 @@ const userColumns = `id, oidc_subject, email, display_name, created_at, last_log
 // avoiding races on oidc_subject -- Service.Upsert wraps insert in a
 // "lookup-or-insert" pattern that handles the concurrent-first-login
 // race.
+//
+// On a UNIQUE-constraint collision (oidc_subject already present)
+// returns ErrUserAlreadyExists so Service.Upsert can distinguish the
+// expected race-lost case from a real driver/FK failure. Mirrors the
+// typed-error pattern in internal/account/repository.go.insert.
+//
+// Governing: SPEC-0005 REQ "OIDC Login Flow"; issue #64.
 func (r *repository) insert(ctx context.Context, row *userRow) error {
 	const q = `
     INSERT INTO users (id, oidc_subject, email, display_name, created_at, last_login_at)
     VALUES (:id, :oidc_subject, :email, :display_name, :created_at, :last_login_at)`
 	if _, err := r.db.NamedExecContext(ctx, q, row); err != nil {
+		// Prefer the typed sqlite error code so this branch survives
+		// driver message-text changes. Fall back to a substring match
+		// against the unique-constraint message so a future driver swap
+		// still has a chance to surface ErrUserAlreadyExists rather
+		// than mis-classifying a race as a real failure.
+		var sqliteErr *sqlite.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
+			return ErrUserAlreadyExists
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "UNIQUE constraint failed") &&
+			strings.Contains(msg, "users.oidc_subject") {
+			return ErrUserAlreadyExists
+		}
 		return fmt.Errorf("users: insert: %w", err)
 	}
 	return nil
