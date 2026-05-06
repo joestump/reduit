@@ -38,6 +38,15 @@ type Service interface {
 	// subject collapse to a single row -- the second caller observes
 	// the row created by the first.
 	//
+	// May return ErrUserNotFound if a concurrent caller deletes the
+	// user row between Upsert's internal lookup and update. This is
+	// the only situation where Upsert -- whose contract is "create
+	// or refresh" -- can surface a not-found error; the window is
+	// narrow (operator-initiated mid-login deletion runs under
+	// SQLite's per-DB write lock) but real, and handlers that see
+	// it SHOULD retry once before propagating the error to the
+	// caller.
+	//
 	// Governing: SPEC-0005 REQ "OIDC Login Flow" (callback upsert),
 	// SPEC-0001 REQ "User Identity".
 	Upsert(ctx context.Context, params UpsertParams) (*User, error)
