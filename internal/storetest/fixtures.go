@@ -20,7 +20,6 @@ package storetest
 
 import (
 	"context"
-	"database/sql"
 	"testing"
 
 	"github.com/joestump/reduit/internal/store"
@@ -112,7 +111,3 @@ func seedUserAccount(t *testing.T, st *store.Store, accountID, state string) str
 	return accountID
 }
 
-// Compile-time assertion that *sql.DB is the Store's connection
-// shape -- so a future store refactor that swaps the underlying
-// driver will break here loudly rather than silently broken-fixture.
-var _ *sql.DB = (*sql.DB)(nil)
