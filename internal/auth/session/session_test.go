@@ -10,6 +10,7 @@ import (
 
 	"github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/store"
+	"github.com/joestump/reduit/internal/storetest"
 )
 
 // TestNew_RequiresDB checks the constructor's nil-DB guard. Without
@@ -190,8 +191,8 @@ func TestBindAndRevokeSessionsForAccount(t *testing.T) {
 	t.Parallel()
 	st := openTempStore(t)
 	defer st.Close()
-	insertAccountForSession(t, st, "acct-victim")
-	insertAccountForSession(t, st, "acct-bystander")
+	storetest.SeedUserAccountActive(t, st, "acct-victim")
+	storetest.SeedUserAccountActive(t, st, "acct-bystander")
 
 	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
 	if err != nil {
@@ -475,7 +476,7 @@ func TestBindSessionToAccount_RequiresUserBindFirst(t *testing.T) {
 	t.Parallel()
 	st := openTempStore(t)
 	defer st.Close()
-	insertAccountForSession(t, st, "acct-orphan")
+	storetest.SeedUserAccountActive(t, st, "acct-orphan")
 
 	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
 	if err != nil {
@@ -648,26 +649,6 @@ func loginAs(t *testing.T, c *http.Client, baseURL, accountID string) {
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("login (%s) status = %d", accountID, resp.StatusCode)
-	}
-}
-
-// Per ADR-0010, accounts.user_id FK requires a users row first --
-// insertAccountForSession mints both inline so each call is
-// self-contained.
-func insertAccountForSession(t *testing.T, st *store.Store, id string) {
-	t.Helper()
-	if _, err := st.DB.ExecContext(t.Context(),
-		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
-		"user-"+id, "sub-"+id,
-	); err != nil {
-		t.Fatalf("insert user: %v", err)
-	}
-	const q = `
-		INSERT INTO accounts (id, user_id, state, key_envelope)
-		VALUES (?, ?, 'active', X'00')
-	`
-	if _, err := st.DB.ExecContext(t.Context(), q, id, "user-"+id); err != nil {
-		t.Fatalf("insert account: %v", err)
 	}
 }
 

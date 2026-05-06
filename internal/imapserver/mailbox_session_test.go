@@ -32,6 +32,7 @@ import (
 	"github.com/joestump/reduit/internal/mailbox"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/store"
+	"github.com/joestump/reduit/internal/storetest"
 )
 
 // migrateMu is the cross-package equivalent of mailbox.migrateMu and
@@ -56,28 +57,8 @@ func newMailboxStack(t *testing.T) (mailbox.Service, *store.Store, string) {
 	}
 
 	const accountID = "acct-imap-test"
-	seedAccountID(t, st, accountID)
+	storetest.SeedUserAccountActive(t, st, accountID)
 	return mailbox.New(st), st, accountID
-}
-
-// Per ADR-0010, accounts.user_id FK requires a users row first --
-// seedAccountID mints both inline so each call is self-contained
-// and the rest of the IMAP test surface doesn't have to reason
-// about the user/account split.
-func seedAccountID(t *testing.T, st *store.Store, id string) {
-	t.Helper()
-	if _, err := st.DB.Exec(
-		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
-		"user-"+id, "sub-"+id,
-	); err != nil {
-		t.Fatalf("seed user %s: %v", id, err)
-	}
-	const q = `
-INSERT INTO accounts (id, user_id, state, key_envelope, created_at, updated_at)
-VALUES (?, ?, 'active', X'00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-	if _, err := st.DB.Exec(q, id, "user-"+id); err != nil {
-		t.Fatalf("seed account %s: %v", id, err)
-	}
 }
 
 // newAuthedSession constructs a session bound to the supplied accountID
@@ -222,7 +203,7 @@ func TestSessionListShowsOnlyOwnMailboxes(t *testing.T) {
 	t.Parallel()
 	mboxes, st, acctA := newMailboxStack(t)
 	const acctB = "acct-other"
-	seedAccountID(t, st, acctB)
+	storetest.SeedUserAccountActive(t, st, acctB)
 
 	ctx := context.Background()
 	if _, err := mboxes.EnsureMailbox(ctx, acctA, "INBOX", mailbox.ProtonInboxLabelID, mailbox.KindSystem); err != nil {
@@ -268,7 +249,7 @@ func TestSessionSelectRefusesNonOwnedMailbox(t *testing.T) {
 	t.Parallel()
 	mboxes, st, acctA := newMailboxStack(t)
 	const acctB = "acct-other"
-	seedAccountID(t, st, acctB)
+	storetest.SeedUserAccountActive(t, st, acctB)
 
 	ctx := context.Background()
 	if _, err := mboxes.EnsureMailbox(ctx, acctB, "Labels/Family", "user-family", mailbox.KindUserLabel); err != nil {
@@ -411,7 +392,7 @@ func TestSessionStatusCrossAccount(t *testing.T) {
 	t.Parallel()
 	mboxes, st, acctA := newMailboxStack(t)
 	const acctB = "acct-cross-status"
-	seedAccountID(t, st, acctB)
+	storetest.SeedUserAccountActive(t, st, acctB)
 	ctx := context.Background()
 
 	if _, err := mboxes.EnsureMailbox(ctx, acctA, "Archive", mailbox.ProtonArchiveLabelID, mailbox.KindSystem); err != nil {

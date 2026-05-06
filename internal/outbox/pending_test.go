@@ -12,12 +12,13 @@ import (
 	"time"
 
 	"github.com/joestump/reduit/internal/store"
+	"github.com/joestump/reduit/internal/storetest"
 )
 
 func TestSQLitePendingStore_RecordTimeout(t *testing.T) {
 	t.Parallel()
 	s := openMigratedStore(t)
-	insertAccount(t, s, "acct-pending")
+	storetest.SeedUserAccountActive(t, s, "acct-pending")
 
 	ps := NewSQLitePendingStore(s.DB)
 	sub := Submission{
@@ -67,7 +68,7 @@ func TestSQLitePendingStore_RecordTimeout(t *testing.T) {
 func TestSQLitePendingStore_AccountCascade(t *testing.T) {
 	t.Parallel()
 	s := openMigratedStore(t)
-	insertAccount(t, s, "acct-doomed")
+	storetest.SeedUserAccountActive(t, s, "acct-doomed")
 
 	ps := NewSQLitePendingStore(s.DB)
 	if err := ps.RecordTimeout(context.Background(), Submission{
@@ -108,25 +109,4 @@ func openMigratedStore(t *testing.T) *store.Store {
 		t.Fatalf("Migrate: %v", err)
 	}
 	return s
-}
-
-// insertAccount writes the minimum row the FK constraint requires.
-// We don't go through internal/account because that pulls in the
-// envelope crypto and adds noise to the test. Per ADR-0010 the
-// accounts table requires a user_id FK, so we mint a users row
-// inline as well.
-func insertAccount(t *testing.T, s *store.Store, id string) {
-	t.Helper()
-	if _, err := s.DB.Exec(
-		`INSERT INTO users(id, oidc_subject) VALUES (?, ?)`,
-		"user-"+id, "sub-"+id,
-	); err != nil {
-		t.Fatalf("insert user: %v", err)
-	}
-	_, err := s.DB.Exec(`
-		INSERT INTO accounts(id, user_id, state, key_envelope)
-		VALUES (?, ?, 'active', x'00')`, id, "user-"+id)
-	if err != nil {
-		t.Fatalf("insert account: %v", err)
-	}
 }

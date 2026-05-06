@@ -13,15 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	gooidc "github.com/coreos/go-oidc/v3/oidc"
 	"github.com/coreos/go-oidc/v3/oidc/oidctest"
 
 	"github.com/joestump/reduit/internal/auth"
 	"github.com/joestump/reduit/internal/auth/mcptoken"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
-	"github.com/joestump/reduit/internal/store"
+	"github.com/joestump/reduit/internal/storetest"
 )
 
 // TestParseBearer covers the RFC 6750 fragments: case-insensitive
@@ -141,7 +139,7 @@ func TestBearerValidator_MCPToken_Valid(t *testing.T) {
 	t.Parallel()
 	st := openTempStore(t)
 	defer st.Close()
-	insertAccount(t, st, "acct-7")
+	storetest.SeedUserAccountPending(t, st, "acct-7")
 	repo := mcptoken.NewRepository(st.DB)
 
 	ctx := context.Background()
@@ -174,7 +172,7 @@ func TestBearerValidator_MCPToken_SubjectResolver(t *testing.T) {
 	t.Parallel()
 	st := openTempStore(t)
 	defer st.Close()
-	insertAccount(t, st, "acct-resolved")
+	storetest.SeedUserAccountPending(t, st, "acct-resolved")
 	repo := mcptoken.NewRepository(st.DB)
 
 	ctx := context.Background()
@@ -236,7 +234,7 @@ func TestBearerValidator_MCPToken_Revoked(t *testing.T) {
 	t.Parallel()
 	st := openTempStore(t)
 	defer st.Close()
-	insertAccount(t, st, "acct-9")
+	storetest.SeedUserAccountPending(t, st, "acct-9")
 	repo := mcptoken.NewRepository(st.DB)
 	ctx := context.Background()
 
@@ -343,23 +341,4 @@ func newOIDCTestServer(t *testing.T) (priv crypto.PrivateKey, srvURL, keyID, alg
 	t.Cleanup(srv.Close)
 	tsrv.SetIssuer(srv.URL)
 	return rsaKey, srv.URL, keyID, alg
-}
-
-func insertAccount(t *testing.T, st *store.Store, id string) {
-	t.Helper()
-	// Per ADR-0010, accounts.user_id FK requires a users row first.
-	sub := "sub-" + uuid.NewString()
-	if _, err := st.DB.ExecContext(context.Background(),
-		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
-		"user-"+id, sub,
-	); err != nil {
-		t.Fatalf("insert user: %v", err)
-	}
-	const q = `
-		INSERT INTO accounts (id, user_id, state, key_envelope)
-		VALUES (?, ?, 'pending_proton_setup', X'00')
-	`
-	if _, err := st.DB.ExecContext(context.Background(), q, id, "user-"+id); err != nil {
-		t.Fatalf("insert account: %v", err)
-	}
 }
