@@ -7,10 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/joestump/reduit/internal/auth/mcptoken"
 	"github.com/joestump/reduit/internal/store"
+	"github.com/joestump/reduit/internal/storetest"
 )
 
 // TestIssueAndFind issues a fresh token and confirms the plaintext
@@ -22,7 +21,7 @@ func TestIssueAndFind(t *testing.T) {
 	t.Parallel()
 	st := openTempStore(t)
 	defer st.Close()
-	insertAccount(t, st, "acct-1")
+	storetest.SeedUserAccountPending(t, st, "acct-1")
 
 	repo := mcptoken.NewRepository(st.DB)
 	ctx := context.Background()
@@ -67,7 +66,7 @@ func TestRevocationTakesEffect(t *testing.T) {
 	t.Parallel()
 	st := openTempStore(t)
 	defer st.Close()
-	insertAccount(t, st, "acct-1")
+	storetest.SeedUserAccountPending(t, st, "acct-1")
 	repo := mcptoken.NewRepository(st.DB)
 	ctx := context.Background()
 
@@ -98,7 +97,7 @@ func TestExpiredTokenInactive(t *testing.T) {
 	t.Parallel()
 	st := openTempStore(t)
 	defer st.Close()
-	insertAccount(t, st, "acct-1")
+	storetest.SeedUserAccountPending(t, st, "acct-1")
 	repo := mcptoken.NewRepository(st.DB)
 	ctx := context.Background()
 
@@ -141,8 +140,8 @@ func TestRevokeForAccount(t *testing.T) {
 	t.Parallel()
 	st := openTempStore(t)
 	defer st.Close()
-	insertAccount(t, st, "acct-victim")
-	insertAccount(t, st, "acct-bystander")
+	storetest.SeedUserAccountPending(t, st, "acct-victim")
+	storetest.SeedUserAccountPending(t, st, "acct-bystander")
 	repo := mcptoken.NewRepository(st.DB)
 	ctx := context.Background()
 
@@ -200,27 +199,6 @@ func TestRevokeForAccount(t *testing.T) {
 	// Empty account-id is a guard.
 	if _, err := repo.RevokeForAccount(ctx, ""); err == nil {
 		t.Error("RevokeForAccount(\"\") returned nil error")
-	}
-}
-
-// insertAccount minimally satisfies the FK constraint on mcp_tokens.
-// The full account.Service is overkill for these table-only tests.
-func insertAccount(t *testing.T, st *store.Store, id string) {
-	t.Helper()
-	// Per ADR-0010, accounts.user_id FK requires a users row first.
-	sub := "sub-" + uuid.NewString()
-	if _, err := st.DB.ExecContext(context.Background(),
-		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
-		"user-"+id, sub,
-	); err != nil {
-		t.Fatalf("insert user: %v", err)
-	}
-	const q = `
-		INSERT INTO accounts (id, user_id, state, key_envelope)
-		VALUES (?, ?, 'pending_proton_setup', X'00')
-	`
-	if _, err := st.DB.ExecContext(context.Background(), q, id, "user-"+id); err != nil {
-		t.Fatalf("insert account: %v", err)
 	}
 }
 

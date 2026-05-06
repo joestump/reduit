@@ -12,6 +12,7 @@ import (
 
 	"github.com/joestump/reduit/internal/cryptenv"
 	"github.com/joestump/reduit/internal/store"
+	"github.com/joestump/reduit/internal/storetest"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -55,29 +56,14 @@ func newTestService(t *testing.T) (Service, *store.Store) {
 	return svc, st
 }
 
-// seedUser inserts a users row directly via raw SQL (sidestepping
-// internal/users to keep this package's tests self-contained) and
-// returns the user_id callers can pass to Service.Create.
-func seedUser(t *testing.T, st *store.Store, sub string) string {
-	t.Helper()
-	id := "user-" + sub
-	if _, err := st.DB.Exec(
-		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
-		id, sub,
-	); err != nil {
-		t.Fatalf("seedUser(%q): %v", sub, err)
-	}
-	return id
-}
-
 // createTestAccount mints a user keyed by the supplied OIDC subject
-// (via seedUser) and returns a freshly-created account owned by that
-// user. Use this for the common "I just need an account in pending
-// state" pattern; tests that need finer control should call seedUser
-// + svc.Create directly.
+// (via storetest.SeedUser) and returns a freshly-created account
+// owned by that user. Use this for the common "I just need an
+// account in pending state" pattern; tests that need finer control
+// should call storetest.SeedUser + svc.Create directly.
 func createTestAccount(t *testing.T, svc Service, st *store.Store, ctx context.Context, sub string) *Account {
 	t.Helper()
-	uid := seedUser(t, st, sub)
+	uid := storetest.SeedUser(t, st, sub)
 	a, err := svc.Create(ctx, CreateParams{UserID: uid})
 	if err != nil {
 		t.Fatalf("createTestAccount(%q): %v", sub, err)
@@ -90,7 +76,7 @@ func TestCreateAndGetByID(t *testing.T) {
 	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	uid := seedUser(t, st, "sub-joe")
+	uid := storetest.SeedUser(t, st, "sub-joe")
 	created, err := svc.Create(ctx, CreateParams{UserID: uid})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -135,7 +121,7 @@ func TestUserCanCreateMultipleAccounts(t *testing.T) {
 	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	uid := seedUser(t, st, "sub-multi-acct")
+	uid := storetest.SeedUser(t, st, "sub-multi-acct")
 
 	first, err := svc.Create(ctx, CreateParams{UserID: uid})
 	if err != nil {
@@ -168,7 +154,7 @@ func TestCreateRejectsDuplicateProtonAccountForUser(t *testing.T) {
 	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	uid := seedUser(t, st, "sub-dup-proton")
+	uid := storetest.SeedUser(t, st, "sub-dup-proton")
 
 	if _, err := svc.Create(ctx, CreateParams{UserID: uid, ProtonUserID: "proton-1"}); err != nil {
 		t.Fatalf("first Create: %v", err)
@@ -187,8 +173,8 @@ func TestDifferentUsersMaySharePollutedProtonID(t *testing.T) {
 	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	u1 := seedUser(t, st, "sub-share-1")
-	u2 := seedUser(t, st, "sub-share-2")
+	u1 := storetest.SeedUser(t, st, "sub-share-1")
+	u2 := storetest.SeedUser(t, st, "sub-share-2")
 
 	if _, err := svc.Create(ctx, CreateParams{UserID: u1, ProtonUserID: "proton-shared"}); err != nil {
 		t.Fatalf("user1 Create: %v", err)
@@ -826,7 +812,7 @@ func TestCreateTrimsUserID(t *testing.T) {
 	svc, st := newTestService(t)
 	ctx := context.Background()
 
-	uid := seedUser(t, st, "sub-paste")
+	uid := storetest.SeedUser(t, st, "sub-paste")
 	a, err := svc.Create(ctx, CreateParams{UserID: "  " + uid + "  "})
 	if err != nil {
 		t.Fatalf("Create with whitespace-padded UserID: %v", err)

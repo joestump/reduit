@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/joestump/reduit/internal/store"
+	"github.com/joestump/reduit/internal/storetest"
 )
 
 // migrateMu serializes calls to store.Migrate across parallel tests —
@@ -41,30 +42,10 @@ func newTestStore(t *testing.T) (*store.Store, string) {
 
 	// Seed one account for the FK. The test does not exercise the
 	// account package's lifecycle so we insert directly with the minimum
-	// required columns.
+	// required columns via storetest.SeedUserAccountActive.
 	const accountID = "acct-test"
-	if err := seedAccount(st, accountID); err != nil {
-		t.Fatalf("seedAccount: %v", err)
-	}
+	storetest.SeedUserAccountActive(t, st, accountID)
 	return st, accountID
-}
-
-// Per ADR-0010 the accounts table no longer carries oidc_subject;
-// ownership is the user_id FK to users(id). seedAccount mints the
-// owning user inline so each account is a self-contained fixture and
-// the rest of the test doesn't have to reason about the user split.
-func seedAccount(st *store.Store, id string) error {
-	if _, err := st.DB.Exec(
-		`INSERT INTO users (id, oidc_subject) VALUES (?, ?)`,
-		"user-"+id, "sub-"+id,
-	); err != nil {
-		return err
-	}
-	const q = `
-INSERT INTO accounts (id, user_id, state, key_envelope, created_at, updated_at)
-VALUES (?, ?, 'active', X'00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-	_, err := st.DB.Exec(q, id, "user-"+id)
-	return err
 }
 
 func newMessage(t *testing.T, svc Service, accountID, protonID string) int64 {
@@ -252,9 +233,7 @@ func TestListMailboxesScopesToAccount(t *testing.T) {
 
 	// Seed a second account.
 	const acctB = "acct-bob"
-	if err := seedAccount(st, acctB); err != nil {
-		t.Fatalf("seedAccount(B): %v", err)
-	}
+	storetest.SeedUserAccountActive(t, st, acctB)
 
 	if _, err := svc.EnsureMailbox(ctx, acctA, "INBOX", ProtonInboxLabelID, KindSystem); err != nil {
 		t.Fatalf("EnsureMailbox(A INBOX): %v", err)
@@ -308,9 +287,7 @@ func TestGetMailboxByNameRefusesNonOwnedMailbox(t *testing.T) {
 	ctx := context.Background()
 
 	const acctB = "acct-bob"
-	if err := seedAccount(st, acctB); err != nil {
-		t.Fatalf("seedAccount(B): %v", err)
-	}
+	storetest.SeedUserAccountActive(t, st, acctB)
 
 	// Create a mailbox under account B.
 	bMbox, err := svc.EnsureMailbox(ctx, acctB, "Labels/Family", "user-family", KindUserLabel)
@@ -337,9 +314,7 @@ func TestAssignUIDRefusesNonOwnedMailbox(t *testing.T) {
 	ctx := context.Background()
 
 	const acctB = "acct-bob"
-	if err := seedAccount(st, acctB); err != nil {
-		t.Fatalf("seedAccount(B): %v", err)
-	}
+	storetest.SeedUserAccountActive(t, st, acctB)
 
 	bMbox, err := svc.EnsureMailbox(ctx, acctB, "INBOX", ProtonInboxLabelID, KindSystem)
 	if err != nil {
@@ -366,9 +341,7 @@ func TestAssignUIDRefusesCrossAccountMessage(t *testing.T) {
 	ctx := context.Background()
 
 	const acctB = "acct-bob"
-	if err := seedAccount(st, acctB); err != nil {
-		t.Fatalf("seedAccount(B): %v", err)
-	}
+	storetest.SeedUserAccountActive(t, st, acctB)
 
 	aMbox, err := svc.EnsureMailbox(ctx, acctA, "INBOX", ProtonInboxLabelID, KindSystem)
 	if err != nil {
@@ -579,9 +552,7 @@ func TestCountMessagesInMailboxIsAccountScoped(t *testing.T) {
 	ctx := context.Background()
 
 	const acctB = "acct-bob"
-	if err := seedAccount(st, acctB); err != nil {
-		t.Fatalf("seedAccount(B): %v", err)
-	}
+	storetest.SeedUserAccountActive(t, st, acctB)
 
 	mboxA, _ := svc.EnsureMailbox(ctx, acctA, "INBOX", ProtonInboxLabelID, KindSystem)
 	mboxB, _ := svc.EnsureMailbox(ctx, acctB, "INBOX", ProtonInboxLabelID, KindSystem)
