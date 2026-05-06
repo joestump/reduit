@@ -54,7 +54,10 @@ jobs:
     name: build + scan + push
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Mirror of `.github/workflows/ci.yml` action versions.
+      # Dependabot only watches `.github/workflows/`, so this file
+      # has to be bumped manually to keep the two CI surfaces aligned.
+      - uses: actions/checkout@v6
 
       - name: Set up QEMU
         run: docker run --rm --privileged tonistiigi/binfmt --install all
