@@ -341,6 +341,48 @@ func RevokeSessionsForUser(ctx context.Context, db *sql.DB, userID string) (int6
 	return n, nil
 }
 
+// SweepOrphanSessionOwners deletes session_owners rows whose token
+// no longer exists in the sessions table. Returns the number of rows
+// affected.
+//
+// Why this exists: when a user re-logs in through the same browser,
+// PutIdentity calls mgr.RenewToken inside SCS, which mints a fresh
+// token for subsequent writes. The prior token's session_owners row
+// is left orphaned -- the SCS sweep only drops `sessions` rows, not
+// the linked sidecar entries. We deliberately can NOT bolt this on
+// as a CASCADE foreign key because SCS commits via
+// `REPLACE INTO sessions` (i.e. DELETE + INSERT), which would fire
+// the cascade on every commit and clobber the bind mid-handler. See
+// migration 20260502000005_sessions_account_id.sql for the long form.
+//
+// Not a correctness bug: revocation paths key on user_id / account_id
+// (see RevokeSessionsForUser, RevokeSessionsForAccount), not on
+// token, so an orphaned row cannot keep a revoked user's session
+// alive. It only bloats the index. A periodic sweep keeps it bounded.
+//
+// Single bulk DELETE -- the index on session_owners(token) plus the
+// PK lookup on sessions(token) make the NOT IN subquery cheap even
+// with thousands of rows. Idempotent: running twice in a row affects
+// 0 rows the second time.
+//
+// Governing: ADR-0010, SPEC-0005 REQ "OIDC Login Flow"; issue #70;
+// PR #69 review M1 / C1.
+func SweepOrphanSessionOwners(ctx context.Context, db *sql.DB) (int64, error) {
+	if db == nil {
+		return 0, errors.New("session: nil db")
+	}
+	const q = `DELETE FROM session_owners WHERE token NOT IN (SELECT token FROM sessions)`
+	res, err := db.ExecContext(ctx, q)
+	if err != nil {
+		return 0, fmt.Errorf("session: sweep orphan owners: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("session: sweep orphan owners rows affected: %w", err)
+	}
+	return n, nil
+}
+
 // GetIdentity returns the cached identity. Subject is empty when no
 // authenticated user is bound to the session, which is the canonical
 // "unauthenticated" signal middleware uses.

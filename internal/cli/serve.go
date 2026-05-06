@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/tls"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -188,6 +189,21 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// REQ "Add-Proton-Account Wizard"; issue #82.
 	go runPendingAccountSweep(ctx, accountService, logger)
 
+	// Orphan session_owners sweep. Re-logins through the same browser
+	// leave the prior token's session_owners row stranded because
+	// SCS's RenewToken mints a fresh token for subsequent writes
+	// (and we can't FK-cascade off sessions(token) because SCS
+	// commits via REPLACE INTO, which would clobber the bind
+	// mid-handler -- see migration 20260502000005's commentary).
+	// Single bulk DELETE keyed on tokens not present in the sessions
+	// table; tiny rows so an hourly cadence keeps bloat trivial.
+	//
+	// First sweep runs immediately so a freshly-restarted daemon
+	// clears accumulated orphans without waiting a full hour.
+	//
+	// Governing: ADR-0010, SPEC-0005 REQ "OIDC Login Flow"; issue #70.
+	go runSessionOwnersSweep(ctx, st.DB.DB, logger)
+
 	// Proton client manager + wizard session store (#24). The manager
 	// is process-scoped (one resty client, many minted Clients); the
 	// wizard store keeps in-memory partial-credentials state with a
@@ -323,6 +339,65 @@ func runPendingAccountSweep(ctx context.Context, svc account.Service, logger *sl
 
 	// First sweep runs immediately so a freshly-restarted daemon
 	// clears accumulated orphans without waiting a full interval.
+	sweep()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			sweep()
+		}
+	}
+}
+
+// sessionOwnersSweepInterval matches pendingAccountSweepInterval --
+// orphan rows are tiny (~50 bytes) so we don't need to chase them
+// urgently, but an hourly cadence keeps the per-tick work trivial
+// and bounds index bloat well below anything an operator would
+// notice. Pre-alpha: hardcoded.
+//
+// Governing: issue #70.
+const sessionOwnersSweepInterval = time.Hour
+
+// runSessionOwnersSweep is the goroutine body for the orphan
+// session_owners cleanup scheduled out of runServe. Mirrors
+// runPendingAccountSweep:
+//
+//   - first sweep fires immediately so a fresh restart clears
+//     accumulated orphans without waiting the full interval
+//   - subsequent sweeps follow the ticker
+//   - each call gets a 30s deadline derived from parent ctx so a
+//     SIGINT mid-query cancels rather than lingering past
+//     `defer st.Close()` in runServe
+//   - context.Canceled during shutdown is silenced so it doesn't
+//     pollute shutdown logs
+//   - any other error is logged-and-swallowed; a transient DB error
+//     MUST NOT take the daemon down, and the next tick retries
+//
+// Governing: ADR-0010, SPEC-0005 REQ "OIDC Login Flow"; issue #70.
+func runSessionOwnersSweep(ctx context.Context, db *sql.DB, logger *slog.Logger) {
+	tick := time.NewTicker(sessionOwnersSweepInterval)
+	defer tick.Stop()
+
+	sweep := func() {
+		opCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		n, err := authsession.SweepOrphanSessionOwners(opCtx, db)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			logger.Warn("session_owners sweep failed",
+				slog.String("error", err.Error()))
+			return
+		}
+		if n > 0 {
+			logger.Info("session_owners sweep deleted orphans",
+				slog.Int64("count", n))
+		}
+	}
+
 	sweep()
 
 	for {
