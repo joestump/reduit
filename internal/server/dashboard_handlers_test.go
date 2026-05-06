@@ -20,6 +20,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -82,9 +83,44 @@ func TestDashboard_UnauthRedirectsToLogin(t *testing.T) {
 	baseURL, _, _, _ := dashboardTestServer(t, nil)
 	c := newClient(t)
 
-	status, _ := fetch(t, c, baseURL+"/accounts")
-	if status != http.StatusFound {
-		t.Errorf("status = %d, want 302", status)
+	// Disable redirect following so we can inspect the gate's 302
+	// response directly. The default client (newClient) follows
+	// redirects, which would consume the Location header and report
+	// the IdP's response shape instead of the dashboard gate's.
+	c.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := c.Get(baseURL + "/accounts")
+	if err != nil {
+		t.Fatalf("GET /accounts: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("status = %d, want 302", resp.StatusCode)
+	}
+
+	// SPEC-0005 REQ "Authentication Gating" Scenario "Unauthenticated
+	// request redirects to login" mandates the redirect points at
+	// /auth/login with a return_to query param echoing the original
+	// request URI. Asserting on the Location header pins the gate-to-
+	// dashboard wiring -- the broader auth_test suite exercises the
+	// same gate generically, but a dashboard-specific assertion catches
+	// a regression that only affects the /accounts route (e.g., a
+	// future caller that mounts /accounts outside the gate, or a
+	// return_to encoder that drops the path).
+	//
+	// Governing: SPEC-0005 REQ "Authentication Gating"; PR #72 review (N2).
+	loc := resp.Header.Get("Location")
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("Location %q parse: %v", loc, err)
+	}
+	if u.Path != "/auth/login" {
+		t.Errorf("Location.Path = %q, want /auth/login (full Location: %q)", u.Path, loc)
+	}
+	if got := u.Query().Get("return_to"); got != "/accounts" {
+		t.Errorf("return_to = %q, want /accounts (full Location: %q)", got, loc)
 	}
 }
 
