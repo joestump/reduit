@@ -15,10 +15,14 @@
 //
 // Subsequent stories fill in the remaining SPEC-0002 surface:
 //
-//   - Issue #17 layers backoff-with-jitter, IMAP IDLE pubsub
-//     publication, and permanent-error account-state transitions
-//     (SPEC-0002 REQ "Backoff on Failure", "IMAP Update Notification",
-//     refresh-token-revoked handling).
+//   - Issue #17 (partial): backoff-with-jitter is implemented in
+//     internal/sync/backoff.go and consumed by worker.tick on every
+//     transient processOnce error; the curve is reset on every
+//     successful tick. The remaining #17 surface — IMAP IDLE pubsub
+//     publication and permanent-error account-state transitions
+//     (refresh-token-revoked → pending_proton_setup) — is still
+//     pending and depends on issues #19 (event materialisation) and
+//     a yet-to-be-built AccountSnapshot wiring path.
 //   - Issue #19 lands the mailbox/UID materialisation that consumes
 //     the cursor pipeline plumbed here.
 //
@@ -39,4 +43,10 @@
 //   - "Panic Isolation" — each worker goroutine runs under a deferred
 //     recover that logs the panic value + stack and marks the worker
 //     crashed without taking down the supervisor.
+//   - "Backoff on Failure" — every transient processOnce error advances
+//     a per-worker full-jitter exponential backoff curve
+//     (delay = uniform(0, min(max, base * 2^attempt)); base=1s,
+//     max=5min by default). The curve resets on every successful tick.
+//     Permanent-error classification (refresh-token-revoked → state
+//     transition) is deferred to a follow-up.
 package sync

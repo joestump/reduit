@@ -53,6 +53,14 @@ type worker struct {
 	// this with a real injection-based panic test once the Proton
 	// call plumbing lands.
 	panicker func()
+
+	// bo is the per-worker backoff state. Touched only from the run
+	// goroutine (next() after a transient failure, reset() after a
+	// successful processOnce), so no lock. The supervisor's Config
+	// supplies base, max, and the RNG source.
+	//
+	// Governing: SPEC-0002 REQ "Backoff on Failure".
+	bo *backoff
 }
 
 // newWorker constructs an unstarted worker bound to the supervisor's
@@ -67,6 +75,7 @@ func newWorker(parent context.Context, id string, sup *Supervisor) *worker {
 		ctx:    ctx,
 		cancel: cancel,
 		done:   make(chan struct{}),
+		bo:     newBackoff(sup.cfg.BackoffBase, sup.cfg.BackoffMax, sup.cfg.BackoffRand),
 	}
 }
 
@@ -249,23 +258,56 @@ func (w *worker) tick() {
 		}
 		more, err := w.runProcessOnce()
 		if err != nil {
-			// Story #17 will classify (transient vs permanent) and
-			// emit backoff. For #16 plumbing we just log + bail; the
-			// next ticker fire retries.
-			//
 			// errProtonSlotUnavailable is a special case: ctx was
 			// canceled while waiting for a slot (e.g. graceful
 			// shutdown), so we exit silently rather than logging an
-			// error.
+			// error or bumping the backoff counter — there was no
+			// upstream failure to retry against.
 			if err == errProtonSlotUnavailable {
 				return
 			}
+			// Transient error path: log, then sleep for a
+			// jitter-bounded backoff window before yielding to the
+			// next ticker fire. Per SPEC-0002 REQ "Backoff on
+			// Failure", consecutive failures grow the upper bound
+			// exponentially up to BackoffMax; a successful tick later
+			// resets the curve via bo.reset().
+			//
+			// Permanent-error classification (refresh-token-revoked
+			// → pending_proton_setup) is deliberately deferred to a
+			// follow-up — it requires AccountSnapshot wiring and a
+			// state-transition path that's still being designed.
+			// Until then every non-cancel error walks the same
+			// backoff curve. This is correct for transient errors
+			// (network blips, Proton 5xx) and merely suboptimal for
+			// permanent ones (we retry on the curve until an operator
+			// suspends the account manually).
+			delay := w.bo.next()
 			w.logger.LogAttrs(w.ctx, slog.LevelError,
-				"sync: event processing failed; will retry next tick",
+				"sync: event processing failed; backing off before retry",
 				slog.Any("err", err),
+				slog.Duration("delay", delay),
+				slog.Int("attempt", w.bo.attempts()),
 			)
+			// Sleep cancel-aware so a graceful Stop wakes us
+			// immediately. A returned ctx.Err is the supervisor's
+			// signal that we're draining; exit silently in that case
+			// (the run loop's ctx.Done branch will log the drain).
+			if serr := sleepCtx(w.ctx, delay); serr != nil {
+				return
+			}
 			return
 		}
+		// Success — reset the backoff curve so the next failure starts
+		// from `base` rather than wherever the prior streak left off.
+		// Reset on every successful processOnce (not just on the final
+		// iteration of the burst) so a partial-progress streak that
+		// later fails doesn't carry an inflated counter from before
+		// the recovery began.
+		//
+		// Governing: SPEC-0002 REQ "Backoff on Failure" — "Failure
+		// counter resets on success".
+		w.bo.reset()
 		if !more {
 			return
 		}

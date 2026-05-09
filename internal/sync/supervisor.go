@@ -128,6 +128,28 @@ type Config struct {
 	// violate "Graceful Shutdown" by trapping the worker in a tight
 	// loop while ctx.Done waits to be observed.
 	MaxConsecutiveTicks int
+
+	// BackoffBase is the lower envelope of the per-worker exponential
+	// backoff curve. Each consecutive transient failure draws a delay
+	// from `[0, base * 2^attempt)`, capped at BackoffMax. <= 0 means
+	// DefaultBackoffBase (1s).
+	//
+	// Governing: SPEC-0002 REQ "Backoff on Failure".
+	BackoffBase time.Duration
+
+	// BackoffMax caps the upper envelope of the backoff curve. <= 0
+	// means DefaultBackoffMax (5min). MUST be >= BackoffBase; if
+	// misconfigured the resolved value is snapped to base so the
+	// "delay <= max" invariant holds.
+	//
+	// Governing: SPEC-0002 REQ "Backoff on Failure".
+	BackoffMax time.Duration
+
+	// BackoffRand is an injectable [0,1) uniform source used by tests
+	// to pin exact delay durations. nil means math/rand/v2's global
+	// generator (which is fine for production: full jitter is the
+	// defense, the source's bias is irrelevant).
+	BackoffRand func() float64
 }
 
 // resolved fills in defaults for every zero-valued field. Returned by
@@ -156,6 +178,18 @@ func (c Config) resolved() Config {
 	}
 	if c.MaxConsecutiveTicks <= 0 {
 		c.MaxConsecutiveTicks = DefaultMaxConsecutiveTicks
+	}
+	if c.BackoffBase <= 0 {
+		c.BackoffBase = DefaultBackoffBase
+	}
+	if c.BackoffMax <= 0 {
+		c.BackoffMax = DefaultBackoffMax
+	}
+	if c.BackoffMax < c.BackoffBase {
+		// Pathological misconfiguration; snap so newBackoff doesn't
+		// have to special-case it again. The same fix is applied in
+		// newBackoff itself for callers that bypass Config.resolved.
+		c.BackoffMax = c.BackoffBase
 	}
 	return c
 }
