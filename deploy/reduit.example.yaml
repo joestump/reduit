@@ -3,6 +3,17 @@
 # Copy this file to /etc/reduit/reduit.yaml or pass --config /path
 # at startup. Secrets (oidc.client_secret) should come from env
 # (REDUIT_OIDC_CLIENT_SECRET) rather than living in the file.
+#
+# Any REDUIT_* env var also supports a "_FILE" variant whose value is
+# the path to a file containing the secret (Docker secrets / Kubernetes
+# secrets convention). For example:
+#
+#   REDUIT_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+#
+# When both forms are set, the "_FILE" variant wins. Trailing
+# whitespace (including the newline Docker appends) is stripped from
+# the file contents. A "_FILE" pointer to a missing file is a hard
+# error at startup.
 
 server:
   http_addr: ":443"     # Admin UI + MCP (HTTPS)

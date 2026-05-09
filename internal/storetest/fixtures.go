@@ -110,4 +110,3 @@ func seedUserAccount(t *testing.T, st *store.Store, accountID, state string) str
 	}
 	return accountID
 }
-

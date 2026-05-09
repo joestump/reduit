@@ -35,6 +35,19 @@ services:
 
     environment:
       # Secrets are best supplied via env, not the YAML file.
+      #
+      # Two forms are supported. Pick one:
+      #
+      #   1. Direct value (simplest):
+      #        REDUIT_OIDC_CLIENT_SECRET: "${REDUIT_OIDC_CLIENT_SECRET}"
+      #
+      #   2. File-based (Docker secrets / k8s secrets / systemd
+      #      LoadCredential). The env var ends in `_FILE` and points at
+      #      a path; reduit reads the file at startup, strips trailing
+      #      whitespace, and treats the contents as the value:
+      #        REDUIT_OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+      #      ... combined with a top-level `secrets:` block and a
+      #      service-level `secrets: [oidc_client_secret]` mount.
       REDUIT_OIDC_CLIENT_SECRET: "${REDUIT_OIDC_CLIENT_SECRET}"
       # Optional structured logging:
       # REDUIT_LOGGER_FORMAT: json

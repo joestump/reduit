@@ -2,10 +2,23 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/viper"
 )
+
+// envPrefix is the prefix viper uses for environment-variable
+// overrides. Exported as a constant so the *_FILE resolver below uses
+// the same value.
+const envPrefix = "REDUIT"
+
+// fileSuffix is appended to any env var name to indicate that the
+// value should be read from the file at that path rather than used
+// directly. This follows the file-based secret delivery convention
+// used by Docker secrets (`/run/secrets/<name>`) and codified in the
+// stumpcloud Ansible role contract (ADR-0006 / ADR-0017).
+const fileSuffix = "_FILE"
 
 // Load reads configuration from `path` (if non-empty) and overlays
 // environment-variable overrides under the REDUIT_ prefix. Defaults
@@ -17,9 +30,20 @@ import (
 //	REDUIT_OIDC_CLIENT_SECRET -> oidc.client_secret
 //	REDUIT_STORE_PATH         -> store.path
 //	REDUIT_LOGGER_LEVEL       -> logger.level
+//
+// Any env var ending in `_FILE` (e.g. REDUIT_OIDC_CLIENT_SECRET_FILE)
+// is resolved by reading the file at that path; the file's trimmed
+// contents become the value of the corresponding non-`_FILE` env var.
+// This mirrors the Docker secrets convention where the secret value
+// arrives as a file at /run/secrets/<name> rather than as an env
+// string. If the `_FILE` variant is set but unreadable, Load fails.
 func Load(path string) (Config, error) {
+	if err := resolveFileEnv(envPrefix); err != nil {
+		return Config{}, fmt.Errorf("resolve _FILE env vars: %w", err)
+	}
+
 	v := viper.New()
-	v.SetEnvPrefix("REDUIT")
+	v.SetEnvPrefix(envPrefix)
 	// Map dotted config keys ("oidc.client_secret") to env names
 	// ("REDUIT_OIDC_CLIENT_SECRET").
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
@@ -43,6 +67,70 @@ func Load(path string) (Config, error) {
 	}
 
 	return loaded, nil
+}
+
+// resolveFileEnv walks the process environment looking for variables
+// of the form "<prefix>_<NAME>_FILE" and, for each one, reads the
+// referenced file and sets "<prefix>_<NAME>" in the environment to
+// the file's trimmed contents. Existing direct values are overwritten
+// when the `_FILE` variant is present, on the principle that file-
+// based delivery (Docker secrets, Kubernetes secrets, systemd
+// LoadCredential) is the more deliberate, more secure path and should
+// take precedence when both are set.
+//
+// A non-empty `<NAME>_FILE` whose target is missing or unreadable is
+// a hard error: silently falling back to "" would mask a deployment
+// misconfiguration and leave the service running without the secret.
+//
+// Trailing whitespace (including the newline Docker secrets append)
+// is stripped from the file contents.
+func resolveFileEnv(prefix string) error {
+	suffix := fileSuffix
+	prefixUnderscore := prefix + "_"
+
+	for _, kv := range os.Environ() {
+		eq := strings.IndexByte(kv, '=')
+		if eq < 0 {
+			continue
+		}
+		name := kv[:eq]
+		path := kv[eq+1:]
+
+		if !strings.HasPrefix(name, prefixUnderscore) {
+			continue
+		}
+		if !strings.HasSuffix(name, suffix) {
+			continue
+		}
+		if path == "" {
+			// An empty _FILE value is treated as unset; no-op so
+			// callers can clear the variable defensively.
+			continue
+		}
+		baseName := strings.TrimSuffix(name, suffix)
+		if baseName == prefix {
+			// The bare "REDUIT_FILE" doesn't map to anything; skip.
+			continue
+		}
+
+		data, err := os.ReadFile(path) //nolint:gosec // path is operator-controlled config
+		if err != nil {
+			return fmt.Errorf("%s=%q: %w", name, path, err)
+		}
+		value := strings.TrimRight(string(data), " \t\r\n")
+		if value == "" {
+			// A whitespace-only or zero-byte file is treated as a
+			// hard error rather than silently substituting an empty
+			// secret -- a botched secret mount would otherwise let
+			// the service boot with e.g. OIDC.ClientSecret="" and
+			// degrade to public-client mode without warning.
+			return fmt.Errorf("%s=%q: file is empty after trim", name, path)
+		}
+		if err := os.Setenv(baseName, value); err != nil {
+			return fmt.Errorf("set %s from %s: %w", baseName, name, err)
+		}
+	}
+	return nil
 }
 
 // bindDefaults sets each known key as a viper default so AutomaticEnv
