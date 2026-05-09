@@ -384,6 +384,161 @@ func TestWorkerBackoffOnFailureThenResetOnSuccess(t *testing.T) {
 	}
 }
 
+// TestWorkerProtonSlotDrainDoesNotBumpBackoff pins the
+// "errProtonSlotUnavailable on graceful drain" invariant: when a
+// worker is parked inside AcquireProtonSlot at Stop time, the
+// resulting drain MUST exit silently — the backoff counter MUST NOT
+// advance, because there was no upstream failure to retry against.
+//
+// SPEC-0002 REQ "Backoff on Failure" only counts transient processing
+// failures; a context cancel observed by AcquireProtonSlot is a
+// shutdown signal, not a retry-worthy event. The early-return in
+// tick() (now spelled with errors.Is per nit #2) is what enforces
+// that distinction; this test pins the behaviour at the worker level
+// so a future refactor that drops the early-return is caught here
+// rather than in production telemetry.
+//
+// Setup: ConcurrencyCap=1 + a sibling that holds the only slot via a
+// long-running tick. The account-under-test's worker enters tick(),
+// calls AcquireProtonSlot, and parks because the semaphore is full.
+// Stop() then cancels every worker's context; the parked
+// AcquireProtonSlot returns ctx.Err(), runProcessOnce wraps it in
+// errProtonSlotUnavailable, and tick() takes the silent-drain branch.
+// After Stop returns we read w.bo.attempt directly — the run goroutine
+// has fully exited so there is no race.
+func TestWorkerProtonSlotDrainDoesNotBumpBackoff(t *testing.T) {
+	t.Parallel()
+	svc, usrSvc := newTestAccountService(t)
+	ctx := context.Background()
+
+	// Sibling holds the slot for as long as its tick body sits inside
+	// the holder closure. We block until the test releases `holdRel`,
+	// guaranteeing the second worker hits a full semaphore.
+	holdAcquired := make(chan struct{})
+	holdRel := make(chan struct{})
+	var holdOnce sync.Once
+	siblingFC := &fakeProtonClient{
+		latest: "evt-bootstrap",
+		getEventFn: func(string) ([]proton.Event, bool, error) {
+			// Park the sibling's tick so it keeps the only slot.
+			// Multiple ticks may land here over the test's lifetime;
+			// only the first signals the gate.
+			holdOnce.Do(func() { close(holdAcquired) })
+			<-holdRel
+			return nil, false, nil
+		},
+	}
+
+	// The account-under-test's client should NEVER see GetEvent: it
+	// must be parked inside AcquireProtonSlot, never reaching the
+	// processor's Proton call. A reached call here means the
+	// concurrency cap was bypassed and the test is no longer pinning
+	// the drain path.
+	var targetGetEventCalls int32
+	targetFC := &fakeProtonClient{
+		latest: "evt-bootstrap",
+		getEventFn: func(string) ([]proton.Event, bool, error) {
+			atomic.AddInt32(&targetGetEventCalls, 1)
+			return nil, false, nil
+		},
+	}
+
+	siblingID := "sub-slot-holder"
+	targetID := "sub-slot-parked"
+	sibling := createTestAccount(t, svc, usrSvc, siblingID)
+	target := createTestAccount(t, svc, usrSvc, targetID)
+
+	cfg := fastConfig()
+	cfg.ConcurrencyCap = 1 // Force serialization on the semaphore.
+	cfg.PollInterval = 5 * time.Millisecond
+	// Long backoffs so any (incorrect) bump would be visible without
+	// the test having to race the run loop's sleep.
+	cfg.BackoffBase = time.Hour
+	cfg.BackoffMax = time.Hour
+	cfg.ClientFactory = func(_ context.Context, accountID string) (proton.Client, error) {
+		switch accountID {
+		case sibling.ID:
+			return siblingFC, nil
+		case target.ID:
+			return targetFC, nil
+		default:
+			t.Errorf("unexpected ClientFactory call for %q", accountID)
+			return nil, errors.New("unexpected account")
+		}
+	}
+	sup := New(svc, cfg)
+	if err := sup.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Release the holder before Stop so its tick can return; otherwise
+	// Stop's graceful drain has to wait for the holder's full timeout.
+	t.Cleanup(func() {
+		select {
+		case <-holdRel:
+		default:
+			close(holdRel)
+		}
+	})
+
+	// Activate the sibling first so it grabs the only slot. Wait until
+	// its first tick has actually entered the holder closure — that
+	// confirms it owns the slot.
+	if _, err := svc.Transition(ctx, sibling.ID, account.StateActive); err != nil {
+		t.Fatalf("Transition sibling active: %v", err)
+	}
+	select {
+	case <-holdAcquired:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("sibling never grabbed the proton slot")
+	}
+
+	// Activate the target. Its first tick will call AcquireProtonSlot
+	// and park because the only slot is held by the sibling.
+	if _, err := svc.Transition(ctx, target.ID, account.StateActive); err != nil {
+		t.Fatalf("Transition target active: %v", err)
+	}
+
+	// Capture the target worker pointer for the post-drain assertion.
+	var targetWorker *worker
+	if !waitFor(t, time.Second, func() bool {
+		sup.workersMu.Lock()
+		defer sup.workersMu.Unlock()
+		w, ok := sup.workers[target.ID]
+		if ok {
+			targetWorker = w
+		}
+		return ok
+	}) {
+		t.Fatalf("target worker for %q never appeared in the live map", target.ID)
+	}
+
+	// Give the target worker enough time to land inside
+	// AcquireProtonSlot. Without a positive signal we sleep briefly;
+	// PollInterval=5ms means the first tick has fired well within
+	// 50ms, and the worker is then blocked on the semaphore until ctx
+	// cancels.
+	time.Sleep(50 * time.Millisecond)
+
+	// Drain. signalStop -> cancel -> AcquireProtonSlot returns ctx.Err
+	// -> runProcessOnce returns errProtonSlotUnavailable -> tick
+	// returns silently. The sibling's holder is released by the
+	// cleanup so the supervisor's graceful window is plenty.
+	close(holdRel)
+	if err := sup.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+
+	// After Stop returns the run goroutine has exited, so direct read
+	// of bo.attempt is race-free. SPEC-0002 invariant: graceful drain
+	// MUST NOT bump the consecutive-failure counter.
+	if got := targetGetEventCalls; got != 0 {
+		t.Errorf("target GetEvent was called %d times; want 0 (worker should have parked at AcquireProtonSlot, not reached processOnce)", got)
+	}
+	if got := targetWorker.bo.attempts(); got != 0 {
+		t.Errorf("target worker bo.attempt = %d after graceful drain; want 0 (errProtonSlotUnavailable must not bump the backoff counter)", got)
+	}
+}
+
 // TestWorkerBackoffEscalatesAcrossConsecutiveFailures pins the
 // "exponential backoff with jitter" scenario: WITHOUT a success
 // between failures, the attempt counter climbs strictly so the upper

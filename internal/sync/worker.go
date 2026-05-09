@@ -7,6 +7,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"runtime/debug"
 	"sync"
@@ -262,8 +263,12 @@ func (w *worker) tick() {
 			// canceled while waiting for a slot (e.g. graceful
 			// shutdown), so we exit silently rather than logging an
 			// error or bumping the backoff counter — there was no
-			// upstream failure to retry against.
-			if err == errProtonSlotUnavailable {
+			// upstream failure to retry against. Use errors.Is so a
+			// future caller that wraps the sentinel (e.g. through
+			// fmt.Errorf("...: %w", errProtonSlotUnavailable)) still
+			// hits this drain branch instead of walking the backoff
+			// curve on a graceful-shutdown event.
+			if errors.Is(err, errProtonSlotUnavailable) {
 				return
 			}
 			// Transient error path: log, then sleep for a
@@ -290,12 +295,16 @@ func (w *worker) tick() {
 				slog.Int("attempt", w.bo.attempts()),
 			)
 			// Sleep cancel-aware so a graceful Stop wakes us
-			// immediately. A returned ctx.Err is the supervisor's
-			// signal that we're draining; exit silently in that case
-			// (the run loop's ctx.Done branch will log the drain).
-			if serr := sleepCtx(w.ctx, delay); serr != nil {
-				return
-			}
+			// immediately, then yield to the next ticker fire
+			// regardless of whether the sleep completed naturally or
+			// was cut short by cancellation. The previous form
+			// branched on sleepCtx's return but both arms returned —
+			// the conditional was dead code. We keep the
+			// "sleep-then-return-to-ticker" semantic (the run loop's
+			// ctx.Done branch logs the drain on the next select); the
+			// effective inter-retry gap is `delay + remaining tick
+			// interval`, which is what production has always shipped.
+			_ = sleepCtx(w.ctx, delay)
 			return
 		}
 		// Success — reset the backoff curve so the next failure starts
