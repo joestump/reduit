@@ -197,11 +197,13 @@ func TestTransitionTable(t *testing.T) {
 		{StatePendingProtonSetup, StateSoftDeleted, true},
 		{StateActive, StateSuspended, true},
 		{StateActive, StateSoftDeleted, true},
+		// SPEC-0002 REQ "Backoff on Failure" — refresh-token-revoked
+		// kicks the account back to pending so the wizard re-prompts.
+		{StateActive, StatePendingProtonSetup, true},
 		{StateSuspended, StateActive, true},
 		{StateSuspended, StateSoftDeleted, true},
 		// Denied
 		{StatePendingProtonSetup, StateSuspended, false},
-		{StateActive, StatePendingProtonSetup, false},
 		{StateSuspended, StatePendingProtonSetup, false},
 		{StateSoftDeleted, StateActive, false},
 		{StateSoftDeleted, StateSuspended, false},
@@ -903,6 +905,51 @@ func TestPrimaryAlias(t *testing.T) {
 // it's computed from OIDC_ADMIN_SUBS at session-bind time. The
 // equivalent empty-subject defense for the session layer is owned
 // by #61 and tested in internal/auth/session.)
+
+// TestMarkCrashedSetsFlag pins SPEC-0002 REQ "Panic Isolation": the
+// supervisor's panic-recovery defer calls MarkCrashed to surface the
+// "needs manual reset" signal in the admin UI without polling. Calling
+// it on a non-existent account returns ErrAccountNotFound.
+//
+// Governing: SPEC-0002 REQ "Panic Isolation".
+func TestMarkCrashedSetsFlag(t *testing.T) {
+	t.Parallel()
+	svc, st := newTestService(t)
+	ctx := context.Background()
+
+	a := createTestAccount(t, svc, st, ctx, "sub-mark-crashed")
+	if a.Crashed {
+		t.Fatalf("freshly-created account is crashed; want false")
+	}
+
+	if err := svc.MarkCrashed(ctx, a.ID); err != nil {
+		t.Fatalf("MarkCrashed: %v", err)
+	}
+
+	got, err := svc.GetByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if !got.Crashed {
+		t.Errorf("Crashed = false after MarkCrashed; want true")
+	}
+
+	// State MUST NOT change: crashed is a flag, not a transition.
+	if got.State != StatePendingProtonSetup {
+		t.Errorf("state changed by MarkCrashed: got %q, want pending_proton_setup", got.State)
+	}
+
+	// Idempotent: a second call is a no-op (the row matches; the
+	// column already holds 1).
+	if err := svc.MarkCrashed(ctx, a.ID); err != nil {
+		t.Errorf("idempotent MarkCrashed: %v", err)
+	}
+
+	// Missing-row → ErrAccountNotFound.
+	if err := svc.MarkCrashed(ctx, "no-such-id"); !errors.Is(err, ErrAccountNotFound) {
+		t.Errorf("MarkCrashed(missing) = %v, want ErrAccountNotFound", err)
+	}
+}
 
 // TestSoftDeleteOldPending exercises the retention sweep that #82
 // added so orphan pending_proton_setup rows (created when a wizard

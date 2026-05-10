@@ -480,3 +480,6 @@ func (f *fakeAccountsAlwaysActive) SetSyncState(context.Context, string, string,
 func (f *fakeAccountsAlwaysActive) SoftDeleteOldPending(context.Context, time.Duration) (int64, error) {
 	panic("not implemented")
 }
+func (f *fakeAccountsAlwaysActive) MarkCrashed(context.Context, string) error {
+	panic("not implemented")
+}
