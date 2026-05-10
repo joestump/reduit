@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"context"
 	"net/http"
 )
 
@@ -48,4 +49,27 @@ func NewWithTerminal(deps Deps, terminal http.Handler) *Server {
 		deps:    deps,
 		handler: chain,
 	}
+}
+
+// CallListMessages drives the unexported list_messages handler from
+// the _test package. Tests assert on the typed output without going
+// through the SDK's JSON-RPC dispatch; that's covered separately by
+// the end-to-end registration test.
+func CallListMessages(ctx context.Context, td ToolDeps, in ListMessagesIn) (ListMessagesOut, error) {
+	return listMessages(ctx, td, in)
+}
+
+// CallGetMessage drives the unexported get_message handler.
+func CallGetMessage(ctx context.Context, td ToolDeps, in GetMessageIn) (GetMessageOut, error) {
+	return getMessage(ctx, td, in)
+}
+
+// CallSearchMessages drives the unexported search_messages handler.
+func CallSearchMessages(ctx context.Context, td ToolDeps, in SearchMessagesIn) (SearchMessagesOut, error) {
+	return searchMessages(ctx, td, in)
+}
+
+// CallListLabels drives the unexported list_labels handler.
+func CallListLabels(ctx context.Context, td ToolDeps, in ListLabelsIn) (ListLabelsOut, error) {
+	return listLabels(ctx, td, in)
 }

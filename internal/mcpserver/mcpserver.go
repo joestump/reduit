@@ -22,15 +22,15 @@
 //     `Retry-After: 5`. Per ADR-0008 / SPEC-0006 this prevents a
 //     single account from exhausting per-account Proton API quotas.
 //
-// This package deliberately does NOT register any tool implementations
-// in this story (#27); tool surface lands in #28-#30. The /mcp endpoint
-// here serves a working `tools/list` that returns an empty array, plus
-// an `initialize` handshake -- enough to prove auth + concurrency over
-// a real MCP transport.
+// Tool registration: SPEC-0006's read-half tool surface
+// (list_messages, get_message, search_messages, list_labels) is
+// registered at construction by RegisterReadTools. Write tools (#29)
+// and streaming variants (#30) layer on top of the same *mcp.Server.
 //
 // Governing: ADR-0008 (embedded MCP server), SPEC-0006 REQ "Bearer
 // Authentication Required", SPEC-0006 REQ "Account Scope on All
-// Operations", SPEC-0006 REQ "Per-Account Concurrency Limit".
+// Operations", SPEC-0006 REQ "Per-Account Concurrency Limit",
+// SPEC-0006 REQ "Required Tool Set".
 package mcpserver
 
 import (
@@ -42,6 +42,7 @@ import (
 
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/auth"
+	"github.com/joestump/reduit/internal/mailbox"
 	"github.com/joestump/reduit/internal/users"
 )
 
@@ -54,7 +55,7 @@ const Version = "0.1.0"
 
 // MaxRequestBodyBytes is the cap on inbound MCP HTTP request bodies.
 // JSON-RPC tool calls in this story carry small inputs; tool stories
-// (#28-#30) may add larger payloads (e.g. send_message with inline
+// (#29-#30) may add larger payloads (e.g. send_message with inline
 // attachments) and lift this. Until then, 1 MiB is a generous cap
 // that bounds memory pressure from a hostile or buggy client.
 //
@@ -90,6 +91,25 @@ type Deps struct {
 	// pass a NoLimiter() to bypass the gate.
 	Limiter Limiter
 
+	// Mailboxes is the per-account mailbox + message store the read
+	// tools query (list_messages, list_labels). Required when
+	// constructing via New (the production path); tests using
+	// NewWithTerminal may leave this nil because they never reach
+	// the tool layer.
+	//
+	// Governing: SPEC-0006 REQ "Required Tool Set" (read).
+	Mailboxes mailbox.Service
+
+	// ProtonForAccount mints a session-bearing proton.Client for an
+	// account-scoped tool invocation. Required when constructing via
+	// New. The composition root wires this to a closure that resolves
+	// account secrets via account.Service and calls
+	// proton.Manager.NewClient.
+	//
+	// Governing: SPEC-0006 REQ "Required Tool Set" (read);
+	// ADR-0001 (go-proton-api).
+	ProtonForAccount ProtonClientFactory
+
 	// Logger is used for structured authn/authz failures and
 	// concurrency-overflow diagnostics. Required.
 	Logger *slog.Logger
@@ -109,11 +129,11 @@ type Server struct {
 // middleware chain.
 //
 // The MCP-protocol Server is constructed once at boot and reused for
-// every session. No tools are registered here; tool registration lands
-// in subsequent stories (#28-#30) and is intentionally out of scope so
-// this PR's diff stays focused on auth + concurrency scaffolding.
+// every session. Read-half tool registration runs here; subsequent
+// stories (#29-#30) layer additional tools onto the same *mcp.Server
+// via dedicated RegisterXxxTools entry points.
 //
-// Governing: ADR-0008.
+// Governing: ADR-0008, SPEC-0006 REQ "Required Tool Set" (read).
 func New(deps Deps) *Server {
 	if deps.Validator == nil {
 		panic("mcpserver: nil Validator")
@@ -124,6 +144,12 @@ func New(deps Deps) *Server {
 	if deps.Limiter == nil {
 		panic("mcpserver: nil Limiter")
 	}
+	if deps.Mailboxes == nil {
+		panic("mcpserver: nil Mailboxes")
+	}
+	if deps.ProtonForAccount == nil {
+		panic("mcpserver: nil ProtonForAccount")
+	}
 	if deps.Logger == nil {
 		deps.Logger = slog.Default()
 	}
@@ -132,6 +158,18 @@ func New(deps Deps) *Server {
 		Name:    "reduit",
 		Version: Version,
 	}, nil)
+
+	// Register the read-side tool surface (SPEC-0006 #28). Write
+	// tools (#29) and streaming variants (#30) layer on top of the
+	// same mcpSrv via additional RegisterXxxTools calls; that
+	// keeps the registration call sites thin and per-story-scoped.
+	//
+	// Governing: SPEC-0006 REQ "Required Tool Set" (read).
+	RegisterReadTools(mcpSrv, ToolDeps{
+		Mailboxes:        deps.Mailboxes,
+		ProtonForAccount: deps.ProtonForAccount,
+		Logger:           deps.Logger,
+	})
 
 	// SDK's streamable-HTTP handler. The `getServer` callback returns
 	// the same server for every session: per ADR-0008 the MCP server
@@ -196,7 +234,7 @@ func limitRequestBody(max int64, next http.Handler) http.Handler {
 func (s *Server) Handler() http.Handler { return s.handler }
 
 // MCPServer exposes the wrapped *mcp.Server for tool-registration
-// callers (issues #28-#30). Returning the inner server keeps tool
+// callers (issues #29-#30). Returning the inner server keeps tool
 // wiring reachable without re-plumbing every dependency through Deps.
 func (s *Server) MCPServer() *mcp.Server { return s.mcp }
 
@@ -219,8 +257,17 @@ func AccountFromContext(ctx context.Context) *account.Account {
 	return nil
 }
 
-// withAccount returns a new context with acct attached. Exported
-// nowhere -- the auth middleware is the only legitimate caller.
+// WithAccount returns a new context with acct attached. Exported for
+// test-only callers that need to drive a tool handler directly without
+// going through the auth/HTTP chain (the production seam is the
+// requireBearerAndAccount middleware).
+func WithAccount(ctx context.Context, acct *account.Account) context.Context {
+	return withAccount(ctx, acct)
+}
+
+// withAccount is the unexported worker the auth middleware calls.
+// Exported callers use WithAccount; the split exists so the test seam
+// is explicitly separate from the production seam in code search.
 func withAccount(ctx context.Context, acct *account.Account) context.Context {
 	return context.WithValue(ctx, accountCtxKey{}, acct)
 }

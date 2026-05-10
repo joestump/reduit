@@ -21,6 +21,7 @@ import (
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	authsession "github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/cryptenv"
+	"github.com/joestump/reduit/internal/mailbox"
 	"github.com/joestump/reduit/internal/mcpserver"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/server"
@@ -254,10 +255,28 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		mcpTokens := mcptoken.NewRepository(st.DB)
 		validator := auth.NewBearerValidator(oidcClient, mcpTokens).
 			WithSubjectResolver(makeSubjectResolver(accountService, usersService))
+		// mailbox.Service backs the read-tools' local store reads
+		// (list_messages, list_labels). One service per process is
+		// fine -- the underlying repository scopes every query by
+		// account_id so there is no per-account state in the service
+		// itself.
+		mailboxService := mailbox.New(st)
+		// MCP-side proton client factory: resolves the account's
+		// Proton secrets via account.Service (refresh token + UID
+		// proxy via proton_user_id) and hands them to
+		// proton.Manager.NewClient. Mirrors the sync supervisor's
+		// ClientFactory pattern but stays decoupled (different
+		// concurrency model, different failure mapping).
+		//
+		// Governing: SPEC-0006 REQ "Required Tool Set" (read);
+		// ADR-0001 (go-proton-api).
+		protonForAccount := makeMCPProtonFactory(accountService, protonMgr)
 		mcpSrv := mcpserver.New(mcpserver.Deps{
-			Validator: validator,
-			Accounts:  accountService,
-			Users:     usersService,
+			Validator:        validator,
+			Accounts:         accountService,
+			Users:            usersService,
+			Mailboxes:        mailboxService,
+			ProtonForAccount: protonForAccount,
 			Limiter: mcpserver.NewConcurrencyLimiter(
 				mcpserver.PerAccountConcurrencyFromEnv(os.Getenv),
 				mcpserver.DefaultQueueDepth,
@@ -319,6 +338,61 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 // overrides applied at startup so operators can debug "why is the
 // config not what I expect".
 var _ = os.Getenv
+
+// makeMCPProtonFactory returns a mcpserver.ProtonClientFactory that
+// hydrates a per-account proton.Client for tool invocations. The
+// composition is:
+//
+//   - Read the account's encrypted refresh token via account.Service.
+//     Missing token (account never completed wizard, or the wizard
+//     row was reset) surfaces as proton.ErrNotAuthenticated, which
+//     the tool layer maps to an `auth_required` MCP error.
+//
+//   - Hand the refresh token (plus the persisted Proton user ID as
+//     the upstream session UID surrogate) to proton.Manager.NewClient.
+//     The upstream auth handler will perform a /auth/v4/refresh on
+//     the first per-call request, picking up a fresh access token;
+//     the rotated refresh token is persisted via the manager-level
+//     callback.
+//
+// Until the schema persists session UID + access token (deferred to
+// the sync-worker stories), accounts that were activated via the
+// wizard but whose refresh token has been rotated since the wizard
+// completed will fail their first MCP tool call with auth_required;
+// callers re-run the wizard's add-account flow to recover. This is
+// a known sharp edge of the v0.1 surface and is documented on the
+// MCP-token issuance UI.
+//
+// Governing: SPEC-0006 REQ "Required Tool Set" (read);
+// ADR-0001 (go-proton-api).
+func makeMCPProtonFactory(accounts account.Service, mgr *proton.Manager) mcpserver.ProtonClientFactory {
+	return func(ctx context.Context, acct *account.Account) (proton.Client, error) {
+		if acct == nil {
+			return nil, proton.ErrNotAuthenticated
+		}
+		ref, err := accounts.OpenRefreshToken(ctx, acct.ID)
+		if err != nil {
+			return nil, proton.ErrNotAuthenticated
+		}
+		// proton_user_id stands in for the session UID until the
+		// schema persists the latter. The upstream library treats
+		// the UID as opaque; using the Proton user ID is correct
+		// for refresh because /auth/v4/refresh authenticates the
+		// session via the cookie+refresh-token tuple, not the UID.
+		uid := acct.ProtonUserID
+		if uid == "" {
+			return nil, proton.ErrNotAuthenticated
+		}
+		// Empty access token forces the upstream library to call
+		// authRefresh on the first per-call HTTP request, which
+		// returns a fresh access token and (typically) a rotated
+		// refresh token. The rotated refresh token is persisted
+		// via the manager-level RefreshTokenCallback wired by the
+		// composition root; this code path does not need to
+		// re-persist.
+		return mgr.NewClient(ctx, uid, "", string(ref)), nil
+	}
+}
 
 // makeSubjectResolver returns a SubjectResolver suitable for the
 // bearer validator's MCP-token branch. It chains accounts.GetByID ->
