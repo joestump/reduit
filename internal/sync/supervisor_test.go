@@ -596,6 +596,79 @@ func TestSupervisorRecoversInjectedPanic(t *testing.T) {
 	}
 }
 
+// TestSupervisorPanicMarksAccountCrashed pins the SPEC-0002 REQ
+// "Panic Isolation" requirement that a panicking worker MUST flip the
+// `crashed` flag on the account row. Combined with the existing
+// TestSupervisorRecoversInjectedPanic (which verifies siblings keep
+// running and the panic is recovered), this proves the full
+// requirement: panic → log → mark crashed → no auto-restart →
+// siblings unaffected.
+//
+// The test also pins the issue #17 acceptance criterion "test injects
+// a panic in the event-decode path": the panicking worker's panicker
+// hook fires inside tick() before the event-stream call, simulating a
+// decode failure that surfaces as a panic.
+//
+// Governing: SPEC-0002 REQ "Panic Isolation".
+func TestSupervisorPanicMarksAccountCrashed(t *testing.T) {
+	t.Parallel()
+	svc, usrSvc := newTestAccountService(t)
+	ctx := context.Background()
+
+	sup := New(svc, fastConfig())
+	if err := sup.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Stop() })
+
+	// Sibling account that should keep running after the panic.
+	siblingAcc := createTestAccount(t, svc, usrSvc, "sub-crashed-sibling")
+	if _, err := svc.Transition(ctx, siblingAcc.ID, account.StateActive); err != nil {
+		t.Fatalf("Transition sibling: %v", err)
+	}
+	if !waitFor(t, time.Second, func() bool { return sup.activeWorkerCount() == 1 }) {
+		t.Fatalf("sibling worker did not start")
+	}
+
+	// Hand-inject a panicking worker through the test-only panicker
+	// hook so we exercise the production deferred-recover paths.
+	panicAcc := createTestAccount(t, svc, usrSvc, "sub-crashed-panic")
+	w := newWorker(sup.rootCtx, panicAcc.ID, sup)
+	w.panicker = func() { panic("event-decode boom") }
+	sup.workersMu.Lock()
+	sup.workers[w.id] = w
+	sup.workersMu.Unlock()
+	w.start()
+
+	// The panicker is removed from the map and the sibling stays.
+	if !waitFor(t, time.Second, func() bool { return sup.activeWorkerCount() == 1 }) {
+		t.Fatalf("after panic: count=%d, want 1 (sibling only)", sup.activeWorkerCount())
+	}
+
+	// The account row's `crashed` flag MUST be set. Read directly via
+	// GetByID — MarkCrashed touches the column, the projection in
+	// account.toAccount surfaces it.
+	if !waitFor(t, time.Second, func() bool {
+		got, err := svc.GetByID(ctx, panicAcc.ID)
+		if err != nil {
+			return false
+		}
+		return got.Crashed
+	}) {
+		got, _ := svc.GetByID(ctx, panicAcc.ID)
+		t.Fatalf("crashed flag not set after panic; account=%+v", got)
+	}
+
+	// Sibling's crashed flag MUST stay false.
+	siblingFresh, err := svc.GetByID(ctx, siblingAcc.ID)
+	if err != nil {
+		t.Fatalf("GetByID sibling: %v", err)
+	}
+	if siblingFresh.Crashed {
+		t.Errorf("sibling crashed flag set; isolation violated")
+	}
+}
+
 // waitFor polls cond every 10ms up to deadline. Returns true if cond
 // ever returned true within the budget. Test helpers that need to
 // wait for a goroutine to make observable progress (worker starts,

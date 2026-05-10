@@ -115,7 +115,7 @@ func (w *worker) start() {
 		w.bootstrapFailed()
 		return
 	}
-	proc, err := newEventProcessor(w.ctx, w.id, w.sup.svc, client, w.logger)
+	proc, err := newEventProcessor(w.ctx, w.id, w.sup.svc, client, w.logger, w.sup.cfg.Publisher)
 	if err != nil {
 		w.logger.LogAttrs(w.ctx, slog.LevelError,
 			"sync: event processor bootstrap failed; worker will not run",
@@ -171,10 +171,21 @@ func (w *worker) run() {
 				slog.Any("panic", r),
 				slog.String("stack", string(debug.Stack())),
 			)
-			// Story #17 will mark the account `crashed` here and
-			// emit an admin-UI notification. For now the panic is
-			// just logged — the worker exits and is removed from
-			// the live map by the deferred removeWorker call above.
+			// Mark the account row's `crashed` flag so the admin UI
+			// (SPEC-0005) can surface "needs manual reset" without
+			// polling. We use context.Background() because w.ctx may
+			// already be cancelled by the outer Stop, and a cancelled
+			// ctx would otherwise prevent the DB write that the spec
+			// requires. SPEC-0002 REQ "Panic Isolation" mandates the
+			// flag be set; admin reset is deferred to SPEC-0005.
+			//
+			// Governing: SPEC-0002 REQ "Panic Isolation".
+			if mcErr := w.sup.svc.MarkCrashed(context.Background(), w.id); mcErr != nil {
+				w.logger.LogAttrs(context.Background(), slog.LevelError,
+					"sync: failed to mark account crashed after panic",
+					slog.Any("err", mcErr),
+				)
+			}
 		}
 	}()
 
@@ -269,6 +280,18 @@ func (w *worker) tick() {
 			// hits this drain branch instead of walking the backoff
 			// curve on a graceful-shutdown event.
 			if errors.Is(err, errProtonSlotUnavailable) {
+				return
+			}
+			// Refresh-token-revoked is the SPEC-0002 permanent-failure
+			// path: processOnce has already transitioned the account
+			// back to pending_proton_setup, so the worker MUST exit
+			// without logging another error or bumping backoff. Cancel
+			// our own context so the run loop's outer select hits
+			// ctx.Done on the next iteration.
+			//
+			// Governing: SPEC-0002 REQ "Backoff on Failure".
+			if errors.Is(err, errRefreshTokenRevoked) {
+				w.cancel()
 				return
 			}
 			// Transient error path: log, then sleep for a

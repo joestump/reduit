@@ -150,6 +150,15 @@ type Config struct {
 	// generator (which is fine for production: full jitter is the
 	// defense, the source's bias is irrelevant).
 	BackoffRand func() float64
+
+	// Publisher receives one pubsub.Update per Proton MessageEvent in
+	// a successfully-committed batch, so IMAP IDLE sessions for the
+	// same account see EXISTS / EXPUNGE / FETCH within ~1s. nil means
+	// notifications are dropped — production wiring SHOULD pass a
+	// *pubsub.Bus, tests that don't care about IDLE leave it nil.
+	//
+	// Governing: SPEC-0002 REQ "IMAP Update Notification".
+	Publisher Publisher
 }
 
 // resolved fills in defaults for every zero-valued field. Returned by
