@@ -51,6 +51,16 @@ func TestIsAllowlisted(t *testing.T) {
 		// match catches a future regression that broadens the
 		// allowlist to a /favicon* prefix.
 		{"/favicon.ico", false},
+		// /mcp is allowlisted because the embedded MCP server has
+		// its own bearer-auth middleware (per ADR-0008 / SPEC-0006);
+		// without the bypass the SCS session gate would 302-redirect
+		// MCP clients to /auth/login -- a redirect they cannot follow.
+		{"/mcp", true},
+		// /mcp/anything is NOT allowlisted by an exact-match entry.
+		// The MCP SDK serves the same path for all methods, so a
+		// stray subpath shouldn't grant blanket bypass.
+		{"/mcp/extra", false},
+		{"/mcpish", false},
 		{"/", false},
 		{"/accounts", false},
 		{"/healthz.json", false},  // exact match required for non-prefix entries

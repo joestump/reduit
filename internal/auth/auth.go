@@ -63,6 +63,16 @@ var Allowlist = []string{
 	//
 	// Governing: SPEC-0005 REQ "Authentication Gating"; issue #77.
 	"/favicon.svg",
+	// /mcp bypasses the SCS session gate because it has its own
+	// bearer-auth middleware (per ADR-0008 the MCP server is
+	// embedded on this same listener but authenticates via OIDC
+	// JWT or per-account MCP tokens, not browser sessions). Without
+	// this entry the session gate would 302-redirect MCP clients to
+	// /auth/login -- a redirect they cannot follow.
+	//
+	// Governing: ADR-0008, SPEC-0006 REQ "Bearer Authentication
+	// Required".
+	"/mcp",
 }
 
 // IsAllowlisted reports whether path is exempt from auth gating.
