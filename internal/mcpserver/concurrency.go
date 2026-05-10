@@ -273,4 +273,3 @@ func respondQueueOverflow(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusServiceUnavailable)
 	_, _ = w.Write([]byte(`{"error":"queue_overflow"}`))
 }
-
