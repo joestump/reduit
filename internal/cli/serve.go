@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,9 +16,12 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/joestump/reduit/internal/account"
+	"github.com/joestump/reduit/internal/auth"
+	"github.com/joestump/reduit/internal/auth/mcptoken"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	authsession "github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/cryptenv"
+	"github.com/joestump/reduit/internal/mcpserver"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/server"
 	"github.com/joestump/reduit/internal/store"
@@ -230,6 +234,43 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	defer protonMgr.Close()
 	wizardSessions := server.NewWizardSessionStore(server.DefaultWizardIdleTimeout)
 
+	// MCP server (per ADR-0008): mounted at `/mcp` on the same admin
+	// HTTPS listener, behind its own bearer-auth + per-account
+	// concurrency-cap middleware. Constructed only when the HTTP
+	// listener is active (no http_addr -> no admin surface, so no
+	// MCP either). The bearer validator is shared with any other
+	// future bearer surface; MCP is the only consumer today.
+	//
+	// Per-account concurrency cap is read from MCP_PER_ACCOUNT_CONCURRENCY
+	// (default 4) per SPEC-0006; queue depth is fixed at 16. The
+	// validator's SubjectResolver is wired against the account/user
+	// services so MCP-token Principals carry an OIDC subject for log
+	// correlation alongside the OIDC-bearer Principals.
+	//
+	// Governing: ADR-0008, SPEC-0006 REQ "Bearer Authentication
+	// Required", SPEC-0006 REQ "Per-Account Concurrency Limit".
+	var mcpHandler http.Handler
+	if cfg.Server.HTTPAddr != "" {
+		mcpTokens := mcptoken.NewRepository(st.DB)
+		validator := auth.NewBearerValidator(oidcClient, mcpTokens).
+			WithSubjectResolver(makeSubjectResolver(accountService, usersService))
+		mcpSrv := mcpserver.New(mcpserver.Deps{
+			Validator: validator,
+			Accounts:  accountService,
+			Users:     usersService,
+			Limiter: mcpserver.NewConcurrencyLimiter(
+				mcpserver.PerAccountConcurrencyFromEnv(os.Getenv),
+				mcpserver.DefaultQueueDepth,
+			),
+			Logger: logger,
+		})
+		mcpHandler = mcpSrv.Handler()
+		logger.Info("mcp server ready",
+			slog.Int("per_account_concurrency",
+				mcpserver.PerAccountConcurrencyFromEnv(os.Getenv)),
+			slog.Int("queue_depth", mcpserver.DefaultQueueDepth))
+	}
+
 	// HTTP server. GetCertificate is nil when tls.disabled — server.New
 	// detects that and skips ListenAndServeTLS in favor of plain HTTP.
 	var getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error)
@@ -249,6 +290,7 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		ProtonManager:  protonMgr,
 		WizardSessions: wizardSessions,
 		AdminSubjects:  cfg.OIDC.AdminSubjects,
+		MCPHandler:     mcpHandler,
 	})
 
 	errCh := make(chan error, 1)
@@ -277,6 +319,32 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 // overrides applied at startup so operators can debug "why is the
 // config not what I expect".
 var _ = os.Getenv
+
+// makeSubjectResolver returns a SubjectResolver suitable for the
+// bearer validator's MCP-token branch. It chains accounts.GetByID ->
+// users.GetByID(account.UserID) -> users.OIDCSubject so an MCP-token
+// Principal's Subject field is populated for log correlation,
+// matching the OIDC-bearer Principal shape. Errors are intentionally
+// surfaced -- the validator swallows them per its docstring (Subject
+// is audit metadata, not an authz key, so a transient DB error MUST
+// NOT 401 the caller).
+//
+// Governing: SPEC-0006 REQ "Bearer Authentication Required" (Subject
+// audit metadata for MCP-token bearers); ADR-0010 (OIDC sub lives
+// on users, not accounts).
+func makeSubjectResolver(accounts account.Service, usrs users.Service) func(ctx context.Context, accountID string) (string, error) {
+	return func(ctx context.Context, accountID string) (string, error) {
+		acct, err := accounts.GetByID(ctx, accountID)
+		if err != nil {
+			return "", err
+		}
+		u, err := usrs.GetByID(ctx, acct.UserID)
+		if err != nil {
+			return "", err
+		}
+		return u.OIDCSubject, nil
+	}
+}
 
 // pendingAccountSweepInterval is how often the retention sweep runs.
 // One hour gives the system rapid-enough cleanup that orphan rows do

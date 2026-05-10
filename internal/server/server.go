@@ -82,6 +82,19 @@ type Deps struct {
 	// that drive the server over plain HTTP (httptest.NewServer).
 	// Production callers MUST leave this false.
 	InsecureCookies bool
+	// MCPHandler is the embedded MCP server's HTTP handler, mounted
+	// at `/mcp` on this same admin listener. Per ADR-0008 there is
+	// no separate process and no separate port -- one binary, one
+	// fault domain. Nil means MCP is not wired (e.g. NewForTest
+	// fixtures that don't exercise the MCP surface); the route is
+	// then unbound and 404s.
+	//
+	// IMPORTANT: this handler MUST embed its own bearer auth (per
+	// SPEC-0006). The session gate that wraps the rest of the admin
+	// surface is bypassed for `/mcp` -- bearer-auth replaces it.
+	//
+	// Governing: ADR-0008, SPEC-0006.
+	MCPHandler http.Handler
 }
 
 // Server holds an http.Server pre-configured with TLS and the
@@ -285,6 +298,18 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /accounts/{id}/suspend", s.handleAccountSuspend)
 	mux.HandleFunc("POST /accounts/{id}/reactivate", s.handleAccountReactivate)
 	mux.HandleFunc("POST /accounts/{id}/imap-password/rotate", s.handleAccountIMAPRotate)
+
+	// Embedded MCP server (per ADR-0008). The handler enforces its
+	// own bearer auth + per-account concurrency cap; the SCS session
+	// gate skips this path via auth.Allowlist. The MCP transport is
+	// HTTP+SSE Streamable HTTP per the modelcontextprotocol/go-sdk;
+	// all methods (POST for tool calls, GET for SSE streaming, DELETE
+	// for session teardown) land on the same path.
+	//
+	// Governing: ADR-0008, SPEC-0006.
+	if s.deps.MCPHandler != nil {
+		mux.Handle("/mcp", s.deps.MCPHandler)
+	}
 }
 
 // handleHealthz returns 200 OK if the process is up. It does not
