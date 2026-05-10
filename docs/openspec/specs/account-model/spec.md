@@ -275,6 +275,15 @@ Every account MUST have a `state` field whose value is one of:
 - **THEN** the account state SHALL transition to `active` and the sync
   worker SHALL start
 
+#### Scenario: Refresh-token revocation reverts active to pending_proton_setup
+
+- **WHEN** the sync worker observes a permanent `AuthRefreshTokenInvalid`
+  (Proton API code 10013) or an HTTP 401 on token refresh
+- **THEN** the account state SHALL transition from `active` to
+  `pending_proton_setup`, the sync worker SHALL exit cleanly without
+  bumping backoff, and the operator SHALL re-run the
+  add-Proton-account wizard to provide fresh credentials
+
 #### Scenario: Suspension halts sync but preserves state
 
 - **WHEN** an admin suspends an account

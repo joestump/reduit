@@ -192,6 +192,17 @@ type Service interface {
 	// Governing: SPEC-0001 REQ "Account Lifecycle States"; ADR-0010,
 	// SPEC-0005 REQ "Add-Proton-Account Wizard"; issue #82.
 	SoftDeleteOldPending(ctx context.Context, olderThan time.Duration) (int64, error)
+
+	// MarkCrashed sets the `crashed` flag on the account row. The sync
+	// supervisor calls this from the panic-recovery defer after a worker
+	// goroutine crashes so the admin UI can surface "needs manual reset"
+	// without polling. The flag is independent of the lifecycle State —
+	// a crashed worker leaves the account in StateActive so reactivation
+	// is a single bit-flip rather than a state transition. Manual reset
+	// happens via SPEC-0005 admin actions.
+	//
+	// Governing: SPEC-0002 REQ "Panic Isolation".
+	MarkCrashed(ctx context.Context, accountID string) error
 }
 
 // CreateParams collects the inputs to Service.Create. ProtonUserID
@@ -422,6 +433,11 @@ var allowedTransitions = map[State]map[State]bool{
 	StateActive: {
 		StateSuspended:   true,
 		StateSoftDeleted: true,
+		// SPEC-0002 REQ "Backoff on Failure" — refresh-token-revoked
+		// kicks the account back to pending so the wizard can re-prompt
+		// for credentials. Not present in the SPEC-0001 lifecycle
+		// diagram; SPEC-0002 explicitly mandates this edge.
+		StatePendingProtonSetup: true,
 	},
 	StateSuspended: {
 		StateActive:      true,
@@ -510,6 +526,20 @@ func allowedPrevStates(next State) []State {
 
 func (s *service) Delete(ctx context.Context, id string) (*Account, error) {
 	return s.Transition(ctx, id, StateSoftDeleted)
+}
+
+// MarkCrashed flips the `crashed` flag on the account row. Idempotent:
+// calling it on an already-crashed account is a no-op (the UPDATE
+// matches the row but the column is already 1). Returns
+// ErrAccountNotFound if no row matches the supplied ID.
+//
+// MarkCrashed deliberately does NOT change the lifecycle State; the
+// account stays in whatever state it was in (typically StateActive)
+// so an admin reset is a flag clear, not a state transition.
+//
+// Governing: SPEC-0002 REQ "Panic Isolation".
+func (s *service) MarkCrashed(ctx context.Context, accountID string) error {
+	return s.repo.markCrashed(ctx, accountID, s.now().UTC())
 }
 
 // SoftDeleteOldPending implements Service.SoftDeleteOldPending. The

@@ -436,6 +436,19 @@ func (r *repository) softDeleteOldPending(ctx context.Context, cutoff, now time.
 	return n, nil
 }
 
+// markCrashed sets the `crashed` column to 1. Used by the sync
+// supervisor's panic-recovery defer.
+//
+// Governing: SPEC-0002 REQ "Panic Isolation".
+func (r *repository) markCrashed(ctx context.Context, id string, now time.Time) error {
+	const q = `UPDATE accounts SET crashed = 1, updated_at = ? WHERE id = ?`
+	res, err := r.db.ExecContext(ctx, q, now, id)
+	if err != nil {
+		return fmt.Errorf("account: mark crashed: %w", err)
+	}
+	return checkOneRow(res, "mark crashed")
+}
+
 func checkOneRow(res sql.Result, op string) error {
 	n, err := res.RowsAffected()
 	if err != nil {

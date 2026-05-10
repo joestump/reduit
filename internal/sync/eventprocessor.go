@@ -1,6 +1,9 @@
 // Governing: ADR-0001 (go-proton-api as Proton client),
 //             SPEC-0002 REQ "Event Cursor Persistence",
-//             SPEC-0002 REQ "Concurrency Limits".
+//             SPEC-0002 REQ "Concurrency Limits",
+//             SPEC-0002 REQ "Backoff on Failure" (refresh-token-revoked
+//             permanent-failure path),
+//             SPEC-0002 REQ "IMAP Update Notification".
 
 package sync
 
@@ -14,7 +17,37 @@ import (
 
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/proton"
+	"github.com/joestump/reduit/internal/pubsub"
 )
+
+// Publisher is the slice of pubsub.Bus the event processor needs:
+// publish an Update under a string key. The Bus implements this
+// interface naturally; tests can pass a recording stub that captures
+// every (key, update) pair without standing up a real bus.
+//
+// Governing: SPEC-0002 REQ "IMAP Update Notification".
+type Publisher interface {
+	Publish(key string, u pubsub.Update)
+}
+
+// nopPublisher is the zero-value publisher: every Publish call is
+// silently dropped. Used when the supervisor was constructed without a
+// Publisher (e.g. a unit test that doesn't care about IDLE notifications)
+// so the eventprocessor can call Publish unconditionally without nil
+// checks at every call site.
+type nopPublisher struct{}
+
+func (nopPublisher) Publish(string, pubsub.Update) {}
+
+// errRefreshTokenRevoked is the sentinel returned by processOnce after
+// the worker has handled a permanent auth failure: the account has
+// been transitioned back to pending_proton_setup and the worker MUST
+// exit without walking the backoff curve. The worker's tick loop uses
+// errors.Is on this sentinel to take the silent-exit branch.
+//
+// Governing: SPEC-0002 REQ "Backoff on Failure" — "Permanent errors do
+// not retry indefinitely".
+var errRefreshTokenRevoked = errors.New("sync: refresh token revoked; account returned to pending_proton_setup")
 
 // eventProcessor owns one worker's interaction with Proton's event
 // stream. It is constructed by worker.start() (synchronously, before
@@ -50,6 +83,13 @@ type eventProcessor struct {
 	client    proton.Client
 	logger    *slog.Logger
 
+	// publisher receives one Update per MessageEvent in a successfully-
+	// committed batch. nil is replaced with nopPublisher at construction
+	// so processOnce can call Publish unconditionally.
+	//
+	// Governing: SPEC-0002 REQ "IMAP Update Notification".
+	publisher Publisher
+
 	// cursor is the cached event ID to pass to the next GetEvent call.
 	// Mutation is single-goroutine (only the worker.run loop calls
 	// processOnce), so no lock is required.
@@ -70,7 +110,10 @@ type eventProcessor struct {
 //
 // Governing: SPEC-0002 REQ "Event Cursor Persistence" (Resume on
 // startup uses persisted cursor).
-func newEventProcessor(ctx context.Context, accountID string, svc account.Service, client proton.Client, logger *slog.Logger) (*eventProcessor, error) {
+func newEventProcessor(ctx context.Context, accountID string, svc account.Service, client proton.Client, logger *slog.Logger, publisher Publisher) (*eventProcessor, error) {
+	if publisher == nil {
+		publisher = nopPublisher{}
+	}
 	state, err := svc.GetSyncState(ctx, accountID)
 	switch {
 	case err == nil:
@@ -83,6 +126,7 @@ func newEventProcessor(ctx context.Context, accountID string, svc account.Servic
 			svc:       svc,
 			client:    client,
 			logger:    logger,
+			publisher: publisher,
 			cursor:    state.LastEventID,
 		}, nil
 	case errors.Is(err, account.ErrNoSyncState):
@@ -104,6 +148,7 @@ func newEventProcessor(ctx context.Context, accountID string, svc account.Servic
 			svc:       svc,
 			client:    client,
 			logger:    logger,
+			publisher: publisher,
 			cursor:    latest,
 		}, nil
 	default:
@@ -142,6 +187,41 @@ func newEventProcessor(ctx context.Context, accountID string, svc account.Servic
 func (p *eventProcessor) processOnce(ctx context.Context) (bool, error) {
 	events, more, err := p.client.GetEvent(ctx, p.cursor)
 	if err != nil {
+		// Permanent auth failure: refresh token revoked server-side.
+		// Transition the account back to pending_proton_setup so the
+		// wizard prompts for re-login, then return the sentinel so the
+		// worker's tick loop exits without walking the backoff curve.
+		//
+		// Governing: SPEC-0002 REQ "Backoff on Failure" — "Permanent
+		// errors do not retry indefinitely".
+		if isRefreshTokenRevokedError(err) {
+			// The Transition fires the supervisor's OnTransition
+			// callback synchronously, which dispatches to stopWorker
+			// on the active->pending edge. stopWorker.waitDone blocks
+			// on the worker's run goroutine — and we ARE that goroutine.
+			// Running Transition inline would therefore deadlock.
+			//
+			// We spin Transition into a fresh goroutine so the
+			// supervisor's stopWorker can wait on us draining via
+			// ctx.Done. The worker's tick() consumes the sentinel by
+			// cancelling its own context, so the run loop exits, the
+			// done channel closes, and stopWorker.waitDone returns.
+			//
+			// Governing: SPEC-0002 REQ "Backoff on Failure".
+			go func(svc account.Service, id string) {
+				if _, terr := svc.Transition(context.Background(), id, account.StatePendingProtonSetup); terr != nil {
+					p.logger.LogAttrs(context.Background(), slog.LevelError,
+						"sync: refresh token revoked but transition to pending failed",
+						slog.Any("err", terr),
+					)
+				}
+			}(p.svc, p.accountID)
+			p.logger.LogAttrs(ctx, slog.LevelWarn,
+				"sync: refresh token revoked; account returned to pending_proton_setup, worker exiting",
+				slog.Any("err", err),
+			)
+			return false, errRefreshTokenRevoked
+		}
 		// Stale-cursor recovery. The bookmark we have is older than
 		// Proton's retention window; the only correct response is to
 		// reset to "now" and let #19's mailbox/UID materialisation
@@ -233,7 +313,125 @@ func (p *eventProcessor) processOnce(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	p.cursor = nextCursor
+
+	// Publish IDLE notifications AFTER the cursor commit so a
+	// subscriber that observes a Publish can rely on the underlying
+	// state having committed. Publishing pre-commit would let an IDLE
+	// session see "MessageAdded" for a message that the next FETCH
+	// can't find if the commit then fails. SPEC-0002 design pins
+	// notification AFTER state changes have committed.
+	//
+	// Governing: SPEC-0002 REQ "IMAP Update Notification".
+	p.publishMessageEvents(events)
 	return more, nil
+}
+
+// publishMessageEvents fans the per-MessageEvent kind onto the pubsub
+// bus. Each MessageEvent carries one Action and at least one
+// LabelID — Proton uses LabelIDs as its per-mailbox routing key, and
+// IMAP IDLE consumers subscribe under the same `<account_id>:<label_id>`
+// shape so the worker does not need to resolve LabelIDs to local
+// mailbox row IDs at notification time.
+//
+// EventAction mapping (from go-proton-api):
+//
+//	EventCreate      → MessageAdded       (new message in a label)
+//	EventDelete      → MessageRemoved     (message removed from labels)
+//	EventUpdate      → MessageFlagChanged (full update)
+//	EventUpdateFlags → MessageFlagChanged (flags-only update)
+//
+// EventDelete events have no Message body, so we cannot enumerate the
+// labels the message was in. The IMAP IDLE consumer's RESYNC-on-
+// reconnect contract handles this gap: a delete fans an account-wide
+// notification (mailbox_id=""), and any IDLE session for that account
+// re-checks its selected mailbox. SPEC-0002 design's drop-oldest
+// policy makes this acceptable — the spec already accepts lossy
+// notifications behind a RESYNC fallback.
+//
+// Governing: SPEC-0002 REQ "IMAP Update Notification".
+func (p *eventProcessor) publishMessageEvents(events []proton.Event) {
+	for _, e := range events {
+		for _, m := range e.Messages {
+			kind := messageEventKind(m.Action)
+			if kind == pubsub.KindUnknown {
+				continue
+			}
+			update := pubsub.Update{Kind: kind, MessageID: m.ID}
+			// Most MessageEvent payloads carry the message metadata
+			// (which includes LabelIDs); EventDelete leaves the
+			// Message field zero, so LabelIDs is empty and we fall
+			// back to the account-wide key. The IMAP IDLE session's
+			// re-check on a wildcard notification covers the gap.
+			labels := m.Message.LabelIDs
+			if len(labels) == 0 {
+				p.publisher.Publish(notifyKey(p.accountID, ""), update)
+				continue
+			}
+			for _, label := range labels {
+				p.publisher.Publish(notifyKey(p.accountID, label), update)
+			}
+		}
+	}
+}
+
+// messageEventKind maps a Proton EventAction to the pubsub Kind the
+// IDLE session emits. Returns KindUnknown for actions the IDLE side
+// has no representation for; the caller skips those.
+func messageEventKind(a gpa.EventAction) pubsub.Kind {
+	switch a {
+	case gpa.EventCreate:
+		return pubsub.MessageAdded
+	case gpa.EventDelete:
+		return pubsub.MessageRemoved
+	case gpa.EventUpdate, gpa.EventUpdateFlags:
+		return pubsub.MessageFlagChanged
+	default:
+		return pubsub.KindUnknown
+	}
+}
+
+// notifyKey is the canonical pubsub key shape for IMAP IDLE
+// notifications: `<account_id>:<mailbox_id>`. mailbox_id may be the
+// empty string for account-wide events (e.g. EventDelete with no
+// Message body); IDLE sessions subscribed to a specific mailbox key
+// will not see those, so the IMAP server will need to also subscribe
+// to the account-wide key as a RESYNC trigger when SPEC-0003 IDLE
+// support lands.
+//
+// The shape matches `internal/pubsub/doc.go` ("opaque string, expected
+// shape <account_id>:<mailbox_id>").
+//
+// Governing: SPEC-0002 REQ "IMAP Update Notification".
+func notifyKey(accountID, mailboxID string) string {
+	return accountID + ":" + mailboxID
+}
+
+// isRefreshTokenRevokedError reports whether err is the upstream
+// signal that the refresh token has been revoked — the permanent-
+// failure case SPEC-0002 REQ "Backoff on Failure" calls out
+// explicitly. We match on Code=AuthRefreshTokenInvalid (10013) primary
+// because the upstream issues that on /auth/v4/refresh failure with a
+// 4xx; we also accept HTTP 401 as a defensive fallback because some
+// proxies strip the body and we'd rather kick the account to pending
+// than spin on a credential that has clearly stopped working.
+//
+// Governing: SPEC-0002 REQ "Backoff on Failure".
+func isRefreshTokenRevokedError(err error) bool {
+	var apiErr *gpa.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.Code == gpa.AuthRefreshTokenInvalid {
+		return true
+	}
+	// HTTP 401 from /auth/v4/refresh is the "your refresh token is
+	// rejected" surface in the rare cases the upstream omits the
+	// typed code. 401 from any other endpoint is normally retried by
+	// go-proton-api's transport layer, but those go via a refresh
+	// round-trip that itself surfaces 10013 if the refresh fails —
+	// so a 401 reaching us here strongly implies the refresh path
+	// has already given up.
+	return apiErr.Status == http.StatusUnauthorized
 }
 
 // isStaleCursorError reports whether err indicates the cursor we
