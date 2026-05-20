@@ -21,6 +21,7 @@ import (
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/mailbox"
 	"github.com/joestump/reduit/internal/proton"
+	"github.com/joestump/reduit/internal/pubsub"
 )
 
 // AccountLookup is the slice of `account.Service` the IMAP backend
@@ -78,6 +79,7 @@ type Backend struct {
 	accounts  AccountLookup
 	mailboxes MailboxService
 	proton    ProtonClientLookup
+	bus       *pubsub.Bus
 	sessions  *Sessions
 	logger    *slog.Logger
 	rateLimit *authRateLimiter
@@ -169,6 +171,16 @@ func WithMailboxes(svc MailboxService) BackendOption {
 // to translate IMAP folder transitions into Proton label adjustments.
 func WithProton(p ProtonClientLookup) BackendOption {
 	return func(b *Backend) { b.proton = p }
+}
+
+// WithBus wires the in-process pubsub bus. Required for IDLE to
+// deliver live EXISTS/EXPUNGE/FETCH updates from the sync worker.
+// Without it, IDLE still functions but blocks until DONE with no
+// updates — correct but unresponsive to new mail.
+//
+// Governing: SPEC-0003 REQ "IDLE Support With Live Updates".
+func WithBus(bus *pubsub.Bus) BackendOption {
+	return func(b *Backend) { b.bus = bus }
 }
 
 // burnDummyBcrypt runs a bcrypt comparison against the precomputed

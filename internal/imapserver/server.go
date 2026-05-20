@@ -20,6 +20,8 @@ import (
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapserver"
+
+	"github.com/joestump/reduit/internal/pubsub"
 )
 
 // DefaultIMAPSAddress is the listen address used when neither
@@ -72,6 +74,15 @@ type Config struct {
 	// label adjustments. Absent, Move returns a transient `NO` so the
 	// client retries.
 	Proton ProtonClientLookup
+
+	// Bus is the in-process pubsub bus that the sync worker publishes
+	// to after each committed Proton event batch. When wired, IDLE
+	// sessions subscribe to it and emit EXISTS/EXPUNGE/FETCH updates
+	// within 1 second of the sync event. When nil, IDLE still works
+	// but delivers no live updates.
+	//
+	// Governing: SPEC-0003 REQ "IDLE Support With Live Updates".
+	Bus *pubsub.Bus
 
 	// Logger is the slog.Logger used for connection-level events.
 	// nil falls back to slog.Default().
@@ -126,6 +137,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.Proton != nil {
 		backendOpts = append(backendOpts, WithProton(cfg.Proton))
+	}
+	if cfg.Bus != nil {
+		backendOpts = append(backendOpts, WithBus(cfg.Bus))
 	}
 	backend, err := NewBackend(cfg.Accounts, cfg.Sessions, logger, backendOpts...)
 	if err != nil {
@@ -228,12 +242,12 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("imapserver: listen %s: %w", addr, err)
 	}
-	// Wrap each accepted conn with capFilterConn so post-auth CAPABILITY
-	// responses no longer advertise IDLE — see capfilter.go for the
-	// rationale (story #20 wires the live-update bus; until then the
-	// cap is dishonest).
+	// Wrap each accepted conn with capFilterConn so Backend.NewSession's
+	// isTLSConn drill-through can see through to the underlying *tls.Conn
+	// via capFilterConn.Unwrap(). The wrapper no longer strips IDLE from
+	// CAPABILITY responses — IDLE is fully implemented since story #20.
 	//
-	// Governing: SPEC-0003 REQ "IDLE Support With Live Updates" (deferred).
+	// Governing: SPEC-0003 REQ "IDLE Support With Live Updates".
 	ln := &capFilterListener{Listener: rawLn}
 	s.mu.Lock()
 	if s.closed {
