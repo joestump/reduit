@@ -8,15 +8,12 @@ import (
 	"github.com/joestump/reduit/internal/account"
 )
 
-// TestPostAuthCapabilityDoesNotAdvertiseIDLE confirms the wire-level
-// capability filter strips IDLE from the post-auth CAPABILITY response.
-// Until story #20 wires the live-update bus, IDLE is a 35-minute no-op
-// — advertising it makes Apple Mail / Thunderbird sit on a dead socket
-// instead of falling back to NOOP polling.
+// TestPostAuthCapabilityAdvertisesIDLE confirms the post-auth CAPABILITY
+// response now includes IDLE. Story #20 wired the live-update pubsub bus,
+// so IDLE is functional and should be advertised to clients.
 //
-// Governing: SPEC-0003 REQ "IDLE Support With Live Updates" (deferred
-// to story #20).
-func TestPostAuthCapabilityDoesNotAdvertiseIDLE(t *testing.T) {
+// Governing: SPEC-0003 REQ "IDLE Support With Live Updates".
+func TestPostAuthCapabilityAdvertisesIDLE(t *testing.T) {
 	t.Parallel()
 	stub := newStubAccounts()
 	stub.addAccount("acct-idle", "user@reduit.example", "pw", account.StateActive)
@@ -45,13 +42,16 @@ func TestPostAuthCapabilityDoesNotAdvertiseIDLE(t *testing.T) {
 	if capLine == "" {
 		t.Fatal("did not receive a `* CAPABILITY ...` line")
 	}
-	// IDLE must not appear as a standalone token. We accept only
-	// strict atom-boundary matches — a hypothetical future cap that
-	// happens to contain the substring `IDLE` (e.g. `IDLE-EXTRA`) is
-	// fine; bare `IDLE` is not.
+	// IDLE must appear as a standalone token in the capability line now
+	// that story #20 wired the live-update bus.
+	found := false
 	for _, atom := range strings.Split(capLine, " ") {
 		if atom == "IDLE" {
-			t.Errorf("post-auth CAPABILITY must not advertise IDLE (deferred to story #20); got %q", capLine)
+			found = true
+			break
 		}
+	}
+	if !found {
+		t.Errorf("post-auth CAPABILITY must advertise IDLE (story #20); got %q", capLine)
 	}
 }
