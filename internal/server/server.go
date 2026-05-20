@@ -90,6 +90,15 @@ type Deps struct {
 	IMAPSessions interface {
 		DropForAccount(accountID, reason string) int
 	}
+	// SMTPSessions is the live SMTP session registry. Mirrors IMAPSessions:
+	// action handlers call DropForAccount after credential rotation or
+	// account suspension to satisfy SPEC-0005 REQ "Per-User IMAP/SMTP
+	// Credentials" (both IMAP and SMTP sessions dropped within 1s).
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials",
+	// REQ "Admin Account Management".
+	SMTPSessions interface {
+		DropForAccount(accountID, reason string) int
+	}
 }
 
 // Server holds an http.Server pre-configured with TLS and the

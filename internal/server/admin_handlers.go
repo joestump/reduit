@@ -95,10 +95,15 @@ func (s *Server) handleAdminAccountSuspend(w http.ResponseWriter, r *http.Reques
 	}
 	if _, err := s.deps.AccountService.Transition(r.Context(), acct.ID, account.StateSuspended); err != nil {
 		if errors.Is(err, account.ErrInvalidTransition) {
+			s.deps.Logger.Warn("admin action: invalid transition (suspend)",
+				slog.String("admin_subject", id.Subject),
+				slog.String("account_id", acct.ID),
+				slog.String("error", err.Error()))
 			http.Error(w, "account cannot be suspended from its current state", http.StatusConflict)
 			return
 		}
 		s.deps.Logger.Error("admin action: suspend",
+			slog.String("admin_subject", id.Subject),
 			slog.String("account_id", acct.ID),
 			slog.String("error", err.Error()))
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -108,6 +113,9 @@ func (s *Server) handleAdminAccountSuspend(w http.ResponseWriter, r *http.Reques
 	s.revokeAccountSessions(r, acct.ID)
 	if s.deps.IMAPSessions != nil {
 		s.deps.IMAPSessions.DropForAccount(acct.ID, "account suspended by admin")
+	}
+	if s.deps.SMTPSessions != nil {
+		s.deps.SMTPSessions.DropForAccount(acct.ID, "account suspended by admin")
 	}
 	s.deps.Logger.Info("admin action: suspended account",
 		slog.String("account_id", acct.ID),
@@ -131,10 +139,15 @@ func (s *Server) handleAdminAccountUnsuspend(w http.ResponseWriter, r *http.Requ
 	}
 	if _, err := s.deps.AccountService.Transition(r.Context(), acct.ID, account.StateActive); err != nil {
 		if errors.Is(err, account.ErrInvalidTransition) {
+			s.deps.Logger.Warn("admin action: invalid transition (unsuspend)",
+				slog.String("admin_subject", id.Subject),
+				slog.String("account_id", acct.ID),
+				slog.String("error", err.Error()))
 			http.Error(w, "account cannot be unsuspended from its current state", http.StatusConflict)
 			return
 		}
 		s.deps.Logger.Error("admin action: unsuspend",
+			slog.String("admin_subject", id.Subject),
 			slog.String("account_id", acct.ID),
 			slog.String("error", err.Error()))
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -162,10 +175,15 @@ func (s *Server) handleAdminAccountDelete(w http.ResponseWriter, r *http.Request
 	}
 	if _, err := s.deps.AccountService.Delete(r.Context(), acct.ID); err != nil {
 		if errors.Is(err, account.ErrInvalidTransition) {
+			s.deps.Logger.Warn("admin action: invalid transition (delete)",
+				slog.String("admin_subject", id.Subject),
+				slog.String("account_id", acct.ID),
+				slog.String("error", err.Error()))
 			http.Error(w, "account is already removed", http.StatusConflict)
 			return
 		}
 		s.deps.Logger.Error("admin action: delete",
+			slog.String("admin_subject", id.Subject),
 			slog.String("account_id", acct.ID),
 			slog.String("error", err.Error()))
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -175,6 +193,9 @@ func (s *Server) handleAdminAccountDelete(w http.ResponseWriter, r *http.Request
 	s.revokeAccountSessions(r, acct.ID)
 	if s.deps.IMAPSessions != nil {
 		s.deps.IMAPSessions.DropForAccount(acct.ID, "account deleted by admin")
+	}
+	if s.deps.SMTPSessions != nil {
+		s.deps.SMTPSessions.DropForAccount(acct.ID, "account deleted by admin")
 	}
 	s.deps.Logger.Info("admin action: soft-deleted account",
 		slog.String("account_id", acct.ID),

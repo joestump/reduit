@@ -21,6 +21,7 @@ import (
 	"github.com/joestump/reduit/internal/imapserver"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/server"
+	"github.com/joestump/reduit/internal/smtpserver"
 	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/tlsloader"
 	"github.com/joestump/reduit/internal/users"
@@ -243,6 +244,16 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// REQ "Admin Account Management".
 	imapSessions := imapserver.NewSessions()
 
+	// SMTP session registry — mirrors imapSessions. SPEC-0005 requires
+	// both IMAP and SMTP sessions to be dropped within 1s on credential
+	// rotation and account suspension. The SMTP server is wired in a
+	// later milestone; the registry is created here so the drop path is
+	// live as soon as any SMTP sessions register themselves.
+	//
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials",
+	// REQ "Admin Account Management".
+	smtpSessions := smtpserver.NewSessions()
+
 	// HTTP server. GetCertificate is nil when tls.disabled — server.New
 	// detects that and skips ListenAndServeTLS in favor of plain HTTP.
 	var getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error)
@@ -263,6 +274,7 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		WizardSessions: wizardSessions,
 		AdminSubjects:  cfg.OIDC.AdminSubjects,
 		IMAPSessions:   imapSessions,
+		SMTPSessions:   smtpSessions,
 	})
 
 	errCh := make(chan error, 1)

@@ -244,6 +244,16 @@ func (s *Server) handleAccountIMAPRotate(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	// Guard: only active accounts may rotate credentials. Issuing new
+	// credentials on a suspended or soft-deleted account is incoherent
+	// because SASL auth is already halted for those states.
+	//
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials"
+	// (suspension halts SASL auth — rotation on inactive account blocked).
+	if acct.State != account.StateActive {
+		http.Error(w, "account is not active", http.StatusConflict)
+		return
+	}
 	// Rate limit: one rotation per imapRotateCooldown per account.
 	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials".
 	if !checkRotateRateLimit(acct.ID) {
@@ -261,9 +271,12 @@ func (s *Server) handleAccountIMAPRotate(w http.ResponseWriter, r *http.Request)
 	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials" — drop
 	// live IMAP/SMTP sessions within 1s so the old credential cannot be
 	// replayed after rotation. nil-safe; not wired in test fixtures that
-	// don't exercise the IMAP server.
+	// don't exercise the IMAP/SMTP servers.
 	if s.deps.IMAPSessions != nil {
 		s.deps.IMAPSessions.DropForAccount(acct.ID, "IMAP password rotated")
+	}
+	if s.deps.SMTPSessions != nil {
+		s.deps.SMTPSessions.DropForAccount(acct.ID, "IMAP password rotated")
 	}
 	s.deps.Logger.Info("dashboard action: rotated imap password",
 		slog.String("account_id", acct.ID),
