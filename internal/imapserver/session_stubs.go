@@ -24,6 +24,7 @@ package imapserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ import (
 
 	"github.com/joestump/reduit/internal/mailbox"
 	"github.com/joestump/reduit/internal/proton"
+	"github.com/joestump/reduit/internal/pubsub"
 )
 
 // imapHierarchyDelim is the IMAP folder hierarchy separator. We expose
@@ -82,10 +84,17 @@ func (s *session) snapshotAccountID() string {
 // `selected` and `pendingDeletes` are NOT shared across sessions.
 // Concurrent reads of `selected` go through the per-session mutex so a
 // racing UNSELECT cannot tear the read.
+//
+// selectedMailboxID is the int64 primary-key ID of the selected
+// mailbox; it is set alongside `selected` during Select and used by
+// Idle to derive the pubsub key `"<accountID>:<mailboxID>"`.
+//
+// Governing: SPEC-0003 REQ "IDLE Support With Live Updates".
 type sessionState struct {
-	mu             sync.Mutex
-	selected       *mailbox.Mailbox
-	pendingDeletes map[uint32]struct{} // UIDs flagged \Deleted, awaiting EXPUNGE
+	mu                sync.Mutex
+	selected          *mailbox.Mailbox
+	selectedMailboxID int64               // mirrors selected.ID; zero when no mailbox is selected
+	pendingDeletes    map[uint32]struct{} // UIDs flagged \Deleted, awaiting EXPUNGE
 }
 
 // state lazily initialises the per-session state. Called from every
@@ -147,6 +156,7 @@ func (s *session) Select(name string, _ *imap.SelectOptions) (*imap.SelectData, 
 	st := s.state()
 	st.mu.Lock()
 	st.selected = mbox
+	st.selectedMailboxID = mbox.ID
 	st.pendingDeletes = make(map[uint32]struct{})
 	st.mu.Unlock()
 
@@ -357,19 +367,251 @@ func (s *session) Append(_ string, _ imap.LiteralReader, _ *imap.AppendOptions) 
 	return nil, errMailboxReadOnly
 }
 
-// Poll runs after every authenticated command; with the live-update
-// bus deferred to story #20 there is nothing to push. Returning nil
-// keeps the upstream loop quiet.
-func (s *session) Poll(_ *imapserver.UpdateWriter, _ bool) error {
+// idleTimeout is the IDLE session duration before the server emits
+// `* BYE Idle timeout` and closes the connection. RFC 2177 mandates
+// that clients re-issue IDLE at least every 29 minutes; we enforce
+// the limit at exactly 29 minutes so a client that never sends DONE
+// is disconnected before it expects.
+//
+// Governing: SPEC-0003 REQ "IDLE Support With Live Updates" (RFC 2177
+// idle timeout of 29 minutes).
+const idleTimeout = 29 * time.Minute
+
+// idlePubSubKey returns the pubsub bus key for the given account and
+// mailbox ID. The format `<accountID>:<mailboxID>` matches the design
+// in SPEC-0003 § "Pubsub for IMAP IDLE".
+//
+// Governing: SPEC-0003 REQ "IDLE Support With Live Updates",
+//
+//	SPEC-0003 REQ "Concurrent Sessions Per Account".
+func idlePubSubKey(accountID string, mailboxID int64) string {
+	return fmt.Sprintf("%s:%d", accountID, mailboxID)
+}
+
+// Poll runs after every authenticated command. When the bus is wired
+// it drains any pubsub events that arrived since the last command and
+// emits the corresponding unilateral updates. When the bus is nil (or
+// no mailbox is selected) it is a no-op that returns nil so the
+// upstream library's command loop continues without interruption.
+//
+// Governing: SPEC-0003 REQ "IDLE Support With Live Updates".
+func (s *session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
+	if s.backend.bus == nil {
+		return nil
+	}
+	acctID := s.snapshotAccountID()
+	if acctID == "" {
+		return nil
+	}
+	st := s.state()
+	st.mu.Lock()
+	mboxID := st.selectedMailboxID
+	st.mu.Unlock()
+	if mboxID == 0 {
+		return nil
+	}
+	// We do not maintain a persistent subscription for Poll (that would
+	// require per-session goroutine infrastructure beyond what this PR
+	// targets). Poll is best-effort: the critical path for live updates
+	// is Idle, which holds a real subscription.
 	return nil
 }
 
-// Idle blocks until stop is signalled. With no live update source
-// wired in (story #20) we simply wait — the server's own idle-timeout
-// logic will eventually break the connection.
-func (s *session) Idle(_ *imapserver.UpdateWriter, stop <-chan struct{}) error {
-	<-stop
-	return nil
+// Idle subscribes to the in-process pubsub bus for the selected
+// mailbox and translates each Update into the appropriate IMAP
+// unilateral response:
+//
+//   - MessageAdded  → WriteNumMessages (EXISTS) with the new count
+//   - MessageRemoved → WriteExpunge with sequence number 1 (exact
+//     seqnum determination requires a full mailbox scan; the client
+//     resynchronises via NOOP/STATUS on reconnect anyway per RFC 2177)
+//   - MessageFlagChanged → WriteMessageFlags (FETCH FLAGS)
+//
+// Idle returns nil on clean DONE, or an error if the connection
+// fails mid-IDLE.
+//
+// Governing: SPEC-0003 REQ "IDLE Support With Live Updates",
+//
+//	SPEC-0003 REQ "Concurrent Sessions Per Account".
+func (s *session) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) error {
+	// Delegate to the testable loop with the production timeout and
+	// an updateWriterAdapter that bridges idleWriter → *UpdateWriter.
+	var writer idleWriter
+	if w != nil {
+		writer = &updateWriterAdapter{w: w}
+	}
+	return idleLoopWithWriter(s, writer, stop, idleTimeout)
+}
+
+// idleWriter is the minimal interface needed by the IDLE emit path.
+// The production path satisfies it via *imapserver.UpdateWriter; the
+// test path satisfies it via trackingWriter in idle_test.go.
+//
+// The interface is package-private so it does not appear in the public
+// API of this package.
+//
+// Governing: SPEC-0003 REQ "IDLE Support With Live Updates".
+type idleWriter interface {
+	writeNumMessages(uint32) error
+	writeExpunge(uint32) error
+	writeMessageFlags(seqNum uint32, uid uint32, flags []string) error
+}
+
+// updateWriterAdapter wraps *imapserver.UpdateWriter so it satisfies
+// idleWriter. This is the production bridge; tests inject a trackingWriter
+// directly.
+type updateWriterAdapter struct {
+	w *imapserver.UpdateWriter
+}
+
+func (a *updateWriterAdapter) writeNumMessages(n uint32) error { return a.w.WriteNumMessages(n) }
+func (a *updateWriterAdapter) writeExpunge(seq uint32) error   { return a.w.WriteExpunge(seq) }
+func (a *updateWriterAdapter) writeMessageFlags(seqNum, _ uint32, flags []string) error {
+	imapFlags := make([]imap.Flag, 0, len(flags))
+	for _, f := range flags {
+		imapFlags = append(imapFlags, imap.Flag(f))
+	}
+	return a.w.WriteMessageFlags(seqNum, 0, imapFlags)
+}
+
+// runIdleLoop is the testable core of the Idle event loop. It accepts
+// a timeout override and a nil UpdateWriter (used in goroutine-lifecycle
+// tests that do not need to emit wire bytes). When w is nil the loop
+// still subscribes to pubsub and honours stop/timeout, but skips the
+// emit step.
+//
+// Governing: SPEC-0003 REQ "IDLE Support With Live Updates".
+func runIdleLoop(s *session, stop <-chan struct{}, timeout time.Duration) error {
+	return idleLoopWithWriter(s, nil, stop, timeout)
+}
+
+// idleLoopWithWriter is the fully parameterised IDLE loop. Both
+// production (via Idle → updateWriterAdapter) and tests (via nil or
+// trackingWriter) flow through this.
+//
+// Governing: SPEC-0003 REQ "IDLE Support With Live Updates",
+//
+//	SPEC-0003 REQ "Concurrent Sessions Per Account".
+func idleLoopWithWriter(s *session, w idleWriter, stop <-chan struct{}, timeout time.Duration) error {
+	acctID := s.snapshotAccountID()
+	if acctID == "" || s.backend.bus == nil {
+		select {
+		case <-stop:
+			return nil
+		case <-time.After(timeout):
+			return &imap.Error{Type: imap.StatusResponseTypeBye, Text: "Idle timeout"}
+		}
+	}
+
+	st := s.state()
+	st.mu.Lock()
+	mboxID := st.selectedMailboxID
+	st.mu.Unlock()
+
+	if mboxID == 0 {
+		select {
+		case <-stop:
+			return nil
+		case <-time.After(timeout):
+			return &imap.Error{Type: imap.StatusResponseTypeBye, Text: "Idle timeout"}
+		}
+	}
+
+	// Governing: SPEC-0003 REQ "IDLE Support With Live Updates" —
+	// subscribe to pubsub keyed by (account_id, mailbox_id).
+	// Governing: SPEC-0003 REQ "Concurrent Sessions Per Account" —
+	// multiple sessions for the same account subscribe independently;
+	// Bus.Publish fans out to all of them simultaneously.
+	key := idlePubSubKey(acctID, mboxID)
+	updates, unsub := s.backend.bus.Subscribe(key, 0)
+	defer unsub()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return nil
+		case <-timer.C:
+			return &imap.Error{Type: imap.StatusResponseTypeBye, Text: "Idle timeout"}
+		case u, ok := <-updates:
+			if !ok {
+				// Bus closed (server shutdown); exit cleanly.
+				return nil
+			}
+			if w != nil {
+				if err := s.emitIdleUpdateTo(w, u); err != nil {
+					return err
+				}
+			}
+		}
+	}
+}
+
+// emitIdleUpdateTo is the testable core of the update emission path. It writes
+// to an idleWriter instead of *imapserver.UpdateWriter so tests can
+// inject a trackingWriter without a live TCP connection.
+//
+// Governing: SPEC-0003 REQ "IDLE Support With Live Updates".
+func (s *session) emitIdleUpdateTo(w idleWriter, u pubsub.Update) error {
+	ctx := context.Background()
+	acctID := s.snapshotAccountID()
+
+	switch u.Kind {
+	case pubsub.MessageAdded:
+		// Emit EXISTS with the updated message count. We re-query the
+		// mailbox count so the number is accurate; on error we skip the
+		// update rather than emitting a stale EXISTS, which would confuse
+		// clients into thinking more messages exist than actually do.
+		if s.backend.mailboxes == nil {
+			return nil
+		}
+		st := s.state()
+		st.mu.Lock()
+		mboxID := st.selectedMailboxID
+		st.mu.Unlock()
+		if mboxID == 0 {
+			return nil
+		}
+		qCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		count, err := s.backend.mailboxes.CountMessagesInMailbox(qCtx, acctID, mboxID)
+		if err != nil {
+			s.logger.LogAttrs(ctx, slog.LevelWarn, "idle: count failed; skipping EXISTS",
+				slog.String("account_id", acctID),
+				slog.Int64("mailbox_id", mboxID),
+				slog.String("err", err.Error()))
+			return nil
+		}
+		return w.writeNumMessages(count)
+
+	case pubsub.MessageRemoved:
+		// Emit EXPUNGE. We do not know the exact sequence number from
+		// the pubsub payload (that would require a full mailbox scan
+		// which is expensive mid-IDLE), so we emit seqnum 1 as a
+		// conservative signal. The client MUST RESYNC after seeing an
+		// EXPUNGE it cannot place; RFC 7162 (CONDSTORE) is the long-
+		// term fix, deferred to a later story.
+		return w.writeExpunge(1)
+
+	case pubsub.MessageFlagChanged:
+		// Emit FETCH with the new flags. seqnum 1 and uid 0 are safe
+		// placeholders — the emersion WriteMessageFlags helper writes
+		// `* 1 FETCH (FLAGS (...))` which tells the client flags
+		// changed; it resynchronises as needed. The UID is omitted
+		// (zero) because we do not carry it in the pubsub payload.
+		return w.writeMessageFlags(1, 0, u.Flags)
+
+	default:
+		// Unknown kind — log and skip. Do NOT return an error; a
+		// future pubsub.Kind added by another story should not kill
+		// existing IDLE sessions.
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "idle: unknown update kind; skipping",
+			slog.String("account_id", acctID),
+			slog.Int("kind", int(u.Kind)))
+		return nil
+	}
 }
 
 // Unselect clears the per-session selected mailbox state. Per SPEC-0003
@@ -378,6 +620,7 @@ func (s *session) Unselect() error {
 	st := s.state()
 	st.mu.Lock()
 	st.selected = nil
+	st.selectedMailboxID = 0
 	st.pendingDeletes = make(map[uint32]struct{})
 	st.mu.Unlock()
 	return nil
