@@ -18,6 +18,7 @@ import (
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	authsession "github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/cryptenv"
+	"github.com/joestump/reduit/internal/imapserver"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/server"
 	"github.com/joestump/reduit/internal/store"
@@ -230,6 +231,18 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	defer protonMgr.Close()
 	wizardSessions := server.NewWizardSessionStore(server.DefaultWizardIdleTimeout)
 
+	// IMAP session registry — constructed here so action handlers can
+	// call DropForAccount on credential rotation or account suspension
+	// per SPEC-0005 REQ "Per-User IMAP/SMTP Credentials" and REQ "Admin
+	// Account Management". The IMAP server (imapserver.New) is wired in
+	// a later milestone; for now the registry is created standalone and
+	// passed via server.Deps.IMAPSessions so the drop path is live as
+	// soon as any real IMAP sessions register themselves.
+	//
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials",
+	// REQ "Admin Account Management".
+	imapSessions := imapserver.NewSessions()
+
 	// HTTP server. GetCertificate is nil when tls.disabled — server.New
 	// detects that and skips ListenAndServeTLS in favor of plain HTTP.
 	var getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error)
@@ -249,6 +262,7 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		ProtonManager:  protonMgr,
 		WizardSessions: wizardSessions,
 		AdminSubjects:  cfg.OIDC.AdminSubjects,
+		IMAPSessions:   imapSessions,
 	})
 
 	errCh := make(chan error, 1)
