@@ -17,8 +17,10 @@ import (
 	"github.com/joestump/reduit/internal/account"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	authsession "github.com/joestump/reduit/internal/auth/session"
+	"github.com/joestump/reduit/internal/config"
 	"github.com/joestump/reduit/internal/cryptenv"
 	"github.com/joestump/reduit/internal/proton"
+	"github.com/joestump/reduit/internal/retention"
 	"github.com/joestump/reduit/internal/server"
 	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/tlsloader"
@@ -188,6 +190,35 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// Governing: SPEC-0001 REQ "Account Lifecycle States"; SPEC-0005
 	// REQ "Add-Proton-Account Wizard"; issue #82.
 	go runPendingAccountSweep(ctx, accountService, logger)
+
+	// Retention sweep job — hard-deletes soft-deleted accounts that have
+	// exceeded the configured retention window (default 30d). Cascade
+	// fires on all per-account FK tables via ON DELETE CASCADE. Each
+	// deletion is logged at INFO with account_id + oidc_subject per
+	// SPEC-0001 REQ "Account Hard Delete After Retention".
+	//
+	// Governing: SPEC-0001 REQ "Account Hard Delete After Retention",
+	// ADR-0006 (SQLite).
+	{
+		retentionPeriod, err := config.ParseDuration(cfg.Store.RetentionPeriod, retention.DefaultRetentionPeriod)
+		if err != nil {
+			return fmt.Errorf("store.retention_period: %w", err)
+		}
+		sweepInterval, err := config.ParseDuration(cfg.Store.SweepInterval, retention.DefaultSweepInterval)
+		if err != nil {
+			return fmt.Errorf("store.sweep_interval: %w", err)
+		}
+		sweeper := retention.New(retention.Config{
+			DB:              st.DB,
+			RetentionPeriod: retentionPeriod,
+			SweepInterval:   sweepInterval,
+			Logger:          logger,
+		})
+		logger.Info("retention sweeper started",
+			slog.Duration("retention_period", retentionPeriod),
+			slog.Duration("sweep_interval", sweepInterval))
+		go sweeper.Run(ctx)
+	}
 
 	// Orphan session_owners sweep. Re-logins through the same browser
 	// leave the prior token's session_owners row stranded because
