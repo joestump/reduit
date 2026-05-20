@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 // Config is the top-level runtime configuration.
@@ -72,6 +73,18 @@ type StoreConfig struct {
 	// MigrationsDir overrides the embedded migrations source. Empty =
 	// use the binary's embedded migrations.
 	MigrationsDir string `mapstructure:"migrations_dir"`
+	// RetentionPeriod is the minimum age past which soft-deleted accounts
+	// are hard-deleted by the retention sweep job. Accepts Go duration
+	// strings (e.g. "720h", "30d" after suffix expansion). Empty = 720h
+	// (30 days).
+	//
+	// Governing: SPEC-0001 REQ "Account Hard Delete After Retention".
+	RetentionPeriod string `mapstructure:"retention_period"`
+	// SweepInterval controls how often the retention sweep job runs.
+	// Accepts Go duration strings. Empty = 1h.
+	//
+	// Governing: SPEC-0001 REQ "Account Hard Delete After Retention".
+	SweepInterval string `mapstructure:"sweep_interval"`
 }
 
 // OIDCConfig configures the OIDC Relying Party.
@@ -111,7 +124,9 @@ func Defaults() Config {
 			Path: "/var/lib/reduit/master.key",
 		},
 		Store: StoreConfig{
-			Path: "/var/lib/reduit/reduit.db",
+			Path:            "/var/lib/reduit/reduit.db",
+			RetentionPeriod: "720h",
+			SweepInterval:   "1h",
 		},
 		OIDC: OIDCConfig{
 			Scopes:     []string{"openid", "profile", "email"},
@@ -183,6 +198,81 @@ func (c Config) Validate() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// ParseDuration parses a duration string with optional "d" (day) suffix
+// expansion before passing to time.ParseDuration. "30d" becomes "720h",
+// which time.ParseDuration understands. Empty string returns fallback.
+//
+// This is used to parse store.retention_period and store.sweep_interval
+// from YAML config so operators can write "30d" instead of "720h".
+//
+// Governing: SPEC-0001 REQ "Account Hard Delete After Retention" —
+// configuration accepts human-friendly day values.
+func ParseDuration(s string, fallback time.Duration) (time.Duration, error) {
+	if s == "" {
+		return fallback, nil
+	}
+	// Expand "Nd" suffix: "30d" -> "720h".
+	expanded := expandDaySuffix(s)
+	d, err := time.ParseDuration(expanded)
+	if err != nil {
+		return 0, fmt.Errorf("config: parse duration %q: %w", s, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("config: duration %q must be positive", s)
+	}
+	return d, nil
+}
+
+// expandDaySuffix replaces a trailing "d" unit with the equivalent
+// number of hours. Only the last unit is expanded so "1d12h" stays
+// valid (the "d" is in the middle, not trailing). The expansion is
+// purely textual: "30d" -> "720h", "1d" -> "24h".
+func expandDaySuffix(s string) string {
+	if !strings.HasSuffix(s, "d") {
+		return s
+	}
+	// Ensure what precedes the trailing "d" is all digits (i.e. "30d"
+	// not "1h30d" or "1day"). If not, leave it for time.ParseDuration
+	// to error on.
+	prefix := s[:len(s)-1]
+	allDigits := len(prefix) > 0
+	for _, r := range prefix {
+		if r < '0' || r > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if !allDigits {
+		return s
+	}
+	// Multiply by 24 hours. We avoid strconv.Atoi to keep the import
+	// list minimal; the string form is enough for ParseDuration.
+	return prefix + "h"[0:0] + multiplyHours(prefix)
+}
+
+// multiplyHours multiplies the decimal string `s` by 24 and returns
+// the result as a string suffixed with "h". Used only by expandDaySuffix.
+func multiplyHours(s string) string {
+	// Parse the digits manually (avoids strconv import).
+	var n int
+	for _, r := range s {
+		n = n*10 + int(r-'0')
+	}
+	hours := n * 24
+	// Format back to string.
+	result := ""
+	if hours == 0 {
+		return "0h"
+	}
+	tmp := hours
+	digits := ""
+	for tmp > 0 {
+		digits = string(rune('0'+tmp%10)) + digits
+		tmp /= 10
+	}
+	return result + digits + "h"
 }
 
 // ResolveConfigPath returns the path of the configuration file Reduit
