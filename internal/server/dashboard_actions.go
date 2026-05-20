@@ -25,10 +25,46 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/auth/session"
 )
+
+// imapRotateCooldown is the minimum interval between successive
+// password rotations per account. Pre-alpha: in-memory, per-process;
+// sufficient for the pre-alpha security checklist requirement.
+// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials" (rate limit
+// rotation endpoint).
+const imapRotateCooldown = 30 * time.Second
+
+// imapRotateLimiter is the process-global store of per-account
+// last-rotation timestamps. The zero value of sync.Mutex is usable.
+var imapRotateLimiter struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+// checkRotateRateLimit returns true when the caller should be allowed
+// to rotate the IMAP password for accountID (i.e. enough time has
+// passed since the last rotation), and updates the last-rotation
+// timestamp. Returns false when the cooldown is still active.
+func checkRotateRateLimit(accountID string) bool {
+	imapRotateLimiter.mu.Lock()
+	defer imapRotateLimiter.mu.Unlock()
+	if imapRotateLimiter.last == nil {
+		imapRotateLimiter.last = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if last, ok := imapRotateLimiter.last[accountID]; ok {
+		if now.Sub(last) < imapRotateCooldown {
+			return false
+		}
+	}
+	imapRotateLimiter.last[accountID] = now
+	return true
+}
 
 // dashboardActionsReady gates every action handler on its
 // dependencies. Symmetric to wizardReady -- a missing service is a
@@ -208,6 +244,22 @@ func (s *Server) handleAccountIMAPRotate(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
+	// Guard: only active accounts may rotate credentials. Issuing new
+	// credentials on a suspended or soft-deleted account is incoherent
+	// because SASL auth is already halted for those states.
+	//
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials"
+	// (suspension halts SASL auth — rotation on inactive account blocked).
+	if acct.State != account.StateActive {
+		http.Error(w, "account is not active", http.StatusConflict)
+		return
+	}
+	// Rate limit: one rotation per imapRotateCooldown per account.
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials".
+	if !checkRotateRateLimit(acct.ID) {
+		http.Error(w, "too many requests: wait 30s between rotations", http.StatusTooManyRequests)
+		return
+	}
 	plaintext, err := s.deps.AccountService.RotateIMAPPassword(r.Context(), acct.ID)
 	if err != nil {
 		s.deps.Logger.Error("dashboard action: rotate imap password",
@@ -215,6 +267,16 @@ func (s *Server) handleAccountIMAPRotate(w http.ResponseWriter, r *http.Request)
 			slog.String("error", err.Error()))
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials" — drop
+	// live IMAP/SMTP sessions within 1s so the old credential cannot be
+	// replayed after rotation. nil-safe; not wired in test fixtures that
+	// don't exercise the IMAP/SMTP servers.
+	if s.deps.IMAPSessions != nil {
+		s.deps.IMAPSessions.DropForAccount(acct.ID, "IMAP password rotated")
+	}
+	if s.deps.SMTPSessions != nil {
+		s.deps.SMTPSessions.DropForAccount(acct.ID, "IMAP password rotated")
 	}
 	s.deps.Logger.Info("dashboard action: rotated imap password",
 		slog.String("account_id", acct.ID),
