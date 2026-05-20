@@ -249,7 +249,7 @@ func expandDaySuffix(s string) string {
 	}
 	// Multiply by 24 hours. We avoid strconv.Atoi to keep the import
 	// list minimal; the string form is enough for ParseDuration.
-	return prefix + "h"[0:0] + multiplyHours(prefix)
+	return multiplyHours(prefix)
 }
 
 // multiplyHours multiplies the decimal string `s` by 24 and returns
