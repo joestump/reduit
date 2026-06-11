@@ -109,11 +109,26 @@ outcome of submission, not just acceptance into the queue.
 
 - **WHEN** the outbox worker has not returned within the configured
   `SMTP_SUBMIT_TIMEOUT` (default 60s)
-- **THEN** the server SHALL respond with
-  `451 4.4.7 Submission timed out, message will be retried`. The
-  outbox worker SHALL continue retrying in the background and
-  surface eventual outcomes via IMAP Drafts (deferred / per
-  SPEC-0005)
+- **THEN** the server SHALL respond with a transient
+  `451 4.4.7 Submission timed out`. Reduit SHALL NOT perform any
+  server-side background retry: because Proton's `SendDraft` is
+  non-idempotent, a Reduit-side resend risks duplicate delivery. The
+  `451` is a standard RFC 5321 transient failure whose recovery path is
+  the **submitting client's / sender's MTA retry queue** — Reduit hands
+  responsibility back to the sender rather than owning a retry loop. The
+  outbox worker SHALL unwind the in-flight submission and MAY record a
+  best-effort audit row, but MUST NOT promise or attempt a server-side
+  resend, and the `451` response text MUST NOT claim the message "will
+  be retried" by Reduit.
+
+> **Decision note (2026-06-11):** This scenario previously required the
+> outbox worker to "continue retrying in the background and surface
+> outcomes via IMAP Drafts." That requirement is **withdrawn** in favor
+> of the MTA-retry model above, ratifying the implementation choice made
+> in PR #42 (Proton's non-idempotent `SendDraft` makes a safe
+> server-side retry impractical without client-side dedup). A future
+> spec MAY reintroduce server-side retry if a dedup mechanism that does
+> not depend on Proton idempotency is designed.
 
 ### Requirement: Encryption Pipeline
 
@@ -211,3 +226,23 @@ is suspended or deleted; in-flight `DATA` commands SHALL fail.
 - DKIM / SPF signing (Proton signs outbound mail with its own keys).
 - ARC / DMARC awareness.
 - Multi-recipient batching beyond what go-smtp provides natively.
+
+## Security Checklist
+
+Cross-cutting security requirements for the SMTP submission server. Code
+that implements these carries
+`// Governing: SPEC-0004 "Security Checklist"` comments.
+
+- **TLS required (SMTPS only).** The server MUST refuse non-TLS
+  submission and MUST NOT advertise STARTTLS on a cleartext port.
+- **Uniform-time authentication.** SASL PLAIN failures MUST take
+  constant time with respect to account existence and MUST return a
+  byte-identical error, mirroring the IMAP server.
+- **Per-account / per-IP rate limiting.** Submission and auth attempts
+  MUST be rate-limited.
+- **Fail-closed encryption-mode selection.** The outbox MUST select the
+  encryption mode fail-closed — no silent cleartext downgrade; a
+  recipient key that is not Active+Trusted MUST NOT be used for E2E.
+- **Session teardown on suspend.** A suspended/deleted account's live
+  SMTP session MUST be dropped within 1s (see "Per-Session
+  Authentication Lifetime"); implementation tracked in #134.

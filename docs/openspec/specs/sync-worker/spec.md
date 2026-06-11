@@ -188,3 +188,18 @@ API requests across all workers to avoid overwhelming Proton.
 - Backfill of historical messages on first sync (deferred to v0.2;
   v0.1 starts from the current Proton event cursor and only
   materializes new messages from that point forward).
+
+## Implementation Status (v0.1)
+
+Accepted but **deferred** on a tracked roadmap (not drift until landed):
+
+- **IMAP update notification** (EXISTS/EXPUNGE/FETCH push) — depends on
+  the sync→pubsub→IMAP live-update pipeline (epic #5).
+- **Permanent-error state transition** (revoked token / deleted account
+  → suspend, no infinite retry) — partial in #119; admin notification
+  in #118.
+- **Crashed-flag + admin notify on panic** — tracked in #135.
+- **Cursor advances atomically with derived state changes** — cursor
+  persistence is implemented; the atomic-with-materialized-state path is
+  pending message materialization (v0.2 backfill).
+- **Backoff retry-gap correction** — tracked in #136.

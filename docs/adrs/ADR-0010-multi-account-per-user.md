@@ -1,10 +1,18 @@
 # ADR-0010: Multi-Proton-Account Per User
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-05-02
 - **Deciders:** Joe Stump
 
 ## Context and Problem Statement
+
+> **Post-acceptance note (2026-06-11):** This decision has shipped. The
+> users/accounts 1:N split described below is implemented (a `users`
+> table sourced from OIDC, `accounts.user_id` FK, admin status computed
+> at session-bind time), and **SPEC-0001 has since been updated to encode
+> that 1:N model.** The 1:1 OIDC-subject↔account framing in the next
+> paragraph is the *pre-decision* problem statement preserved for the
+> historical record — it is no longer what SPEC-0001 says.
 
 ADR-0002 (multi-tenant data model) and SPEC-0001 (Account Model) both
 encode an implicit 1:1 binding between an OIDC subject and a Proton

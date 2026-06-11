@@ -215,3 +215,40 @@ operating after revocation.
 - IMAP quota extension (deferred).
 - Multi-IMAPS-port support per account (single shared port for all
   accounts).
+
+## Security Checklist
+
+Cross-cutting security requirements for the IMAP server. Code that
+implements these carries `// Governing: SPEC-0003 "Security Checklist"`
+comments.
+
+- **TLS required (IMAPS only).** The server MUST refuse non-TLS
+  connections; STARTTLS on a cleartext port MUST NOT be offered.
+- **Uniform-time authentication.** Authentication failures MUST take
+  constant time with respect to whether the account exists (e.g. a
+  dummy bcrypt comparison on the no-account path), and the failure
+  response MUST be byte-identical regardless of cause, to prevent user
+  enumeration.
+- **Per-account / per-IP rate limiting.** Authentication attempts MUST
+  be rate-limited to blunt credential-stuffing. (v0.1 ships an in-memory
+  limiter; a persistent limiter is tracked separately.)
+- **Output encoding.** Values echoed into IMAP responses (mailbox names,
+  flags, search terms) MUST be encoded so they cannot inject protocol
+  tokens.
+- **Account isolation.** Every LIST/SELECT/STATUS/FETCH MUST be scoped
+  to the authenticated account; cross-account access MUST be
+  indistinguishable from a genuine not-found.
+
+## Implementation Status (v0.1)
+
+The following are accepted but **deferred** on a tracked roadmap; they
+are intentionally not yet implemented in v0.1 and should not be read as
+drift until their tracking issue lands:
+
+- **IDLE support with live updates** — depends on the
+  sync→pubsub→IMAP push pipeline (epic #6).
+- **MOVE reachable over the wire** — handler exists; capability
+  advertisement tracked in #137 (blocks wire tests #45).
+- **APPEND** — tracked in #44.
+- **FETCH `BODY[]` and SEARCH fidelity** — tracked in #139.
+- **Accurate STATUS unseen counts** — tracked in #138.

@@ -134,9 +134,13 @@ server MUST NOT leak which-account-exists-versus-which-is-owned via
 its failure response. "Selector present, account does not exist",
 "selector present, account exists but is not owned by the JWT
 subject", and "selector present, JWT subject has no `users` row at
-all" MUST all produce byte-identical responses (status, headers,
-body, timing characteristics). See the "OIDC bearer subject with no
-`users` row is rejected" scenario for the no-users-row case.
+all" MUST all produce byte-identical responses in **status, headers,
+and body**. Timing characteristics SHOULD be coarsely equivalent (same
+order of magnitude); fine-grained timing-side-channel hardening is out
+of scope for v0.1, consistent with the "Indistinguishability test
+exists" scenario below (which RECOMMENDS only a coarse timing check).
+See the "OIDC bearer subject with no `users` row is rejected" scenario
+for the no-users-row case.
 
 The threat: UUIDv7 carries a creation timestamp. Without this
 discipline, any holder of a valid OIDC ID token (even a non-admin
@@ -399,3 +403,20 @@ on accounts where `account.user_id == session.user_id`.
   UI; no special MCP access).
 - Webhook-style push from server to MCP client (MCP polling /
   resources / prompts patterns are sufficient for v0.1).
+
+## Implementation Status (v0.1)
+
+The MCP tool surface is **roadmap-phased**: the bearer-auth primitives
+(`mcptoken` storage, `BearerValidator`) exist, but the embedded `/mcp`
+server and the tool surface are not yet built. The following are accepted
+but deferred on the tracked roadmap (epic #9) and are not drift until
+their stories land:
+
+- **Embedded `/mcp` server + MCP SDK dependency** — epic #9.
+- **Read tools** (list/get/search/list_labels) — #28.
+- **Write tools + send_message** (label CRUD, move, mark read) — #29.
+- **Streaming get_message / download_attachment + token-issuance UI** — #30.
+- **Path-prefixed selector precedence** (`/accounts/{id}/mcp`) — #116.
+- **401 response-body harmonisation** — #115.
+
+Once these land, trim this section to whatever remains deferred.

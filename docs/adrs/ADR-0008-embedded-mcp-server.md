@@ -25,7 +25,7 @@ a private API?
 - Self-hosters deploy one container, not two. A separate MCP process
   doubles deployment complexity.
 - MCP authentication should reuse Reduit's OIDC session model (or a
-  per-user MCP token derived from it) — this is much simpler if MCP
+  per-account MCP token derived from it) — this is much simpler if MCP
   lives in the same HTTP server.
 - Multi-user routing is identical to the admin UI (auth → identity →
   account scope). One implementation.
@@ -51,8 +51,10 @@ a private API?
 - MCP requests authenticate via:
   - **OIDC bearer token** (the JWT issued by the IdP), validated
     against the same OIDC config the admin UI uses; OR
-  - **Per-user MCP token** issued from the admin UI, stored hashed in
-    SQLite, presented via `Authorization: Bearer <token>`.
+  - **Per-account MCP token** issued from the admin UI, stored hashed in
+    SQLite, presented via `Authorization: Bearer <token>`. A token is
+    bound to exactly one account (`mcp_tokens.account_id`), consistent
+    with the multi-account-per-user model in ADR-0010 and SPEC-0006.
   - Both authenticate to a Reduit account record; all MCP tool
     invocations are scoped to that account.
 - The MCP transport is **HTTP+SSE** (Streamable HTTP per the MCP spec),
@@ -151,7 +153,7 @@ flowchart TB
 
 The MCP server shares the same HTTPS listener, account state, and
 Proton client wrapper as the admin UI. One binary, one auth model
-(OIDC bearer or per-user MCP token), one fault domain. The dashed
+(OIDC bearer or per-account MCP token), one fault domain. The dashed
 alternative is rejected for the operational complexity it would add.
 
 ## References

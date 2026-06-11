@@ -400,3 +400,17 @@ Regenerate any of these by invoking the `gemini-mockup` skill with
 the same filename (it overwrites cleanly). Run a scan-in-arrears
 when the visual identity changes — see the skill's SKILL.md for the
 workflow.
+
+## Implementation Status (v0.1)
+
+Accepted but **deferred** on a tracked roadmap (not drift until landed):
+
+- **Sync status via SSE** — epic #8 (test scaffold #33).
+- **Per-account credentials view** — rotate exists; the view is part of
+  epic #8.
+- **Dedicated /admin/accounts management routes** — epic #8.
+- **First-run operator-configuration warning banner** — epic #8.
+
+Implemented-but-divergent items being corrected as drift fixes (NOT
+deferred): admin-only action segregation + ownership-neutral prose
+(#141), pre-built static CSS vs runtime CDN (#142).

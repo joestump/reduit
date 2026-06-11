@@ -49,8 +49,13 @@ non-trivial.
   outgoing message). Pass authenticated messages to a per-account
   outbox worker that handles encryption and submission via
   `go-proton-api`.
-- **TLS:** wired via the protocol library's `Server.TLSConfig` field.
-  The cert source is the hot-reloading loader from ADR-0009.
+- **TLS:** terminated at a `tls.NewListener` wrapping layer whose
+  `tls.Config.GetCertificate` is wired to the hot-reloading loader from
+  ADR-0009 — not via the protocol library's `Server.TLSConfig` field
+  directly. The `GetCertificate` hot-reload contract from ADR-0009 is
+  the load-bearing part and is preserved; terminating at the listener
+  lets the capability-filter wrapper sit between the TLS layer and the
+  emersion server.
 - **SASL:** PLAIN over TLS only. No CRAM-MD5, no APOP, no anonymous.
   Username form: **`user@host`** (e.g., `joe@reduit.family.tld`),
   matching standard email-client expectations. Auth lookups validate
@@ -161,6 +166,6 @@ talks to SQLite and the Proton client.
 - [`emersion/go-message`](https://github.com/emersion/go-message)
 - [`emersion/hydroxide`](https://github.com/emersion/hydroxide) — same
   author's third-party Proton bridge; reference implementation.
-- ADR-0009 (TLS) — TLS config wired into `Server.TLSConfig`.
+- ADR-0009 (TLS) — `GetCertificate` hot-reload wired at the `tls.Listen` layer (see TLS note above).
 - ADR-0010 (deferred — IMAP UID stability).
 - ADR-0011 (deferred — label↔folder mapping).
