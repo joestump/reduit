@@ -227,14 +227,18 @@ is suspended or deleted; in-flight `DATA` commands SHALL fail.
 - ARC / DMARC awareness.
 - Multi-recipient batching beyond what go-smtp provides natively.
 
-## Security Checklist
+## Security checklist
 
 Cross-cutting security requirements for the SMTP submission server. Code
 that implements these carries
-`// Governing: SPEC-0004 "Security Checklist"` comments.
+`// Governing: SPEC-0004 "Security checklist"` comments.
 
 - **TLS required (SMTPS only).** The server MUST refuse non-TLS
   submission and MUST NOT advertise STARTTLS on a cleartext port.
+- **Request body size limits enforced.** Message/`DATA` size MUST be
+  bounded by `MAX_MESSAGE_BYTES` and oversize input rejected with
+  `552 5.3.4` (see "Recipient and Message Size Limits"), so a single
+  submission cannot exhaust server memory.
 - **Uniform-time authentication.** SASL PLAIN failures MUST take
   constant time with respect to account existence and MUST return a
   byte-identical error, mirroring the IMAP server.

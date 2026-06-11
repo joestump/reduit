@@ -216,14 +216,17 @@ operating after revocation.
 - Multi-IMAPS-port support per account (single shared port for all
   accounts).
 
-## Security Checklist
+## Security checklist
 
 Cross-cutting security requirements for the IMAP server. Code that
-implements these carries `// Governing: SPEC-0003 "Security Checklist"`
+implements these carries `// Governing: SPEC-0003 "Security checklist"`
 comments.
 
 - **TLS required (IMAPS only).** The server MUST refuse non-TLS
   connections; STARTTLS on a cleartext port MUST NOT be offered.
+- **Input validation for SASL.** SASL `AUTHENTICATE`/`LOGIN` credentials
+  MUST be length-bounded and validated before use; malformed or
+  oversized SASL input MUST be rejected without partial processing.
 - **Uniform-time authentication.** Authentication failures MUST take
   constant time with respect to whether the account exists (e.g. a
   dummy bcrypt comparison on the no-account path), and the failure

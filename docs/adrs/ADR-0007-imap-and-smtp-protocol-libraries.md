@@ -49,7 +49,7 @@ non-trivial.
   outgoing message). Pass authenticated messages to a per-account
   outbox worker that handles encryption and submission via
   `go-proton-api`.
-- **TLS:** terminated at a `tls.NewListener` wrapping layer whose
+- **TLS:** terminated at a `tls.Listen` listener layer whose
   `tls.Config.GetCertificate` is wired to the hot-reloading loader from
   ADR-0009 — not via the protocol library's `Server.TLSConfig` field
   directly. The `GetCertificate` hot-reload contract from ADR-0009 is
