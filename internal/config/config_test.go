@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDefaultsValidate(t *testing.T) {
@@ -275,5 +276,53 @@ func TestResolveConfigPathPrecedence(t *testing.T) {
 	t.Parallel()
 	if got := ResolveConfigPath("/explicit/flag.yaml"); got != "/explicit/flag.yaml" {
 		t.Errorf("flag override: got %q", got)
+	}
+}
+
+func TestParseDuration(t *testing.T) {
+	t.Parallel()
+
+	const fallback = 0 // unused for non-empty inputs; empty input returns it
+
+	type tc struct {
+		input     string
+		wantErr   bool
+		wantValue time.Duration
+	}
+
+	cases := []tc{
+		// Day-suffix expansion: "30d" must become 720h, not 30720h.
+		{input: "30d", wantErr: false, wantValue: 30 * 24 * time.Hour},
+		// Single-day expansion.
+		{input: "1d", wantErr: false, wantValue: 24 * time.Hour},
+		// Native Go duration bypasses expansion entirely.
+		{input: "720h", wantErr: false, wantValue: 720 * time.Hour},
+		// Ordinary short duration.
+		{input: "1h", wantErr: false, wantValue: time.Hour},
+		// Empty string returns the fallback (no error).
+		{input: "", wantErr: false, wantValue: fallback},
+		// Invalid duration string must error.
+		{input: "abc", wantErr: true},
+		// "0d" expands to "0h" which is not positive — must error.
+		{input: "0d", wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.input, func(t *testing.T) {
+			t.Parallel()
+			got, err := ParseDuration(c.input, fallback)
+			if c.wantErr {
+				if err == nil {
+					t.Errorf("ParseDuration(%q): expected error, got %v", c.input, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseDuration(%q): unexpected error: %v", c.input, err)
+			}
+			if got != c.wantValue {
+				t.Errorf("ParseDuration(%q): got %v, want %v", c.input, got, c.wantValue)
+			}
+		})
 	}
 }

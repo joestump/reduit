@@ -95,6 +95,23 @@ type Deps struct {
 	//
 	// Governing: ADR-0008, SPEC-0006.
 	MCPHandler http.Handler
+	// IMAPSessions is the live IMAP session registry. When non-nil,
+	// action handlers call DropForAccount after credential rotation or
+	// account suspension so clients are kicked within 1s.
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials",
+	// REQ "Admin Account Management".
+	IMAPSessions interface {
+		DropForAccount(accountID, reason string) int
+	}
+	// SMTPSessions is the live SMTP session registry. Mirrors IMAPSessions:
+	// action handlers call DropForAccount after credential rotation or
+	// account suspension to satisfy SPEC-0005 REQ "Per-User IMAP/SMTP
+	// Credentials" (both IMAP and SMTP sessions dropped within 1s).
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials",
+	// REQ "Admin Account Management".
+	SMTPSessions interface {
+		DropForAccount(accountID, reason string) int
+	}
 }
 
 // Server holds an http.Server pre-configured with TLS and the
@@ -310,6 +327,32 @@ func (s *Server) routes(mux *http.ServeMux) {
 	if s.deps.MCPHandler != nil {
 		mux.Handle("/mcp", s.deps.MCPHandler)
 	}
+
+	// Per-user credentials view and rotation per SPEC-0005 REQ
+	// "Per-User IMAP/SMTP Credentials". GET renders connection details
+	// (host, port, username) with a rotate button; POST generates a
+	// fresh password and returns a one-time-display HTMX modal.
+	// Gated: account.user_id == session.user_id || session.is_admin.
+	//
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials".
+	mux.HandleFunc("GET /accounts/{id}/credentials", s.handleAccountCredentials)
+	mux.HandleFunc("POST /accounts/{id}/credentials/rotate", s.handleAccountCredentialsRotate)
+
+	// Admin-only account management routes. All routes below are
+	// wrapped by auth.RequireAdmin so a 403 is returned for any
+	// non-admin session. See admin_handlers.go.
+	//
+	// Governing: SPEC-0005 REQ "Admin Account Management".
+	adminHandler := func(h http.HandlerFunc) http.Handler {
+		if s.deps.SessionManager != nil {
+			return auth.RequireAdmin(s.deps.SessionManager, h)
+		}
+		return h
+	}
+	mux.Handle("GET /admin/accounts", adminHandler(s.handleAdminAccounts))
+	mux.Handle("POST /admin/accounts/{id}/suspend", adminHandler(s.handleAdminAccountSuspend))
+	mux.Handle("POST /admin/accounts/{id}/unsuspend", adminHandler(s.handleAdminAccountUnsuspend))
+	mux.Handle("POST /admin/accounts/{id}/delete", adminHandler(s.handleAdminAccountDelete))
 }
 
 // handleHealthz returns 200 OK if the process is up. It does not

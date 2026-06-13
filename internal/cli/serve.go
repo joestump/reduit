@@ -20,10 +20,14 @@ import (
 	"github.com/joestump/reduit/internal/auth/mcptoken"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	authsession "github.com/joestump/reduit/internal/auth/session"
+	"github.com/joestump/reduit/internal/config"
 	"github.com/joestump/reduit/internal/cryptenv"
+	"github.com/joestump/reduit/internal/imapserver"
 	"github.com/joestump/reduit/internal/mcpserver"
 	"github.com/joestump/reduit/internal/proton"
+	"github.com/joestump/reduit/internal/retention"
 	"github.com/joestump/reduit/internal/server"
+	"github.com/joestump/reduit/internal/smtpserver"
 	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/tlsloader"
 	"github.com/joestump/reduit/internal/users"
@@ -193,6 +197,35 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// REQ "Add-Proton-Account Wizard"; issue #82.
 	go runPendingAccountSweep(ctx, accountService, logger)
 
+	// Retention sweep job — hard-deletes soft-deleted accounts that have
+	// exceeded the configured retention window (default 30d). Cascade
+	// fires on all per-account FK tables via ON DELETE CASCADE. Each
+	// deletion is logged at INFO with account_id + oidc_subject per
+	// SPEC-0001 REQ "Account Hard Delete After Retention".
+	//
+	// Governing: SPEC-0001 REQ "Account Hard Delete After Retention",
+	// ADR-0006 (SQLite).
+	{
+		retentionPeriod, err := config.ParseDuration(cfg.Store.RetentionPeriod, retention.DefaultRetentionPeriod)
+		if err != nil {
+			return fmt.Errorf("store.retention_period: %w", err)
+		}
+		sweepInterval, err := config.ParseDuration(cfg.Store.SweepInterval, retention.DefaultSweepInterval)
+		if err != nil {
+			return fmt.Errorf("store.sweep_interval: %w", err)
+		}
+		sweeper := retention.New(retention.Config{
+			DB:              st.DB,
+			RetentionPeriod: retentionPeriod,
+			SweepInterval:   sweepInterval,
+			Logger:          logger,
+		})
+		logger.Info("retention sweeper started",
+			slog.Duration("retention_period", retentionPeriod),
+			slog.Duration("sweep_interval", sweepInterval))
+		go sweeper.Run(ctx)
+	}
+
 	// Orphan session_owners sweep. Re-logins through the same browser
 	// leave the prior token's session_owners row stranded because
 	// SCS's RenewToken mints a fresh token for subsequent writes
@@ -271,6 +304,28 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 			slog.Int("queue_depth", mcpserver.DefaultQueueDepth))
 	}
 
+	// IMAP session registry — constructed here so action handlers can
+	// call DropForAccount on credential rotation or account suspension
+	// per SPEC-0005 REQ "Per-User IMAP/SMTP Credentials" and REQ "Admin
+	// Account Management". The IMAP server (imapserver.New) is wired in
+	// a later milestone; for now the registry is created standalone and
+	// passed via server.Deps.IMAPSessions so the drop path is live as
+	// soon as any real IMAP sessions register themselves.
+	//
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials",
+	// REQ "Admin Account Management".
+	imapSessions := imapserver.NewSessions()
+
+	// SMTP session registry — mirrors imapSessions. SPEC-0005 requires
+	// both IMAP and SMTP sessions to be dropped within 1s on credential
+	// rotation and account suspension. The SMTP server is wired in a
+	// later milestone; the registry is created here so the drop path is
+	// live as soon as any SMTP sessions register themselves.
+	//
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials",
+	// REQ "Admin Account Management".
+	smtpSessions := smtpserver.NewSessions()
+
 	// HTTP server. GetCertificate is nil when tls.disabled — server.New
 	// detects that and skips ListenAndServeTLS in favor of plain HTTP.
 	var getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error)
@@ -291,6 +346,8 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		WizardSessions: wizardSessions,
 		AdminSubjects:  cfg.OIDC.AdminSubjects,
 		MCPHandler:     mcpHandler,
+		IMAPSessions:   imapSessions,
+		SMTPSessions:   smtpSessions,
 	})
 
 	errCh := make(chan error, 1)
