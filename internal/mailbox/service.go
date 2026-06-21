@@ -66,6 +66,11 @@ type Service interface {
 	// CountMessagesInMailbox returns the number of message_uids rows
 	// for the mailbox. Used by Session.Status.
 	CountMessagesInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error)
+
+	// CountUnseenInMailbox returns the number of messages in the
+	// mailbox that do NOT carry the `\Seen` flag. Used by Session.Status
+	// to report an accurate STATUS NumUnseen.
+	CountUnseenInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error)
 }
 
 type service struct {
@@ -215,4 +220,8 @@ func (s *service) ListMessagesInMailbox(ctx context.Context, accountID string, m
 
 func (s *service) CountMessagesInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error) {
 	return s.repo.countMessagesInMailbox(ctx, accountID, mailboxID)
+}
+
+func (s *service) CountUnseenInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error) {
+	return s.repo.countUnseenInMailbox(ctx, accountID, mailboxID)
 }

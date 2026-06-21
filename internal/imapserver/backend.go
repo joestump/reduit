@@ -63,6 +63,7 @@ type MailboxService interface {
 	RemoveMessageFromMailbox(ctx context.Context, accountID string, mailboxID, messageID int64) (bool, error)
 	ListMessagesInMailbox(ctx context.Context, accountID string, mailboxID int64) ([]*mailbox.MessageInMailbox, error)
 	CountMessagesInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error)
+	CountUnseenInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error)
 }
 
 // Compile-time assertion: the production mailbox.Service MUST satisfy

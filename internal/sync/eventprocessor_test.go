@@ -73,6 +73,9 @@ func (f *fakeProtonClient) GetLatestEventID(context.Context) (string, error) {
 func (f *fakeProtonClient) GetMessage(context.Context, string) (proton.Message, error) {
 	panic("GetMessage: unexpected call")
 }
+func (f *fakeProtonClient) GetMessageRFC822(context.Context, string) ([]byte, error) {
+	panic("GetMessageRFC822: unexpected call")
+}
 func (f *fakeProtonClient) ListMessages(context.Context, proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	panic("ListMessages: unexpected call")
 }

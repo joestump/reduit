@@ -413,6 +413,78 @@ func TestClient_RequireSession(t *testing.T) {
 	}
 }
 
+// TestClient_GetMessageRFC822_RequiresSession confirms the FETCH BODY[]
+// retrieval path is gated behind an active session: a pre-auth client
+// returns ErrNotAuthenticated before it ever reaches the keyring lookup.
+//
+// Governing: SPEC-0003 design "FETCH BODY[] on big messages".
+func TestClient_GetMessageRFC822_RequiresSession(t *testing.T) {
+	t.Parallel()
+
+	m := NewManager()
+	t.Cleanup(m.Close)
+	c := &clientImpl{mgr: m} // intentionally not adopted
+	if _, err := c.GetMessageRFC822(context.Background(), "msg-1"); !errors.Is(err, ErrNotAuthenticated) {
+		t.Fatalf("pre-auth GetMessageRFC822 error = %v, want ErrNotAuthenticated", err)
+	}
+}
+
+// TestClient_KeyRingFor covers the keyring-selection logic the FETCH
+// BODY[] path relies on: exact AddressID match, single-keyring fallback
+// for an unmatched/empty AddressID, ErrNotUnlocked when nothing is
+// unlocked, and ErrNotUnlocked when a multi-address account cannot match
+// the requested AddressID (picking arbitrarily would risk a decrypt
+// failure).
+//
+// We use a non-nil sentinel *crypto.KeyRing pointer purely for identity
+// comparison — keyRingFor never dereferences it.
+func TestClient_KeyRingFor(t *testing.T) {
+	t.Parallel()
+
+	krA := &KeyRing{}
+	krB := &KeyRing{}
+
+	t.Run("not unlocked", func(t *testing.T) {
+		t.Parallel()
+		c := &clientImpl{}
+		if _, err := c.keyRingFor("addr-1"); !errors.Is(err, ErrNotUnlocked) {
+			t.Fatalf("err = %v, want ErrNotUnlocked", err)
+		}
+	})
+
+	t.Run("exact match", func(t *testing.T) {
+		t.Parallel()
+		c := &clientImpl{addrKeyRings: map[string]*KeyRing{"addr-1": krA, "addr-2": krB}}
+		got, err := c.keyRingFor("addr-2")
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if got != krB {
+			t.Fatalf("got keyring %p, want %p", got, krB)
+		}
+	})
+
+	t.Run("single-keyring fallback on unmatched id", func(t *testing.T) {
+		t.Parallel()
+		c := &clientImpl{addrKeyRings: map[string]*KeyRing{"addr-1": krA}}
+		got, err := c.keyRingFor("does-not-exist")
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if got != krA {
+			t.Fatalf("got keyring %p, want %p", got, krA)
+		}
+	})
+
+	t.Run("multi-keyring unmatched id is not unlocked", func(t *testing.T) {
+		t.Parallel()
+		c := &clientImpl{addrKeyRings: map[string]*KeyRing{"addr-1": krA, "addr-2": krB}}
+		if _, err := c.keyRingFor("addr-3"); !errors.Is(err, ErrNotUnlocked) {
+			t.Fatalf("err = %v, want ErrNotUnlocked", err)
+		}
+	})
+}
+
 // fakeAccount is a minimal AccountSnapshot used to exercise WithAccount
 // without dragging in the real account service (which lives behind the
 // foundation work for issue #10 and is not yet on main).

@@ -368,3 +368,37 @@ WHERE account_id = ? AND mailbox_id = ?`
 	}
 	return n, nil
 }
+
+// seenFlagToken is the exact substring a message's flags column holds
+// when the message carries the IMAP `\Seen` system flag. Flags are
+// stored as a comma-separated token list (see decodeFlags in the
+// imapserver package), so a message is unseen iff this token is absent
+// from its comma-delimited flag set.
+const seenFlagToken = `\Seen`
+
+// countUnseenInMailbox returns the number of messages in the mailbox
+// that do NOT carry the `\Seen` flag. We compute this at the SQL layer
+// by joining message_uids → messages and matching the comma-wrapped
+// flags column against the `\Seen` token: wrapping both the stored
+// value and the needle in commas (',' || flags || ',' LIKE
+// '%,\Seen,%') makes the match exact rather than a substring hit on a
+// hypothetical `\SeenSomething` keyword.
+//
+// Governing: SPEC-0003 REQ "Account Isolation in IMAP Operations" — the
+// WHERE account_id clause keeps the count scoped to the owning account.
+func (r *repository) countUnseenInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error) {
+	const q = `
+SELECT COUNT(*)
+FROM message_uids mu
+JOIN messages m ON m.id = mu.message_id
+WHERE mu.account_id = ? AND mu.mailbox_id = ?
+  AND (',' || COALESCE(m.flags, '') || ',') NOT LIKE ?`
+	// The LIKE needle escapes nothing because `\Seen` contains no SQL
+	// wildcard metacharacters (% or _); the backslash is a literal here.
+	needle := "%," + seenFlagToken + ",%"
+	var n uint32
+	if err := r.reads.GetContext(ctx, &n, q, accountID, mailboxID, needle); err != nil {
+		return 0, fmt.Errorf("mailbox: count unseen: %w", err)
+	}
+	return n, nil
+}

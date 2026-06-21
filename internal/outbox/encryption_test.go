@@ -62,6 +62,9 @@ func (f *fakeProtonClient) GetEvent(context.Context, string) ([]proton.Event, bo
 func (f *fakeProtonClient) GetMessage(context.Context, string) (proton.Message, error) {
 	panic("fakeProtonClient: GetMessage not implemented")
 }
+func (f *fakeProtonClient) GetMessageRFC822(context.Context, string) ([]byte, error) {
+	panic("fakeProtonClient: GetMessageRFC822 not implemented")
+}
 func (f *fakeProtonClient) ListMessages(context.Context, proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	panic("fakeProtonClient: ListMessages not implemented")
 }

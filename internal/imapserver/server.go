@@ -148,16 +148,29 @@ func New(cfg Config) (*Server, error) {
 
 	imapSrv := imapserver.New(&imapserver.Options{
 		NewSession: backend.NewSession,
-		// Caps explicitly contains IMAP4rev1 only. We do NOT advertise
-		// STARTTLS (TLSConfig left nil) so the spec's "STARTTLS-from-
-		// cleartext is not supported" requirement is structurally
-		// enforced. We also do NOT supply IMAP4rev2 because v2 implies
-		// MOVE / NAMESPACE / etc. that we have not yet implemented.
+		// Caps advertises IMAP4rev1 plus the standalone MOVE extension
+		// (RFC 6851). MOVE is fully implemented server-side (see
+		// session_stubs.go performMove / Move), so advertising the
+		// capability lets clients issue the atomic MOVE verb instead of
+		// the COPY + STORE \Deleted + EXPUNGE dance — which on Proton's
+		// additive-label model is both slower and racier.
+		//
+		// We advertise the standalone MOVE cap rather than IMAP4rev2
+		// because v2 *also* implies NAMESPACE / ESEARCH / LIST-EXTENDED /
+		// STATUS=SIZE and other surface we have not validated against the
+		// clients we deploy. Adding just MOVE keeps the blast radius to
+		// the one verb we have implemented and tested.
+		//
+		// We still do NOT advertise STARTTLS (TLSConfig left nil) so the
+		// spec's "STARTTLS-from-cleartext is not supported" requirement
+		// is structurally enforced.
 		//
 		// Governing: SPEC-0003 REQ "TLS Required, IMAPS Only",
-		// SPEC-0003 REQ "PLAIN is the only advertised SASL mechanism".
+		// SPEC-0003 REQ "PLAIN is the only advertised SASL mechanism",
+		// SPEC-0003 REQ "Folder Hierarchy and Mapping".
 		Caps: imap.CapSet{
 			imap.CapIMAP4rev1: {},
+			imap.CapMove:      {},
 		},
 		// TLSConfig is nil ON PURPOSE: this disables STARTTLS in the
 		// emersion server's CAPABILITY response. The actual TLS

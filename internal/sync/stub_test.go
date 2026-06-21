@@ -65,6 +65,9 @@ func (stubClient) GetLatestEventID(context.Context) (string, error) {
 func (stubClient) GetMessage(context.Context, string) (proton.Message, error) {
 	panic("stubClient.GetMessage: lifecycle tests must not reach Proton")
 }
+func (stubClient) GetMessageRFC822(context.Context, string) ([]byte, error) {
+	panic("stubClient.GetMessageRFC822: lifecycle tests must not reach Proton")
+}
 func (stubClient) ListMessages(context.Context, proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	panic("stubClient.ListMessages: lifecycle tests must not reach Proton")
 }

@@ -100,6 +100,14 @@ const (
 // has been revoked via Logout).
 var ErrNotAuthenticated = errors.New("proton: client has no active session")
 
+// ErrNotUnlocked is returned by keyring-dependent calls (currently
+// GetMessageRFC822) when the account's mailbox has not been unlocked in
+// this process. Unlock populates the per-address keyrings the decrypt
+// path needs; until it runs there is nothing to decrypt with. Distinct
+// from ErrNotAuthenticated: the session may be valid (tokens present)
+// yet the mailbox still locked.
+var ErrNotUnlocked = errors.New("proton: mailbox keyring is not unlocked")
+
 // Client is the only Proton surface the rest of Reduit imports. The
 // method set is intentionally minimal: just enough to drive the relay
 // (auth, mailbox unlock, event polling, message read/send, attachment
@@ -162,6 +170,23 @@ type Client interface {
 
 	// GetMessage fetches the full body of one message.
 	GetMessage(ctx context.Context, messageID string) (Message, error)
+
+	// GetMessageRFC822 fetches one message, downloads its attachments,
+	// decrypts everything with the account's unlocked keyring, and
+	// returns the assembled RFC822 (MIME) bytes — the exact payload an
+	// IMAP client expects from FETCH BODY[].
+	//
+	// Requires a keyring: it returns ErrNotUnlocked if the account's
+	// mailbox has not been unlocked in this process (Unlock was never
+	// called on this client, e.g. the daemon restarted and the sync
+	// supervisor has not re-unlocked yet). Callers translate that to a
+	// transient IMAP `NO` so the client retries once the account is
+	// unlocked.
+	//
+	// Governing: SPEC-0003 design "FETCH BODY[] on big messages" —
+	// Proton requires a full body fetch + decrypt; bodies are NOT stored
+	// locally and are materialised lazily on demand here.
+	GetMessageRFC822(ctx context.Context, messageID string) ([]byte, error)
 
 	// ListMessages returns metadata for all messages matching `filter`.
 	// Wraps the upstream paged GetMessageMetadata.
@@ -242,6 +267,20 @@ type clientImpl struct {
 	// (and any future short-lived flow) can read it without
 	// contending with the per-call lifecycle locks.
 	latestRefresh atomic.Pointer[string]
+
+	// addrKeyRings holds the per-address keyrings produced by the most
+	// recent successful Unlock, keyed by Proton AddressID. The IMAP
+	// FETCH BODY[] path (GetMessageRFC822) selects the keyring matching
+	// the message's AddressID to decrypt the body + attachments. nil
+	// until Unlock runs; guarded by krMu because Unlock and the read
+	// path can race across goroutines.
+	//
+	// These are decrypted private keyrings held in memory for the life
+	// of the unlocked session — the same trust posture as the upstream
+	// bridge, which must hold them to render any message. They are
+	// dropped on Logout.
+	krMu         sync.RWMutex
+	addrKeyRings map[string]*crypto.KeyRing
 }
 
 // adoptUpstream installs `up` as the live upstream client and registers
@@ -387,9 +426,47 @@ func (c *clientImpl) GetAddresses(ctx context.Context) ([]Address, error) {
 	return up.GetAddresses(ctx)
 }
 
-// Unlock is a pure operation upstream; we just forward.
+// Unlock is a pure operation upstream; we just forward. On success we
+// also retain the per-address keyrings so the IMAP FETCH BODY[] path
+// (GetMessageRFC822) can decrypt message bodies on demand without
+// re-deriving the keyring on every fetch.
 func (c *clientImpl) Unlock(user User, addresses []Address, saltedKeyPass []byte) (*KeyRing, map[string]*KeyRing, error) {
-	return gpa.Unlock(user, addresses, saltedKeyPass, nil)
+	userKR, addrKRs, err := gpa.Unlock(user, addresses, saltedKeyPass, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	c.krMu.Lock()
+	c.addrKeyRings = addrKRs
+	c.krMu.Unlock()
+	return userKR, addrKRs, nil
+}
+
+// keyRingFor returns the unlocked keyring for the given Proton
+// AddressID, or the sole keyring when addressID is empty / unmatched and
+// exactly one address is unlocked (the common single-address account).
+// Returns ErrNotUnlocked when no keyrings are retained.
+func (c *clientImpl) keyRingFor(addressID string) (*crypto.KeyRing, error) {
+	c.krMu.RLock()
+	defer c.krMu.RUnlock()
+	if len(c.addrKeyRings) == 0 {
+		return nil, ErrNotUnlocked
+	}
+	if kr, ok := c.addrKeyRings[addressID]; ok && kr != nil {
+		return kr, nil
+	}
+	// Fall back to the only keyring when the AddressID does not resolve
+	// (single-address accounts, or a message whose AddressID we cannot
+	// map). Picking an arbitrary keyring for a multi-address account
+	// would risk a decrypt failure, so we only fall back when there is
+	// exactly one.
+	if len(c.addrKeyRings) == 1 {
+		for _, kr := range c.addrKeyRings {
+			if kr != nil {
+				return kr, nil
+			}
+		}
+	}
+	return nil, ErrNotUnlocked
 }
 
 // GetEvent forwards to the upstream client.
@@ -420,6 +497,48 @@ func (c *clientImpl) GetMessage(ctx context.Context, messageID string) (Message,
 	}
 	defer release()
 	return up.GetMessage(ctx, messageID)
+}
+
+// GetMessageRFC822 fetches a message + its attachments, decrypts with
+// the account keyring, and assembles RFC822 (MIME) bytes for FETCH
+// BODY[]. The attachment download uses the upstream sequential
+// scheduler + default allocator (GetFullMessage); for the small mailbox
+// sizes Reduit targets (≤50 family/team accounts) sequential download is
+// adequate and avoids spawning per-fetch goroutine pools.
+//
+// Governing: SPEC-0003 design "FETCH BODY[] on big messages" — full
+// fetch + decrypt; bodies are not stored locally.
+func (c *clientImpl) GetMessageRFC822(ctx context.Context, messageID string) ([]byte, error) {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	full, err := up.GetFullMessage(ctx, messageID,
+		gpa.NewSequentialScheduler(), gpa.NewDefaultAttachmentAllocator())
+	if err != nil {
+		return nil, err
+	}
+
+	kr, err := c.keyRingFor(full.AddressID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Zip the parallel Attachments / AttData slices into the id→bytes
+	// map BuildRFC822 expects. GetFullMessage guarantees the two slices
+	// line up, but we bound the loop by the shorter of the two so a
+	// future upstream change cannot panic us with an index overrun.
+	attData := make(map[string][]byte, len(full.Attachments))
+	for i, att := range full.Attachments {
+		if i >= len(full.AttData) {
+			break
+		}
+		attData[att.ID] = full.AttData[i]
+	}
+
+	return gpa.BuildRFC822(kr, full.Message, attData)
 }
 
 // ListMessages wraps the upstream paged GetMessageMetadata.
@@ -513,6 +632,15 @@ func (c *clientImpl) Logout(ctx context.Context) error {
 	c.loggedOut = true
 	c.up = nil
 	c.upMu.Unlock()
+
+	// Drop the retained keyrings: the session is gone, so the decrypt
+	// material must not outlive it. A post-Logout GetMessageRFC822 then
+	// takes the ErrNotAuthenticated path (c.up is nil) before it ever
+	// reaches the keyring lookup, but clearing here keeps the decrypted
+	// private keys from lingering in memory after revocation.
+	c.krMu.Lock()
+	c.addrKeyRings = nil
+	c.krMu.Unlock()
 
 	// Phase 2: AuthDelete and Close run on the local snapshot with no
 	// lock held, so a slow network can't starve callers of WithAccount

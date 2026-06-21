@@ -50,12 +50,21 @@ func newTestStore(t *testing.T) (*store.Store, string) {
 
 func newMessage(t *testing.T, svc Service, accountID, protonID string) int64 {
 	t.Helper()
+	return newMessageWithFlags(t, svc, accountID, protonID, "")
+}
+
+// newMessageWithFlags seeds a message with the given comma-separated
+// flag string (e.g. `\Seen` or `\Seen,\Flagged`). Used by the unseen-
+// count test to control which messages carry `\Seen`.
+func newMessageWithFlags(t *testing.T, svc Service, accountID, protonID, flags string) int64 {
+	t.Helper()
 	id, err := svc.UpsertMessage(context.Background(), &Message{
 		AccountID:       accountID,
 		ProtonMessageID: protonID,
 		Subject:         "test " + protonID,
 		Sender:          "alice@example.com",
 		RFC822Size:      4096,
+		Flags:           flags,
 		InternalDate:    time.Now().UTC(),
 	})
 	if err != nil {
@@ -581,6 +590,83 @@ func TestCountMessagesInMailboxIsAccountScoped(t *testing.T) {
 	// (account_id filter excludes the rows entirely).
 	if got, _ := svc.CountMessagesInMailbox(ctx, acctA, mboxB.ID); got != 0 {
 		t.Errorf("CountMessagesInMailbox(A, B's mailbox) = %d, want 0", got)
+	}
+}
+
+// TestCountUnseenInMailbox confirms that the unseen count reflects only
+// messages WITHOUT the `\Seen` flag, that the flag match is exact (a
+// `\SeenSomething` keyword does not count as seen), and that the count
+// is scoped to the owning account.
+//
+// Governing: SPEC-0003 REQ "Account Isolation in IMAP Operations".
+func TestCountUnseenInMailbox(t *testing.T) {
+	t.Parallel()
+	st, acctA := newTestStore(t)
+	svc := New(st)
+	ctx := context.Background()
+
+	// A second account so we can prove the count is account-scoped.
+	const acctB = "acct-b"
+	storetest.SeedUserAccountActive(t, st, acctB)
+
+	mboxA, err := svc.EnsureMailbox(ctx, acctA, "INBOX", ProtonInboxLabelID, KindSystem)
+	if err != nil {
+		t.Fatalf("EnsureMailbox(A): %v", err)
+	}
+	mboxB, err := svc.EnsureMailbox(ctx, acctB, "INBOX", ProtonInboxLabelID, KindSystem)
+	if err != nil {
+		t.Fatalf("EnsureMailbox(B): %v", err)
+	}
+
+	// Account A: 5 messages in INBOX.
+	//   m1: unread (no flags)            -> unseen
+	//   m2: read (\Seen)                 -> seen
+	//   m3: read (\Seen,\Flagged)        -> seen
+	//   m4: unread (\Flagged only)       -> unseen
+	//   m5: a `\SeenLater` keyword only  -> unseen (exact-match guard)
+	seed := []struct {
+		id    string
+		flags string
+	}{
+		{"a-m1", ""},
+		{"a-m2", `\Seen`},
+		{"a-m3", `\Seen,\Flagged`},
+		{"a-m4", `\Flagged`},
+		{"a-m5", `\SeenLater`},
+	}
+	for _, s := range seed {
+		mid := newMessageWithFlags(t, svc, acctA, s.id, s.flags)
+		if _, err := svc.AssignUID(ctx, acctA, mboxA.ID, mid); err != nil {
+			t.Fatalf("AssignUID(%s): %v", s.id, err)
+		}
+	}
+
+	// Account B: one read message, so a leaky query would inflate A's
+	// total but its unseen count stays 0 — proving scoping both ways.
+	bID := newMessageWithFlags(t, svc, acctB, "b-m1", `\Seen`)
+	if _, err := svc.AssignUID(ctx, acctB, mboxB.ID, bID); err != nil {
+		t.Fatalf("AssignUID(b-m1): %v", err)
+	}
+
+	got, err := svc.CountUnseenInMailbox(ctx, acctA, mboxA.ID)
+	if err != nil {
+		t.Fatalf("CountUnseenInMailbox(A): %v", err)
+	}
+	if got != 3 {
+		t.Errorf("CountUnseenInMailbox(A) = %d, want 3 (m1, m4, m5)", got)
+	}
+
+	// Sanity: total is 5, so the unseen count is genuinely a subset.
+	if total, _ := svc.CountMessagesInMailbox(ctx, acctA, mboxA.ID); total != 5 {
+		t.Errorf("CountMessagesInMailbox(A) = %d, want 5", total)
+	}
+
+	gotB, err := svc.CountUnseenInMailbox(ctx, acctB, mboxB.ID)
+	if err != nil {
+		t.Fatalf("CountUnseenInMailbox(B): %v", err)
+	}
+	if gotB != 0 {
+		t.Errorf("CountUnseenInMailbox(B) = %d, want 0 (only message is \\Seen)", gotB)
 	}
 }
 

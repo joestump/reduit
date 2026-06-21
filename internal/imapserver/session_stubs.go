@@ -22,6 +22,7 @@
 package imapserver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -328,29 +329,37 @@ func (s *session) Status(name string, options *imap.StatusOptions) (*imap.Status
 	if options.UIDNext {
 		data.UIDNext = imap.UID(mbox.UIDNext)
 	}
-	if options.NumMessages || options.NumRecent || options.NumUnseen {
+	if options.NumMessages {
 		count, err := s.backend.mailboxes.CountMessagesInMailbox(ctx, acctID, mbox.ID)
 		if err != nil {
 			return nil, errMailboxNotFound
 		}
-		if options.NumMessages {
-			n := count
-			data.NumMessages = &n
+		data.NumMessages = &count
+	}
+	if options.NumRecent {
+		// We do not track \Recent (deprecated in IMAP4rev2 anyway);
+		// always return 0 so clients that ask have a stable answer.
+		zero := uint32(0)
+		data.NumRecent = &zero
+	}
+	if options.NumUnseen {
+		// Compute the real unseen (no `\Seen` flag) count via a per-flag
+		// SQL accounting rather than surfacing the total. On error we
+		// fail the whole STATUS with the byte-identical not-found
+		// response so a back-end hiccup never leaks a distinguishable
+		// error shape.
+		//
+		// Governing: SPEC-0003 REQ "Account Isolation in IMAP
+		// Operations".
+		unseen, err := s.backend.mailboxes.CountUnseenInMailbox(ctx, acctID, mbox.ID)
+		if err != nil {
+			s.logger.LogAttrs(ctx, slog.LevelWarn, "imap status unseen count error",
+				slog.String("account_id", acctID),
+				slog.String("mailbox", name),
+				slog.String("err", err.Error()))
+			return nil, errMailboxNotFound
 		}
-		if options.NumRecent {
-			// We do not track \Recent (deprecated in IMAP4rev2 anyway);
-			// always return 0 so clients that ask have a stable answer.
-			zero := uint32(0)
-			data.NumRecent = &zero
-		}
-		if options.NumUnseen {
-			// Without a per-flag accounting yet, surface the total as
-			// the unseen count. The sync worker will populate per-flag
-			// counters in a later story; until then over-reporting
-			// unread messages is the safer side.
-			n := count
-			data.NumUnseen = &n
-		}
+		data.NumUnseen = &unseen
 	}
 	return data, nil
 }
@@ -692,11 +701,21 @@ func (s *session) Search(_ imapserver.NumKind, _ *imap.SearchCriteria, _ *imap.S
 	return &imap.SearchData{}, nil
 }
 
-// Fetch writes minimal FETCH responses for every message in numSet
-// matching the requested options. We support the flag/uid/internaldate/
-// rfc822.size subset that lets clients build a pane (Apple Mail does
-// this on first SELECT). Body retrieval (BODY[]) requires a Proton
-// round-trip and lands when the sync worker materialises bodies.
+// Fetch writes FETCH responses for every message in numSet matching the
+// requested options. Metadata items (UID / Flags / InternalDate /
+// RFC822.SIZE) come straight from the local `messages` row. Body items
+// (BODY[], the obsolete RFC822* family, BODY[HEADER], BODY[TEXT], and
+// their <partial> ranges) require the real message content, which Reduit
+// does NOT store locally — it is fetched from Proton and decrypted on
+// demand via GetMessageRFC822.
+//
+// The Proton fetch happens at most once per message per Fetch call: the
+// full RFC822 is materialised lazily the first time any body section for
+// that message is requested, then every section (full / header / text /
+// partial) is sliced from those bytes.
+//
+// Governing: SPEC-0003 design "FETCH BODY[] on big messages" — full
+// fetch + decrypt, bodies not stored locally.
 func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	if s.backend.mailboxes == nil {
 		return errMailboxNotFound
@@ -713,7 +732,7 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		return errMailboxNotFound
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	msgs, err := s.backend.mailboxes.ListMessagesInMailbox(ctx, acctID, mbox.ID)
@@ -739,11 +758,248 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		if options.RFC822Size {
 			rw.WriteRFC822Size(m.RFC822Size)
 		}
+		if len(options.BodySection) > 0 {
+			if err := s.writeBodySections(ctx, rw, acctID, m, options.BodySection); err != nil {
+				// A body-fetch failure (Proton unreachable, mailbox still
+				// locked, decrypt failure) must not poison the whole FETCH
+				// response: we have already written this message's opening
+				// paren and any metadata items. Close the message and
+				// surface the error so emersion emits a tagged NO; the
+				// client retries.
+				_ = rw.Close()
+				return err
+			}
+		}
 		if err := rw.Close(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// writeBodySections materialises the message's RFC822 once and writes
+// each requested section as a BODY[...] literal. Supported sections:
+//
+//   - BODY[] / RFC822 — the full message.
+//   - BODY[HEADER] / RFC822.HEADER — the MIME header block (through the
+//     blank line that separates header from body, inclusive).
+//   - BODY[TEXT] / RFC822.TEXT — the body after that blank line.
+//   - any of the above with a <offset.size> Partial range.
+//
+// Specific MIME part addressing (BODY[1.2], BODY[1.MIME]) is NOT yet
+// supported; an unsupported specifier yields an empty literal rather
+// than an error so a client requesting a mix of sections still gets the
+// ones we can serve. Full-message BODY[] — the headline client need —
+// is always served.
+//
+// Governing: SPEC-0003 design "FETCH BODY[] on big messages".
+func (s *session) writeBodySections(ctx context.Context, rw *imapserver.FetchResponseWriter, acctID string, m *mailbox.MessageInMailbox, sections []*imap.FetchItemBodySection) error {
+	payloads, err := s.bodySectionsForMessage(ctx, acctID, m, sections)
+	if err != nil {
+		return err
+	}
+	for i, section := range sections {
+		payload := payloads[i]
+		wc := rw.WriteBodySection(section, int64(len(payload)))
+		_, werr := wc.Write(payload)
+		cerr := wc.Close()
+		if werr != nil {
+			return werr
+		}
+		if cerr != nil {
+			return cerr
+		}
+	}
+	return nil
+}
+
+// bodySectionsForMessage fetches + decrypts the message's RFC822 once,
+// then slices it into the bytes each requested section asks for. It is
+// the testable core of the BODY[] path — it touches Proton and the
+// section logic but never the (unconstructable-in-tests) FetchWriter, so
+// unit tests can assert the lazy-fetch + slicing behaviour without a
+// live TCP connection. The returned slice is index-aligned with
+// `sections`.
+//
+// Governing: SPEC-0003 design "FETCH BODY[] on big messages".
+func (s *session) bodySectionsForMessage(ctx context.Context, acctID string, m *mailbox.MessageInMailbox, sections []*imap.FetchItemBodySection) ([][]byte, error) {
+	cli, err := s.protonClient(ctx, acctID)
+	if err != nil {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Cannot reach Proton; try again",
+		}
+	}
+	raw, err := cli.GetMessageRFC822(ctx, m.ProtonMessageID)
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap fetch body retrieval failed",
+			slog.String("account_id", acctID),
+			slog.String("proton_message_id", m.ProtonMessageID),
+			slog.String("err", err.Error()))
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Message body temporarily unavailable",
+		}
+	}
+
+	out := make([][]byte, len(sections))
+	for i, section := range sections {
+		out[i] = bodySectionBytes(raw, section)
+	}
+	return out, nil
+}
+
+// bodySectionBytes slices the full RFC822 message into the bytes a
+// single BODY[...] section asks for, applying the Specifier (full /
+// header / text), the HEADER.FIELDS / HEADER.FIELDS.NOT field filters,
+// and any <offset.size> Partial range. An unsupported specifier (a
+// specific MIME part) returns an empty slice.
+func bodySectionBytes(raw []byte, section *imap.FetchItemBodySection) []byte {
+	var out []byte
+	switch {
+	case len(section.Part) > 0:
+		// Specific MIME-part addressing is not implemented; emit empty.
+		out = nil
+	case section.Specifier == imap.PartSpecifierHeader:
+		switch {
+		case len(section.HeaderFields) > 0:
+			// BODY[HEADER.FIELDS (...)] — only the named header lines.
+			out = filterHeaderFields(rfc822Header(raw), section.HeaderFields, false)
+		case len(section.HeaderFieldsNot) > 0:
+			// BODY[HEADER.FIELDS.NOT (...)] — every header line EXCEPT
+			// the named ones.
+			out = filterHeaderFields(rfc822Header(raw), section.HeaderFieldsNot, true)
+		default:
+			// BODY[HEADER] — the whole header block.
+			out = rfc822Header(raw)
+		}
+	case section.Specifier == imap.PartSpecifierText:
+		out = rfc822Text(raw)
+	default:
+		// PartSpecifierNone (BODY[] / RFC822) — the whole message.
+		out = raw
+	}
+	return applyPartial(out, section.Partial)
+}
+
+// filterHeaderFields returns the subset of a raw RFC822 header block
+// selected by `fields`. When exclude is false it keeps ONLY the named
+// fields (HEADER.FIELDS); when true it keeps every field EXCEPT the
+// named ones (HEADER.FIELDS.NOT). Field-name matching is case-
+// insensitive per RFC 5322. Folded continuation lines (lines beginning
+// with SP or TAB) stay attached to the header line they continue, so a
+// multi-line Subject or Received is emitted whole.
+//
+// The output is terminated with a trailing CRLF (the blank line that
+// closes a header block) so clients see a well-formed, parseable header
+// section — matching what BODY[HEADER] returns.
+func filterHeaderFields(header []byte, fields []string, exclude bool) []byte {
+	want := make(map[string]struct{}, len(fields))
+	for _, f := range fields {
+		want[strings.ToLower(strings.TrimSpace(f))] = struct{}{}
+	}
+
+	var out []byte
+	keep := false // whether the current (possibly folded) header is being kept
+	for _, line := range splitHeaderLines(header) {
+		// A continuation line (folded value) begins with SP or HTAB; it
+		// inherits the keep decision of the header line it continues.
+		if len(line) > 0 && (line[0] == ' ' || line[0] == '\t') {
+			if keep {
+				out = append(out, line...)
+			}
+			continue
+		}
+		// A blank line terminates the header block; do not carry it into
+		// the per-field output (we append our own terminator below).
+		trimmed := strings.TrimRight(string(line), "\r\n")
+		if trimmed == "" {
+			continue
+		}
+		name := trimmed
+		if i := strings.IndexByte(trimmed, ':'); i >= 0 {
+			name = trimmed[:i]
+		}
+		_, named := want[strings.ToLower(strings.TrimSpace(name))]
+		keep = named != exclude // keep iff (named && !exclude) || (!named && exclude)
+		if keep {
+			out = append(out, line...)
+		}
+	}
+	// Terminate with the blank line that closes a header block.
+	out = append(out, '\r', '\n')
+	return out
+}
+
+// splitHeaderLines splits a header block into individual lines, each
+// retaining its trailing CRLF (or LF). Unlike strings.Split it keeps the
+// line terminators so the reassembled output is byte-faithful to the
+// source header.
+func splitHeaderLines(header []byte) [][]byte {
+	var lines [][]byte
+	start := 0
+	for i := 0; i < len(header); i++ {
+		if header[i] == '\n' {
+			lines = append(lines, header[start:i+1])
+			start = i + 1
+		}
+	}
+	if start < len(header) {
+		lines = append(lines, header[start:])
+	}
+	return lines
+}
+
+// rfc822HeaderText splits a raw RFC822 message at the blank line that
+// separates the header block from the body. Returns the header (through
+// and including the separating CRLF/LF) and the remaining body. If no
+// separator is found the whole message is treated as header with an
+// empty body — the conservative reading for a malformed message.
+func rfc822HeaderText(raw []byte) (header, text []byte) {
+	// RFC 5322 uses CRLF; tolerate bare LF for robustness against any
+	// upstream normalisation. Prefer the CRLFCRLF boundary, fall back to
+	// LFLF.
+	if idx := bytes.Index(raw, []byte("\r\n\r\n")); idx >= 0 {
+		return raw[:idx+4], raw[idx+4:]
+	}
+	if idx := bytes.Index(raw, []byte("\n\n")); idx >= 0 {
+		return raw[:idx+2], raw[idx+2:]
+	}
+	return raw, nil
+}
+
+func rfc822Header(raw []byte) []byte {
+	h, _ := rfc822HeaderText(raw)
+	return h
+}
+
+func rfc822Text(raw []byte) []byte {
+	_, t := rfc822HeaderText(raw)
+	return t
+}
+
+// applyPartial restricts data to the <offset.size> window an IMAP
+// BODY[]<o.s> request specifies. An offset past the end yields an empty
+// slice (RFC 3501 §6.4.5); a size that overruns the end is clamped.
+//
+// emersion parses the partial size as a signed int64 straight off the
+// wire, so a hostile client can send a near-MaxInt64 size. The window
+// is computed with overflow-safe SUBTRACTION (avail = len - offset, then
+// clamp size to avail) rather than the additive `offset + size`, which
+// would overflow to a negative end and panic on the slice expression.
+func applyPartial(data []byte, p *imap.SectionPartial) []byte {
+	if p == nil {
+		return data
+	}
+	if p.Offset < 0 || p.Offset >= int64(len(data)) {
+		return nil
+	}
+	avail := int64(len(data)) - p.Offset
+	size := p.Size
+	if size <= 0 || size > avail {
+		size = avail
+	}
+	return data[p.Offset : p.Offset+size]
 }
 
 // Store updates the in-session pending-delete set when a client sets

@@ -20,6 +20,7 @@ package imapserver
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -100,6 +101,18 @@ const testActive = "active"
 type fakeProton struct {
 	mu    sync.Mutex
 	calls []protonCall
+
+	// body is the RFC822 payload GetMessageRFC822 returns; bodyErr, when
+	// set, is returned instead so tests can exercise the Proton-failure
+	// branch of the Fetch BODY[] path. bodyByID overrides body for a
+	// specific Proton message ID when a test fetches several messages.
+	body     []byte
+	bodyErr  error
+	bodyByID map[string][]byte
+	// bodyFetches records the Proton message IDs passed to
+	// GetMessageRFC822 so a test can assert lazy fetch happened exactly
+	// when expected.
+	bodyFetches []string
 }
 
 type protonCall struct {
@@ -152,6 +165,20 @@ func (c *fakeProtonClient) GetEvent(context.Context, string) ([]proton.Event, bo
 }
 func (c *fakeProtonClient) GetMessage(context.Context, string) (proton.Message, error) {
 	return proton.Message{}, nil
+}
+func (c *fakeProtonClient) GetMessageRFC822(_ context.Context, messageID string) ([]byte, error) {
+	c.parent.mu.Lock()
+	c.parent.bodyFetches = append(c.parent.bodyFetches, messageID)
+	err := c.parent.bodyErr
+	body := c.parent.body
+	if b, ok := c.parent.bodyByID[messageID]; ok {
+		body = b
+	}
+	c.parent.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
 }
 func (c *fakeProtonClient) ListMessages(context.Context, proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	return nil, nil
@@ -879,6 +906,9 @@ func (c *erroringProtonClient) GetEvent(ctx context.Context, id string) ([]proto
 func (c *erroringProtonClient) GetMessage(ctx context.Context, id string) (proton.Message, error) {
 	return c.wrapped.GetMessage(ctx, id)
 }
+func (c *erroringProtonClient) GetMessageRFC822(ctx context.Context, id string) ([]byte, error) {
+	return c.wrapped.GetMessageRFC822(ctx, id)
+}
 func (c *erroringProtonClient) ListMessages(ctx context.Context, f proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	return c.wrapped.ListMessages(ctx, f)
 }
@@ -1060,3 +1090,248 @@ func intDigits(i int) string {
 // of which are reachable through performMove. Once IMAP4rev2 is
 // enabled and end-to-end MOVE plumbing lands, a follow-up story can
 // add a TCP-level integration test.
+
+// TestSessionStatusNumUnseenCountsUnreadOnly drives STATUS with
+// NumUnseen against a mailbox holding a mix of read and unread messages
+// and asserts the count reflects only messages WITHOUT the \Seen flag —
+// not the total. Before issue #13 this returned the total message count.
+//
+// Governing: SPEC-0003 REQ "Account Isolation in IMAP Operations".
+func TestSessionStatusNumUnseenCountsUnreadOnly(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+
+	mb, err := mboxes.EnsureMailbox(ctx, acct, "INBOX", mailbox.ProtonInboxLabelID, mailbox.KindSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 4 messages: 2 unread, 2 read (\Seen). Expected NumUnseen = 2,
+	// NumMessages = 4.
+	seed := []string{"", `\Seen`, "", `\Seen`}
+	for i, flags := range seed {
+		mid, err := mboxes.UpsertMessage(ctx, &mailbox.Message{
+			AccountID:       acct,
+			ProtonMessageID: testProtonID(i),
+			Flags:           flags,
+			InternalDate:    time.Now().UTC(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mboxes.AssignUID(ctx, acct, mb.ID, mid); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sess := newAuthedSession(t, mboxes, nil, acct)
+	data, err := sess.Status("INBOX", &imap.StatusOptions{
+		NumMessages: true,
+		NumUnseen:   true,
+	})
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if data.NumMessages == nil || *data.NumMessages != 4 {
+		t.Errorf("NumMessages = %v, want 4", data.NumMessages)
+	}
+	if data.NumUnseen == nil || *data.NumUnseen != 2 {
+		t.Errorf("NumUnseen = %v, want 2 (only the two unread messages)", data.NumUnseen)
+	}
+}
+
+// sampleRFC822 is a minimal but well-formed message: a header block, the
+// blank-line separator, and a body. Used by the BODY[] tests.
+const sampleRFC822 = "From: alice@example.com\r\n" +
+	"To: bob@example.com\r\n" +
+	"Subject: Hello\r\n" +
+	"\r\n" +
+	"This is the body.\r\n"
+
+// TestSessionFetchBodySections covers the FETCH BODY[] section logic
+// end-to-end through bodySectionsForMessage: the full message, the
+// HEADER and TEXT specifiers, and an <offset.size> partial of the full
+// message. The body is sourced lazily from the (fake) Proton client.
+//
+// Governing: SPEC-0003 design "FETCH BODY[] on big messages".
+func TestSessionFetchBodySections(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+
+	mb, err := mboxes.EnsureMailbox(ctx, acct, "INBOX", mailbox.ProtonInboxLabelID, mailbox.KindSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mid, err := mboxes.UpsertMessage(ctx, &mailbox.Message{
+		AccountID:       acct,
+		ProtonMessageID: "proton-body-1",
+		InternalDate:    time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mboxes.AssignUID(ctx, acct, mb.ID, mid); err != nil {
+		t.Fatal(err)
+	}
+
+	fp := &fakeProton{body: []byte(sampleRFC822)}
+	sess := newAuthedSession(t, mboxes, fp, acct)
+	if _, err := sess.Select("INBOX", nil); err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+
+	m := &mailbox.MessageInMailbox{UID: 1, ProtonMessageID: "proton-body-1"}
+
+	header, body := rfc822HeaderText([]byte(sampleRFC822))
+
+	cases := []struct {
+		name    string
+		section *imap.FetchItemBodySection
+		want    []byte
+	}{
+		{"full", &imap.FetchItemBodySection{}, []byte(sampleRFC822)},
+		{"header", &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader}, header},
+		{"text", &imap.FetchItemBodySection{Specifier: imap.PartSpecifierText}, body},
+		{"partial", &imap.FetchItemBodySection{Partial: &imap.SectionPartial{Offset: 0, Size: 4}}, []byte(sampleRFC822)[:4]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := sess.bodySectionsForMessage(ctx, acct, m, []*imap.FetchItemBodySection{tc.section})
+			if err != nil {
+				t.Fatalf("bodySectionsForMessage: %v", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("got %d sections, want 1", len(got))
+			}
+			if string(got[0]) != string(tc.want) {
+				t.Errorf("section %q = %q, want %q", tc.name, got[0], tc.want)
+			}
+		})
+	}
+}
+
+// TestSessionFetchBodyProtonFailure asserts a Proton retrieval error is
+// surfaced as a transient NO (not a crash, and not a silent empty body)
+// so the client retries.
+//
+// Governing: SPEC-0003 design "FETCH BODY[] on big messages".
+func TestSessionFetchBodyProtonFailure(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+
+	fp := &fakeProton{bodyErr: errors.New("simulated proton fetch failure")}
+	sess := newAuthedSession(t, mboxes, fp, acct)
+	m := &mailbox.MessageInMailbox{UID: 1, ProtonMessageID: "proton-body-err"}
+
+	_, err := sess.bodySectionsForMessage(ctx, acct, m, []*imap.FetchItemBodySection{{}})
+	if err == nil {
+		t.Fatal("expected error from Proton failure, got nil")
+	}
+	imapErr, ok := err.(*imap.Error)
+	if !ok || imapErr.Type != imap.StatusResponseTypeNo {
+		t.Errorf("got %v, want a NO imap.Error", err)
+	}
+}
+
+// TestBodySectionBytes unit-tests the pure section-slicing helper across
+// the specifiers and partial-range edge cases (offset past end, size
+// overrun, unsupported MIME-part addressing).
+func TestBodySectionBytes(t *testing.T) {
+	t.Parallel()
+	raw := []byte(sampleRFC822)
+	header, body := rfc822HeaderText(raw)
+
+	cases := []struct {
+		name    string
+		section *imap.FetchItemBodySection
+		want    []byte
+	}{
+		{"full", &imap.FetchItemBodySection{}, raw},
+		{"header", &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader}, header},
+		{"text", &imap.FetchItemBodySection{Specifier: imap.PartSpecifierText}, body},
+		{"partial in range", &imap.FetchItemBodySection{Partial: &imap.SectionPartial{Offset: 6, Size: 5}}, raw[6:11]},
+		{"partial size overrun clamps", &imap.FetchItemBodySection{Partial: &imap.SectionPartial{Offset: int64(len(raw) - 2), Size: 100}}, raw[len(raw)-2:]},
+		{"partial offset past end is empty", &imap.FetchItemBodySection{Partial: &imap.SectionPartial{Offset: int64(len(raw) + 10), Size: 5}}, nil},
+		{"mime part unsupported is empty", &imap.FetchItemBodySection{Part: []int{1}}, nil},
+		// Regression: a hostile client sends BODY[]<10.MaxInt64>. The
+		// additive `offset+size` window overflows to a negative end and
+		// panics on the slice expression, tearing down the connection.
+		// The overflow-safe clamp must instead return raw[10:] without
+		// panicking.
+		{"partial size MaxInt64 clamps without overflow", &imap.FetchItemBodySection{Partial: &imap.SectionPartial{Offset: 10, Size: math.MaxInt64}}, raw[10:]},
+		// And the same enormous size with an offset past the end must be
+		// an empty slice, not a panic.
+		{"partial size MaxInt64 past end is empty", &imap.FetchItemBodySection{Partial: &imap.SectionPartial{Offset: int64(len(raw) + 1), Size: math.MaxInt64}}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := bodySectionBytes(raw, tc.section)
+			if string(got) != string(tc.want) {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBodySectionHeaderFields covers BODY[HEADER.FIELDS (...)] and
+// BODY[HEADER.FIELDS.NOT (...)]: the response must contain ONLY the
+// named fields (resp. every field except them), case-insensitively, with
+// folded continuation lines kept intact — not the entire header block.
+//
+// Governing: SPEC-0003 design "FETCH BODY[] on big messages".
+func TestBodySectionHeaderFields(t *testing.T) {
+	t.Parallel()
+	// A header with a folded Subject to prove continuation lines stay
+	// attached to the field they continue.
+	raw := []byte("From: alice@example.com\r\n" +
+		"To: bob@example.com\r\n" +
+		"Subject: a very long subject\r\n" +
+		"\tthat folds onto a second line\r\n" +
+		"Date: Sun, 21 Jun 2026 00:00:00 +0000\r\n" +
+		"\r\n" +
+		"body\r\n")
+
+	t.Run("FIELDS keeps only named, case-insensitive", func(t *testing.T) {
+		got := bodySectionBytes(raw, &imap.FetchItemBodySection{
+			Specifier:    imap.PartSpecifierHeader,
+			HeaderFields: []string{"from", "TO"},
+		})
+		want := "From: alice@example.com\r\n" +
+			"To: bob@example.com\r\n" +
+			"\r\n"
+		if string(got) != want {
+			t.Errorf("FIELDS got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("FIELDS keeps folded continuation lines", func(t *testing.T) {
+		got := bodySectionBytes(raw, &imap.FetchItemBodySection{
+			Specifier:    imap.PartSpecifierHeader,
+			HeaderFields: []string{"subject"},
+		})
+		want := "Subject: a very long subject\r\n" +
+			"\tthat folds onto a second line\r\n" +
+			"\r\n"
+		if string(got) != want {
+			t.Errorf("FIELDS folded got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("FIELDS.NOT drops named, keeps the rest (incl. folds)", func(t *testing.T) {
+		got := bodySectionBytes(raw, &imap.FetchItemBodySection{
+			Specifier:       imap.PartSpecifierHeader,
+			HeaderFieldsNot: []string{"date"},
+		})
+		want := "From: alice@example.com\r\n" +
+			"To: bob@example.com\r\n" +
+			"Subject: a very long subject\r\n" +
+			"\tthat folds onto a second line\r\n" +
+			"\r\n"
+		if string(got) != want {
+			t.Errorf("FIELDS.NOT got %q, want %q", got, want)
+		}
+	})
+}

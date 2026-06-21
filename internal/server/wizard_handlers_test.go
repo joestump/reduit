@@ -176,6 +176,9 @@ func (c *stubProtonClient) GetLatestEventID(context.Context) (string, error) {
 func (c *stubProtonClient) GetMessage(context.Context, string) (proton.Message, error) {
 	panic("unexpected")
 }
+func (c *stubProtonClient) GetMessageRFC822(context.Context, string) ([]byte, error) {
+	panic("unexpected")
+}
 func (c *stubProtonClient) ListMessages(context.Context, proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	panic("unexpected")
 }
