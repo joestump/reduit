@@ -5,52 +5,38 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.Title}} — Reduit</title>
 <!--
-  v1 ships Tailwind 4 (browser-build mode) + DaisyUI 5 from a
-  versioned CDN with SRI integrity hashes. The proper build pipeline
-  (Tailwind compile-time PurgeCSS) lands when the asset-pipeline ADR
-  is filed (tracked separately). Acceptable for the pre-alpha MVP;
-  the visible identity matches the mockups in docs/mockups/spec-0005/.
+  Frontend assets ship PRE-BUILT and committed, served from the binary
+  (go:embed under internal/server/static/vendor). No runtime CDN, no
+  in-browser Tailwind compile. Per ADR-0005.
 
-  Versions are pinned (Tailwind 4.2.4, DaisyUI 5.0.0) and the
-  integrity hashes are computed against the exact bytes those URLs
-  return, so a CDN compromise that swaps the file would be rejected
-  by the browser. Bumping versions REQUIRES recomputing the hash:
+  - app.css: Tailwind 4.2.4 + DaisyUI 5.0.0, compiled by the Tailwind
+    standalone CLI (`make css` over web/app.css) with the templates as
+    the purge source and the `reduit-dark` theme baked in. Regenerate
+    and re-commit when templates or the theme change.
+  - htmx + the SSE extension: vendored from the same pinned versions
+    (2.0.4 / 2.2.3) previously loaded via CDN; their bytes match the
+    SRI hashes that gated those CDN loads.
+  - Inter: the variable woff2 is vendored and declared @font-face below
+    instead of pulling rsms.me at runtime.
 
-    curl -sLf <url> | openssl dgst -sha384 -binary | openssl base64 -A
+  Governing: ADR-0005 (HTMX + SSE + Tailwind 4 + DaisyUI, pre-built
+  committed CSS, no runtime CDN); SPEC-0005 REQ "Sync Status via SSE";
+  issues #16, #20, #102, #103.
 -->
-<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.2.4"
-        integrity="sha384-yNSZBFvuOWcmww494a9+1zNuvgUGEXoWkein7cxP8wHUTi3iXCU4vJ7hr3tzBCml"
-        crossorigin="anonymous"></script>
-<!-- HTMX 2.0.4 (pinned) for the dashboard's per-account action
-     handlers. SRI integrity is computed against the exact bytes the
-     pinned URL returns; bumping the version REQUIRES recomputing the
-     hash via the same recipe documented above for Tailwind/DaisyUI.
-     Governing: ADR-0005 (HTMX + SSE + Tailwind 4 + DaisyUI); issues
-     #102, #103. -->
-<script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js"
-        integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
-        crossorigin="anonymous"></script>
-<!-- HTMX SSE extension (pinned 2.2.3) for the dashboard's live
-     sync-status cards. Each status badge subscribes to
-     GET /sse/accounts/{id}/status and swaps on the `status` event
-     (per ADR-0005). SSE is same-origin, so the CSP's connect-src 'self'
-     already covers the EventSource connection; the script itself loads
-     from cdn.jsdelivr.net, already allowed by script-src. SRI is
-     computed against the exact bytes the pinned URL returns; bumping
-     the version REQUIRES recomputing the hash via the recipe documented
-     above for Tailwind/DaisyUI.
-     Governing: ADR-0005 (HTMX + SSE); SPEC-0005 REQ "Sync Status via
-     SSE"; issue #16. -->
-<script src="https://cdn.jsdelivr.net/npm/htmx-ext-sse@2.2.3/dist/sse.min.js"
-        integrity="sha384-Y4gc0CK6Kg+hmulDc6rZPJu0tqvk7EWlih0Oh+2OkAi1ZDlCbBDCQEE2uVk472Ky"
-        crossorigin="anonymous"></script>
-<link href="https://cdn.jsdelivr.net/npm/daisyui@5.0.0/daisyui.min.css"
-      integrity="sha384-Ne25/KSd+//Kv4vLZMuZMKWVB4jxY83OCZAuPyyVrocKy+SDhJYefHuKJ92YkLux"
-      crossorigin="anonymous"
-      rel="stylesheet">
+<link rel="stylesheet" href="/static/vendor/app.css">
+<script src="/static/vendor/htmx-2.0.4.min.js"></script>
+<script src="/static/vendor/htmx-ext-sse-2.2.3.min.js"></script>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
 <style>
+  /* Inter variable font, served locally (no rsms.me CDN). The single
+     variable woff2 covers weights 100-900. Governing: ADR-0005. */
+  @font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: swap;
+    src: url('/static/vendor/InterVariable.woff2') format('woff2');
+  }
   :root { font-family: 'Inter', system-ui, sans-serif; }
   body { background: #0F172A; color: #E2E8F0; }
   .surface { background: #1E293B; border: 1px solid #334155; }

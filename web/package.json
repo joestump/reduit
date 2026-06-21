@@ -1,0 +1,13 @@
+{
+  "name": "reduit-web",
+  "private": true,
+  "description": "Build-time only: produces internal/server/static/vendor/app.css. Not shipped, not required at go build / CI time.",
+  "scripts": {
+    "build": "tailwindcss -i ./app.css -o ../internal/server/static/vendor/app.css --minify"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.2.4",
+    "daisyui": "^5.0.0",
+    "tailwindcss": "^4.2.4"
+  }
+}

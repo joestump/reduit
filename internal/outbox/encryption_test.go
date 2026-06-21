@@ -190,8 +190,11 @@ func TestSelectMode_ExternalWithKeyGetsExternalE2E(t *testing.T) {
 // GetPublicKeys for a Proton-internal recipient MUST produce
 // *ErrKeyLookup, not silently downgrade to ModeCleartext.
 //
-// Governing: SPEC-0004 Security checklist + the SPEC-0004 design
-// rationale in encryption.go's package doc.
+// Governing: SPEC-0004 REQ "Encryption Pipeline" (a key-lookup error
+// for a Proton-internal recipient MUST fail closed rather than
+// downgrade off the E2E path the "Proton recipient gets E2E" scenario
+// requires) + the SPEC-0004 design rationale in encryption.go's
+// package doc.
 func TestSelectMode_KeyLookupErrorFailsClosed(t *testing.T) {
 	t.Parallel()
 	upstreamErr := errors.New("simulated 503 from /core/v4/keys")

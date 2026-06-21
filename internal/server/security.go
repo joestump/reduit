@@ -3,11 +3,10 @@
 //
 // securityHeaders wraps the whole mux so every admin-UI response
 // (pages, fragments, 302s, error pages) carries the baseline browser
-// hardening headers. The CSP is deliberately permissive about the
-// jsdelivr CDN because base.html loads Tailwind 4 (browser-build mode),
-// DaisyUI, and HTMX from cdn.jsdelivr.net at runtime; tightening that
-// (moving the asset pipeline off the CDN) is tracked separately as a
-// P3 issue and is explicitly out of scope here.
+// hardening headers. The CSP is same-origin-only: the frontend assets
+// (Tailwind+DaisyUI CSS, HTMX core + SSE extension, Inter font) ship
+// pre-built and embedded, served from /static/vendor (per ADR-0005), so
+// no CDN host is allowlisted.
 //
 // clientIP derives the real client address from X-Forwarded-For /
 // X-Real-IP, but ONLY when the immediate TCP peer (r.RemoteAddr) is a
@@ -31,37 +30,35 @@ import (
 
 // contentSecurityPolicy is the CSP applied to every admin-UI response.
 //
-// The directives intentionally allow https://cdn.jsdelivr.net for
-// scripts and styles because base.html pulls Tailwind 4 (browser
-// build), DaisyUI, and HTMX from that CDN at runtime (see base.html's
-// header comment). The in-browser Tailwind compiler needs
-// 'unsafe-inline' (it injects a <style> element) and 'unsafe-eval'
-// (it evaluates generated CSS-in-JS); DaisyUI ships as a stylesheet
-// and the page carries an inline <style> block plus inline SVG, so
-// style-src also needs 'unsafe-inline'. HTMX uses inline `hx-*`
-// attributes (not inline <script>), which are not constrained by
-// script-src, so no script hash dance is required.
+// Same-origin-only. Every asset the UI loads -- the pre-built
+// Tailwind+DaisyUI stylesheet, the HTMX core + SSE-extension scripts,
+// the Inter variable font, the favicon -- is embedded in the binary
+// and served from this origin under /static/vendor (per ADR-0005). No
+// CDN host (formerly cdn.jsdelivr.net, rsms.me) is allowlisted.
 //
-// font-src / style-src also allow https://rsms.me for the Inter web
-// font (base.html links rsms.me/inter/inter.css, which in turn pulls
-// font files from the same origin). img-src allows data: for any
-// inline data-URI imagery and 'self' for /favicon.svg.
+// script-src keeps 'unsafe-inline' only for inline event-free script
+// the page itself carries; 'unsafe-eval' is GONE -- it was required
+// solely by the in-browser Tailwind compiler, which no longer runs.
+// HTMX uses inline `hx-*` attributes (not inline <script>), unaffected
+// by script-src. style-src keeps 'unsafe-inline' because base.html and
+// denied.html carry an inline <style> block (the @font-face + brand
+// surface rules) plus inline-styled SVG. img-src allows data: for any
+// inline data-URI imagery and 'self' for /favicon.svg. font-src 'self'
+// covers the locally-served Inter woff2.
 //
 // frame-ancestors 'none' is the CSP-level twin of X-Frame-Options:
 // DENY -- modern browsers honour the former; the header is kept for
-// older agents. base-uri 'self' and form-action 'self' keep a CDN
-// compromise from repointing relative URLs or exfiltrating form posts
+// older agents. base-uri 'self' and form-action 'self' keep injected
+// markup from repointing relative URLs or exfiltrating form posts
 // off-origin.
 //
-// Moving the asset pipeline off the CDN (which would let this collapse
-// to 'self') is a separate P3 issue and deliberately NOT done here.
-//
-// Governing: SPEC-0005 design "Content security and CSRF"; ADR-0005
-// (Tailwind/DaisyUI/HTMX via CDN in the pre-alpha MVP).
+// Governing: ADR-0005 (pre-built committed assets served from the
+// binary, no runtime CDN); SPEC-0005 design "Content security and
+// CSRF"; issue #20.
 const contentSecurityPolicy = "default-src 'self'; " +
-	"script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net; " +
-	"style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://rsms.me; " +
-	"font-src 'self' https://rsms.me; " +
+	"script-src 'self' 'unsafe-inline'; " +
+	"style-src 'self' 'unsafe-inline'; " +
+	"font-src 'self'; " +
 	"img-src 'self' data:; " +
 	"connect-src 'self'; " +
 	"base-uri 'self'; " +
@@ -93,8 +90,8 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		// Referrer-Policy keeps the full admin-UI URL (which can carry
-		// account IDs in the path) from leaking to the jsdelivr CDN or
-		// any off-origin navigation.
+		// account IDs in the path) from leaking on any off-origin
+		// navigation.
 		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		next.ServeHTTP(w, r)
 	})

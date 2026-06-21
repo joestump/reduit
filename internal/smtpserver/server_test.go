@@ -108,8 +108,9 @@ func TestSASLPlainHappyPath(t *testing.T) {
 // asserts byte-identical 535 responses across the board. This is the
 // "no detail leak" guarantee SPEC-0004 inherits from SPEC-0003.
 //
-// Governing: SPEC-0004 REQ "SASL PLAIN Authentication Matching IMAP",
-// SPEC-0004 Security checklist (uniform-time auth).
+// Governing: SPEC-0004 REQ "SASL PLAIN Authentication Matching IMAP"
+// (the "no detail leak" guarantee SPEC-0004 inherits from SPEC-0003's
+// "Authentication failure returns NO with no detail").
 func TestSASLPlainAuthFailuresAreIdentical(t *testing.T) {
 	t.Parallel()
 	stub := newStubAccounts()
@@ -305,8 +306,9 @@ func TestRecipientLimitEnforced(t *testing.T) {
 // We send a payload bigger than the cap; the server returns
 // `552 5.3.4 ...` without buffering the whole payload.
 //
-// Governing: SPEC-0004 REQ "Recipient and Message Size Limits" +
-// Security checklist "Request body size limits enforced".
+// Governing: SPEC-0004 REQ "Recipient and Message Size Limits"
+// (scenario "Message size limit" — enforced mid-stream, not after
+// buffering the whole body).
 func TestMessageSizeLimitDuringStreaming(t *testing.T) {
 	t.Parallel()
 	stub := newStubAccounts()

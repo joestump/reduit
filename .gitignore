@@ -12,6 +12,12 @@ master.key
 *.db-shm
 *.db-wal
 
+# Frontend build tooling (build-time only; the OUTPUT
+# internal/server/static/vendor/app.css IS committed). node_modules and
+# the npm lockfile are local to `make css` and not shipped.
+web/node_modules/
+web/package-lock.json
+
 # Editor / OS
 .idea/
 .vscode/

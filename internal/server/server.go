@@ -386,6 +386,19 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// Governing: SPEC-0005 REQ "Authentication Gating"; issue #77.
 	mux.HandleFunc("GET /favicon.svg", s.handleFavicon)
 
+	// Pre-built frontend assets (Tailwind+DaisyUI CSS, HTMX core + SSE
+	// extension, Inter variable font), embedded in the binary and
+	// served from the same origin instead of a runtime CDN. The
+	// /static/* prefix is already allowlisted (auth.Allowlist) so the
+	// login page's stylesheet/JS load without the session gate.
+	// Immutable, version-pinned bytes -> a long, immutable Cache-Control
+	// (filenames carry the version, e.g. htmx-2.0.4.min.js, so cache
+	// busting is by URL).
+	//
+	// Governing: ADR-0005 (pre-built committed assets, no runtime CDN);
+	// SPEC-0005 REQ "Authentication Gating"; issue #20.
+	mux.Handle("GET /static/vendor/", http.StripPrefix("/static/vendor/", s.staticVendorHandler()))
+
 	// Root path: 302 to /accounts. Without this, an authenticated
 	// browser landing on `/` (e.g., after a login that captured
 	// `?return_to=/` from a stale link, or an operator typing the

@@ -173,7 +173,9 @@ func TestData_OutboxServerErrorMapsTo451(t *testing.T) {
 // sender retries, so a flaky Proton key endpoint doesn't manifest as a
 // permanent reject).
 //
-// Governing: SPEC-0004 REQ "Encryption Pipeline" + Security checklist.
+// Governing: SPEC-0004 REQ "Encryption Pipeline" (fail-closed: a
+// key-lookup error maps to a transient 451 rather than downgrading
+// off the E2E path).
 func TestData_OutboxKeyLookupErrorMapsTo451(t *testing.T) {
 	t.Parallel()
 	ob := &stubOutbox{

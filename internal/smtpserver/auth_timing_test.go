@@ -20,7 +20,8 @@ import (
 // median is within ±20% of the bcrypt-bearing (wrong-password)
 // baseline.
 //
-// Governing: SPEC-0004 Security checklist (uniform-time auth).
+// Governing: SPEC-0004 REQ "SASL PLAIN Authentication Matching IMAP"
+// (uniform-time auth — failure modes must not be timing-distinguishable).
 func TestAuthFailureIsConstantTime(t *testing.T) {
 	if testing.Short() {
 		t.Skip("timing-side-channel test runs ~150 bcrypts at cost 12; skipped in -short mode")

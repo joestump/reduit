@@ -31,19 +31,32 @@ import (
 //go:embed templates/*.html templates/fragments/*.html
 var templateFS embed.FS
 
-// staticFS embeds the small set of brand-mark assets the layout
-// needs (favicon, etc.). Lives in this file because //go:embed
-// directives compile against the surrounding package; there is no
-// separate static subpackage today.
+// staticFS embeds the static asset tree the layout needs:
+//   - static/favicon.svg              brand mark
+//   - static/vendor/app.css           pre-built Tailwind 4 + DaisyUI 5
+//   - static/vendor/htmx-*.min.js     HTMX core + SSE extension
+//   - static/vendor/InterVariable.woff2  Inter variable font
 //
-// Routes that serve from staticFS (currently /favicon.svg) are
-// allowlisted so an unauthenticated browser can fetch them on the
-// login page -- mirrors how auth.Allowlist handles /static/*.
+// Per ADR-0005 the frontend ships pre-built committed assets served
+// from the binary -- no runtime CDN, no bundler at `go build` time.
+// The app.css bundle is produced by `make css` (Tailwind standalone
+// CLI over web/app.css) and committed; the JS/font are vendored from
+// the same pinned versions base.html previously loaded via CDN (their
+// bytes match the SRI hashes that were trusted there -- see web/ and
+// the commit that vendored them).
 //
-// Governing: SPEC-0005 REQ "Authentication Gating" (Allowlist
-// bypasses auth -- the favicon is unprivileged brand-mark content).
+// Lives in this file because //go:embed directives compile against the
+// surrounding package; there is no separate static subpackage today.
 //
-//go:embed static/favicon.svg
+// Routes that serve from staticFS (/favicon.svg and /static/vendor/*)
+// are allowlisted so an unauthenticated browser can fetch them on the
+// login page -- /static/* is already in auth.Allowlist.
+//
+// Governing: ADR-0005 (pre-built committed CSS/JS, no runtime CDN);
+// SPEC-0005 REQ "Authentication Gating" (Allowlist bypasses auth --
+// these are unprivileged brand/chrome assets).
+//
+//go:embed static/favicon.svg static/vendor
 var staticFS embed.FS
 
 // faviconBytes is the favicon payload read once at package init so
@@ -53,7 +66,39 @@ var staticFS embed.FS
 // is cheap and keeps the handler trivially correct.
 var faviconBytes []byte
 
+// vendorFS is the static/vendor subtree, rooted so paths like
+// "app.css" and "htmx-2.0.4.min.js" resolve directly. Computed once at
+// init; an error here means the //go:embed pattern above failed to
+// capture static/vendor -- a build-time wiring error, so we panic.
+var vendorFS fs.FS
+
+// staticVendorHandler serves the embedded /static/vendor tree. The
+// caller mounts it under "/static/vendor/" with the prefix stripped.
+// A long immutable Cache-Control is set on every asset: the filenames
+// are version-pinned (app.css is regenerated+recommitted on change,
+// the JS/font carry versions in their names), so cached copies never
+// go stale under a fixed URL.
+//
+// Governing: ADR-0005 (pre-built committed assets served from the
+// binary, no runtime CDN).
+func (s *Server) staticVendorHandler() http.Handler {
+	fileServer := http.FileServerFS(vendorFS)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		fileServer.ServeHTTP(w, r)
+	})
+}
+
 func init() {
+	sub, err := fs.Sub(staticFS, "static/vendor")
+	if err != nil {
+		// The //go:embed directive lists static/vendor explicitly; a
+		// failure here means the directory was renamed or dropped from
+		// the embed pattern -- the binary cannot serve its frontend.
+		panic("server: sub static/vendor FS: " + err.Error())
+	}
+	vendorFS = sub
+
 	b, err := staticFS.ReadFile("static/favicon.svg")
 	if err != nil {
 		// embed.FS reports "file not found" only when the //go:embed

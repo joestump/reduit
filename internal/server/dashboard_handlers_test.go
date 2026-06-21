@@ -133,7 +133,7 @@ func TestDashboard_EmptyStateForUserWithZeroAccounts(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", status, body)
 	}
-	if !strings.Contains(body, "Add your first Proton account") {
+	if !strings.Contains(body, "Add a Proton account") {
 		t.Errorf("empty-state hero copy missing; body=%s", body[:min(len(body), 500)])
 	}
 	if !strings.Contains(body, "/accounts/setup") {
@@ -370,5 +370,56 @@ func TestFavicon_ServedUnauthenticatedWithSvgContentType(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !strings.Contains(string(body), "<svg") {
 		t.Errorf("body does not look like SVG (first 80 bytes: %q)", string(body[:min(len(body), 80)]))
+	}
+}
+
+// TestStaticVendor_ServedUnauthenticatedFromBinary pins the embedded
+// frontend assets: the pre-built CSS, HTMX core + SSE extension, and
+// the Inter font MUST be served from /static/vendor (no runtime CDN per
+// ADR-0005) and MUST be reachable unauthenticated so /auth/login can
+// style itself. A 302 here means the /static/* allowlist regressed; a
+// 404 means the go:embed wiring dropped an asset.
+//
+// Governing: ADR-0005 (pre-built committed assets, no runtime CDN);
+// SPEC-0005 REQ "Authentication Gating"; issue #20.
+func TestStaticVendor_ServedUnauthenticatedFromBinary(t *testing.T) {
+	t.Parallel()
+	baseURL, _, _, _ := dashboardTestServer(t, nil)
+
+	c := newClient(t)
+	c.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	cases := []struct {
+		path       string
+		wantBody   string // substring that must appear
+		wantCTPart string // substring of the Content-Type
+	}{
+		{"/static/vendor/app.css", "tailwindcss", "css"},
+		{"/static/vendor/htmx-2.0.4.min.js", "htmx", "javascript"},
+		{"/static/vendor/htmx-ext-sse-2.2.3.min.js", "sse", "javascript"},
+	}
+	for _, tc := range cases {
+		resp, err := c.Get(baseURL + tc.path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", tc.path, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			t.Errorf("%s: status = %d, want 200 (302 => allowlist regressed, 404 => embed dropped it)", tc.path, resp.StatusCode)
+			continue
+		}
+		if got := resp.Header.Get("Cache-Control"); !strings.Contains(got, "max-age=") {
+			t.Errorf("%s: Cache-Control = %q, want a max-age directive", tc.path, got)
+		}
+		if got := resp.Header.Get("Content-Type"); !strings.Contains(got, tc.wantCTPart) {
+			t.Errorf("%s: Content-Type = %q, want substring %q", tc.path, got, tc.wantCTPart)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if !strings.Contains(strings.ToLower(string(body)), tc.wantBody) {
+			t.Errorf("%s: body missing %q (first 80 bytes: %q)", tc.path, tc.wantBody, string(body[:min(len(body), 80)]))
+		}
 	}
 }

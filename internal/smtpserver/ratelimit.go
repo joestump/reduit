@@ -8,8 +8,11 @@
 // rate-limit subsystem will do a sharded LRU rewrite that absorbs
 // both packages.
 //
-// Governing: SPEC-0004 Security checklist (rate limiting on auth
-// attempts — full rate limit lands in v0.5; this is the placeholder).
+// Defensive hardening for SPEC-0004 REQ "SASL PLAIN Authentication
+// Matching IMAP": rate-limiting repeated failed authentications slows
+// credential stuffing. SPEC-0004 does not itself mandate a rate
+// limiter; the full rate-limit subsystem lands in v0.5 and this is the
+// placeholder (mirrors internal/imapserver/ratelimit.go).
 
 package smtpserver
 

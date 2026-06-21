@@ -1,0 +1,53 @@
+/* Reduit admin-UI stylesheet — Tailwind 4 + DaisyUI 5 source.
+ *
+ * This is the BUILD-TIME source. The committed, browser-ready output
+ * is internal/server/static/vendor/app.css, produced by:
+ *
+ *   make css        # runs the Tailwind 4 standalone CLI
+ *
+ * Tailwind scans the template tree (see @source below) and emits only
+ * the utility classes actually referenced, plus the DaisyUI component
+ * layer and the custom `reduit-dark` theme. No Node tooling runs at
+ * `go build` time or in CI/Docker — the Go binary embeds the already-
+ * built app.css. Regenerate and re-commit only when templates or the
+ * theme change.
+ *
+ * Governing: ADR-0005 (Tailwind 4 + DaisyUI, pre-built committed CSS,
+ * no runtime CDN/bundler).
+ */
+@import "tailwindcss";
+
+/* Scan the embedded templates so the purge keeps exactly the classes
+ * the admin UI renders. Paths are relative to this file. */
+@source "../internal/server/templates/**/*.html";
+
+@plugin "daisyui";
+
+/* reduit-dark: the canonical dark surface from CLAUDE.md's Visual
+ * Identity. DaisyUI semantic tokens are mapped onto the slate/indigo
+ * palette so `btn`, `card`, `modal`, `alert`, `badge` render on-brand
+ * without per-component overrides. Most page chrome is plain Tailwind
+ * utilities (inline in the templates); this theme covers the DaisyUI
+ * component primitives. */
+@plugin "daisyui/theme" {
+  name: "reduit-dark";
+  default: true;
+  prefersdark: true;
+  color-scheme: "dark";
+
+  --color-base-100: #0F172A;   /* slate-900  page background      */
+  --color-base-200: #1E293B;   /* slate-800  card surface         */
+  --color-base-300: #334155;   /* slate-700  borders / dividers   */
+  --color-base-content: #E2E8F0; /* slate-200 primary foreground  */
+
+  --color-primary: #4F46E5;    /* indigo-600 buttons/active       */
+  --color-primary-content: #FFFFFF;
+
+  --color-accent: #F59E0B;     /* amber-500  single warm accent   */
+  --color-accent-content: #1F2937;
+
+  --color-success: #10B981;    /* emerald                          */
+  --color-error: #F43F5E;      /* rose                             */
+  --color-info: #0EA5E9;       /* sky                              */
+  --color-warning: #F59E0B;    /* amber                            */
+}

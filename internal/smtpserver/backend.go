@@ -75,9 +75,10 @@ type Backend struct {
 	// rather than extracted into a shared package — see the doc on
 	// the IMAP version for the rationale.
 	//
-	// Governing: SPEC-0004 Security checklist + the parallel SPEC-0003
-	// REQ "Authentication failure returns NO with no detail" — uniform-
-	// time auth.
+	// Governing: SPEC-0004 REQ "SASL PLAIN Authentication Matching
+	// IMAP" (which inherits the parallel SPEC-0003 REQ "Authentication
+	// failure returns NO with no detail") — uniform-time auth so the
+	// failure mode is not distinguishable by timing.
 	//
 	// TODO: extract shared SASL helpers if a third listener appears.
 	dummyBcryptHash []byte
@@ -139,7 +140,9 @@ func NewBackend(accounts AccountLookup, sessions *Sessions, ob OutboxSubmitter, 
 // branch that does NOT otherwise reach the real bcrypt verify, so the
 // CPU cost of every failure path is uniform.
 //
-// Governing: SPEC-0004 Security checklist — uniform-time auth.
+// Governing: SPEC-0004 REQ "SASL PLAIN Authentication Matching IMAP"
+// — uniform-time auth (every failure branch spends the same bcrypt
+// CPU so failure modes are not timing-distinguishable).
 func (b *Backend) burnDummyBcrypt(candidate []byte) {
 	// The error is intentionally discarded — we are spending CPU, not
 	// validating anything. Use the candidate bytes (not a fixed input)

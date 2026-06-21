@@ -21,8 +21,13 @@
 // limiter lock — acceptable at the v0.2 scale; the v0.5 rewrite will
 // move to a sharded LRU.
 //
-// Governing: SPEC-0003 Security checklist (rate limiting on auth
-// attempts — full rate limit lands in v0.5; this is the placeholder).
+// Defensive hardening for SPEC-0003 REQ "SASL PLAIN Authentication
+// With user@host Identity": rate-limiting repeated failed
+// authentications slows credential stuffing without leaking which
+// failure mode occurred (the spec's "Authentication failure returns
+// NO with no detail" scenario). SPEC-0003 does not itself mandate a
+// rate limiter; the full rate-limit subsystem lands in v0.5 and this
+// is the placeholder.
 
 package imapserver
 

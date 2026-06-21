@@ -19,8 +19,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Access denied — Reduit</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
 <style>
+  /* Inter variable font, served locally (no rsms.me CDN). Governing:
+     ADR-0005 (no runtime CDN). This page is otherwise self-contained
+     inline CSS -- it does not load the Tailwind/DaisyUI bundle. */
+  @font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: swap;
+    src: url('/static/vendor/InterVariable.woff2') format('woff2');
+  }
   :root { font-family: 'Inter', system-ui, sans-serif; }
   body {
     background: #0F172A; color: #E2E8F0; min-height: 100vh;

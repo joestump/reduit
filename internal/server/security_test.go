@@ -46,10 +46,17 @@ func TestSecurityHeaders_PresentOnEveryResponse(t *testing.T) {
 		if csp := h.Get("Content-Security-Policy"); csp == "" {
 			t.Errorf("%s: missing Content-Security-Policy", path)
 		} else {
-			// The CSP MUST allow the jsdelivr CDN (Tailwind/DaisyUI/HTMX
-			// load from there) or the UI breaks.
-			if !containsAll(csp, "https://cdn.jsdelivr.net", "frame-ancestors 'none'") {
+			// The CSP is same-origin-only now that the frontend assets are
+			// embedded and served from /static/vendor (ADR-0005): it MUST
+			// carry frame-ancestors 'none' and MUST NOT allowlist any of
+			// the formerly-trusted CDN hosts.
+			if !containsAll(csp, "default-src 'self'", "frame-ancestors 'none'") {
 				t.Errorf("%s: CSP missing required directive: %q", path, csp)
+			}
+			for _, banned := range []string{"cdn.jsdelivr.net", "rsms.me", "unsafe-eval"} {
+				if containsAll(csp, banned) {
+					t.Errorf("%s: CSP must not contain %q after asset vendoring: %q", path, banned, csp)
+				}
 			}
 		}
 		if hsts := h.Get("Strict-Transport-Security"); hsts == "" {

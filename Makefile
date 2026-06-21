@@ -26,6 +26,24 @@ build:
 	@mkdir -p $(BIN_DIR)
 	$(GO) build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/reduit
 
+# css rebuilds the committed Tailwind 4 + DaisyUI 5 bundle from
+# web/app.css into internal/server/static/vendor/app.css. The Go build
+# embeds that committed file (go:embed), so this runs only when
+# templates or the theme change -- NOT at `go build`, in CI, or in the
+# Dockerfile. Requires Node (npx) to fetch the pinned Tailwind CLI +
+# DaisyUI; nothing else in the toolchain does. Re-commit the output.
+#
+# Governing: ADR-0005 (pre-built committed CSS, no runtime CDN/bundler).
+CSS_SRC := web/app.css
+CSS_OUT := internal/server/static/vendor/app.css
+.PHONY: css
+css:
+	cd web && npm install --no-audit --no-fund \
+	  @tailwindcss/cli@4.2.4 tailwindcss@4.2.4 daisyui@5.0.0
+	cd web && ./node_modules/.bin/tailwindcss -i ./app.css \
+	  -o ../$(CSS_OUT) --minify
+	@echo "Rebuilt $(CSS_OUT) -- commit it."
+
 .PHONY: test
 test:
 	$(GO) test -race -count=1 ./...

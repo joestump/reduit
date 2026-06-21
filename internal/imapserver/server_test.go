@@ -224,8 +224,8 @@ func TestSASLPlainAuthFailuresAreIdentical(t *testing.T) {
 // by an unknown-but-syntactically-valid alias.
 //
 // Governing: SPEC-0003 REQ "Authentication failure returns NO with
-// no detail" + Security checklist "Input validation for SASL
-// identity format".
+// no detail" — a malformed SASL identity is just another failure mode
+// the scenario requires be indistinguishable from an unknown alias.
 func TestSASLPlainIdentityMalformation(t *testing.T) {
 	t.Parallel()
 	stub := newStubAccounts()

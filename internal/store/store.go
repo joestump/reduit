@@ -45,16 +45,25 @@ import (
 //
 // Scope: process-local only. This lock is sufficient for the v0.x
 // single-process Reduit deployment described in ADR-0006 ("the relay
-// is single-host", "single-file deployment") and for parallel `go
-// test` runs that open many fresh stores. It does NOT generalise to
-// a multi-replica deployment: two Reduit processes pointed at the
-// same SQLite file calling goose.Up concurrently still race on
-// `goose_db_version` at the database level — one will hit a UNIQUE
-// constraint violation and the migration will fail. A future
-// multi-replica deployment MUST coordinate via a database-level
-// advisory lock (e.g. `BEGIN IMMEDIATE; SELECT version_id FROM
-// goose_db_version`); tracked separately so a single-host operator
-// is not paying that complexity today.
+// is single-host", "single-file deployment", "Replication / HA is out
+// of scope") and for parallel `go test` runs that open many fresh
+// stores.
+//
+// DECISION (item #20.3): a database-level advisory lock around
+// goose.Up (e.g. BEGIN IMMEDIATE) is deliberately NOT added. It would
+// only matter if two Reduit *processes* pointed at the same SQLite
+// file ran goose.Up concurrently — and that arrangement is excluded by
+// ADR-0006, which makes single-process/single-host the accepted
+// posture (SQLite + a single writer; HA/replication out of scope). In
+// that excluded multi-replica setup the two processes would race on
+// `goose_db_version` at the database level and one would hit a UNIQUE
+// constraint violation; if Reduit ever adopts a multi-replica posture
+// (a new ADR superseding ADR-0006), the fix is a DB advisory lock
+// here. Until then a process-local mutex is the lighter correct
+// choice and a DB lock would be complexity a single-host operator
+// pays for nothing.
+//
+// Governing: ADR-0006 (SQLite, single-host, HA out of scope).
 var migrateMu sync.Mutex
 
 //go:embed all:migrations/*.sql

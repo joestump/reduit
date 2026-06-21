@@ -97,8 +97,9 @@ func (s *session) Auth(mech string) (sasl.Server, error) {
 // implementation so the two listeners' auth code paths are byte-for-
 // byte alignable in review.
 //
-// Governing: SPEC-0004 REQ "SASL PLAIN Authentication Matching IMAP",
-// SPEC-0004 Security checklist (uniform-time auth).
+// Governing: SPEC-0004 REQ "SASL PLAIN Authentication Matching IMAP"
+// (uniform-time auth: every failure branch spends the same bcrypt CPU
+// so failure modes are not timing-distinguishable).
 func (s *session) login(username, password string) error {
 	// Step 1: per-IP rate-limit cooldown on repeated failures.
 	s.backend.rateLimit.Throttle(s.rateKey)

@@ -287,8 +287,10 @@ func (s *session) Authenticate(mech string) (sasl.Server, error) {
 // controlled data into a log aggregator that may surface it elsewhere.
 //
 // Governing: SPEC-0003 REQ "Authentication failure returns NO with
-// no detail" + Security checklist "Output encoding (no IMAP response
-// injection from username)".
+// no detail" (the scenario mandates the reason be logged at INFO with
+// structured fields and NOT echoed to the client; omitting the
+// attacker-controlled SASL identity from the log avoids re-injecting
+// it downstream).
 func (s *session) logFailure(reason string, extras ...slog.Attr) {
 	attrs := []slog.Attr{
 		slog.String("event", "imap_auth_failed"),
