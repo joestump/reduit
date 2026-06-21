@@ -90,6 +90,14 @@ type Backend struct {
 	sessions  *Sessions
 	logger    *slog.Logger
 	rateLimit *authRateLimiter
+	// bodyCaches holds the per-account decrypted-body LRU + fetch limiter
+	// the FETCH BODY[] path consults so repeated fetches of the same
+	// message skip the Proton round-trip and a bulk FETCH 1:* cannot
+	// stampede Proton. Shared across every session for an account.
+	//
+	// Governing: SPEC-0003 design "Performance considerations" — per-
+	// account decrypted-body LRU (32 MiB / 5min TTL) + bounded fetch.
+	bodyCaches *accountBodyCaches
 	// dummyBcryptHash is a fixed bcrypt hash generated at construction
 	// time and reused on every auth failure branch that does NOT reach
 	// the real password verify. By forcing every failure path to
@@ -153,6 +161,7 @@ func NewBackend(accounts AccountLookup, sessions *Sessions, logger *slog.Logger,
 		sessions:        sessions,
 		logger:          logger,
 		rateLimit:       newAuthRateLimiter(),
+		bodyCaches:      newAccountBodyCaches(),
 		dummyBcryptHash: dummyHash,
 	}
 	for _, opt := range opts {

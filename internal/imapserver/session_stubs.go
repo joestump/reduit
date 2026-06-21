@@ -1060,16 +1060,49 @@ func (s *session) writeBodySections(ctx context.Context, rw *imapserver.FetchRes
 	return nil
 }
 
-// bodySectionsForMessage fetches + decrypts the message's RFC822 once,
-// then slices it into the bytes each requested section asks for. It is
-// the testable core of the BODY[] path — it touches Proton and the
-// section logic but never the (unconstructable-in-tests) FetchWriter, so
-// unit tests can assert the lazy-fetch + slicing behaviour without a
-// live TCP connection. The returned slice is index-aligned with
-// `sections`.
+// bodySectionsForMessage materialises the message's full decrypted
+// RFC822 once, then slices it into the bytes each requested section asks
+// for. It is the testable core of the BODY[] path — it touches the
+// cache, Proton, and the section logic but never the
+// (unconstructable-in-tests) FetchWriter, so unit tests can assert the
+// cache + lazy-fetch + slicing behaviour without a live TCP connection.
+// The returned slice is index-aligned with `sections`.
 //
-// Governing: SPEC-0003 design "FETCH BODY[] on big messages".
+// The full RFC822 is served from the account's body cache on a hit; on a
+// miss it is fetched + decrypted from Proton under the account's fetch
+// limiter (so a bulk FETCH 1:* cannot stampede Proton) and the result is
+// cached for subsequent FETCHes of the same message.
+//
+// Governing: SPEC-0003 design "FETCH BODY[] on big messages" and
+// "Performance considerations" — per-account decrypted-body LRU + bounded
+// fetch.
 func (s *session) bodySectionsForMessage(ctx context.Context, acctID string, m *mailbox.MessageInMailbox, sections []*imap.FetchItemBodySection) ([][]byte, error) {
+	raw, err := s.fetchBody(ctx, acctID, m)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([][]byte, len(sections))
+	for i, section := range sections {
+		out[i] = bodySectionBytes(raw, section)
+	}
+	return out, nil
+}
+
+// fetchBody returns the full decrypted RFC822 for a message, preferring
+// the per-account body cache and falling back to a Proton fetch+decrypt
+// gated by the per-account fetch limiter. A cache hit performs no Proton
+// round-trip and consumes no limiter slot.
+//
+// Governing: SPEC-0003 design "Performance considerations" — per-account
+// decrypted-body LRU (32 MiB / 5min TTL) keyed by Proton message ID, plus
+// a bounded fetch so FETCH 1:* BODY[] does not hammer Proton.
+func (s *session) fetchBody(ctx context.Context, acctID string, m *mailbox.MessageInMailbox) ([]byte, error) {
+	cache := s.backend.bodyCaches.cacheFor(acctID)
+	if raw, ok := cache.get(m.ProtonMessageID); ok {
+		return raw, nil
+	}
+
 	cli, err := s.protonClient(ctx, acctID)
 	if err != nil {
 		return nil, &imap.Error{
@@ -1077,6 +1110,20 @@ func (s *session) bodySectionsForMessage(ctx context.Context, acctID string, m *
 			Text: "Cannot reach Proton; try again",
 		}
 	}
+
+	// Bound concurrent Proton fetches per account. Honour the FETCH
+	// command's context deadline while waiting for a slot so a saturated
+	// limiter surfaces a transient NO rather than hanging past the
+	// command timeout.
+	limiter := s.backend.bodyCaches.limiterFor(acctID)
+	if !limiter.acquire(ctx.Done()) {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Message body temporarily unavailable",
+		}
+	}
+	defer limiter.release()
+
 	raw, err := cli.GetMessageRFC822(ctx, m.ProtonMessageID)
 	if err != nil {
 		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap fetch body retrieval failed",
@@ -1089,11 +1136,8 @@ func (s *session) bodySectionsForMessage(ctx context.Context, acctID string, m *
 		}
 	}
 
-	out := make([][]byte, len(sections))
-	for i, section := range sections {
-		out[i] = bodySectionBytes(raw, section)
-	}
-	return out, nil
+	cache.put(m.ProtonMessageID, raw)
+	return raw, nil
 }
 
 // bodySectionBytes slices the full RFC822 message into the bytes a
