@@ -130,7 +130,8 @@ When orchestrating multiple design plugin skills in a single session (e.g., runn
 
 #### Tracker
 
-- **Type**: github
+- **Type**: gitea
+- **Host**: gitea.stump.rocks
 - **Owner**: joestump
 - **Repo**: reduit
 
