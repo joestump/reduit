@@ -14,10 +14,39 @@ import (
 
 // xReduitAccount is the canonical out-of-band account-selector header
 // for OIDC-bearer MCP requests on the bare `/mcp` route. Per
-// SPEC-0006 REQ "Selector Precedence" the path-parameter form wins
-// when both are present; this story does not yet mount path-prefixed
-// routes (`/accounts/{id}/mcp`) -- that lands with the tool stories.
+// SPEC-0006 REQ "Selector Precedence" the path-parameter form
+// (`/accounts/{id}/mcp`) wins when both are present and the header is
+// then NOT consulted; the header is read only on routes without an
+// account-id path parameter (today: the bare `/mcp` endpoint).
 const xReduitAccount = "X-Reduit-Account"
+
+// accountPathValue is the name of the path-parameter wildcard the
+// `/accounts/{id}/mcp` route binds. http.ServeMux stamps it onto the
+// request via r.SetPathValue before the handler runs, so
+// requireBearerAndAccount reads it with r.PathValue. On the bare
+// `/mcp` route the wildcard is unbound and r.PathValue returns "".
+//
+// Governing: SPEC-0006 REQ "Selector Precedence".
+const accountPathValue = "id"
+
+// selectorFromRequest implements SPEC-0006 REQ "Selector Precedence":
+// the path-parameter account selector wins over the X-Reduit-Account
+// header. When a non-empty path parameter is present the header is NOT
+// consulted at all -- not read, not parsed, not validated -- so an
+// attacker cannot use the header value to probe whether it matches the
+// path id and learn ownership of a non-owned account. The header is
+// read only when the path carries no selector (the bare `/mcp` route).
+//
+// Governing: SPEC-0006 REQ "Selector Precedence".
+func selectorFromRequest(r *http.Request) string {
+	if pathSel := strings.TrimSpace(r.PathValue(accountPathValue)); pathSel != "" {
+		// Path wins. Per the spec the header MUST NOT be parsed when a
+		// path parameter is present, so we return here without ever
+		// touching r.Header.
+		return pathSel
+	}
+	return r.Header.Get(xReduitAccount)
+}
 
 // requireBearerAndAccount is the MCP-side authentication middleware.
 // It composes auth.RequireBearer (which validates the Authorization
@@ -89,7 +118,11 @@ func requireBearerAndAccount(deps Deps, next http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(withAccount(r.Context(), acct)))
 
 		case auth.PrincipalSourceOIDC:
-			acct, status := resolveAccountFromOIDC(r.Context(), deps, p, r.Header.Get(xReduitAccount))
+			// Per SPEC-0006 REQ "Selector Precedence": a path-param
+			// selector (`/accounts/{id}/mcp`) wins over the header and
+			// suppresses header parsing entirely. selectorFromRequest
+			// encapsulates that rule.
+			acct, status := resolveAccountFromOIDC(r.Context(), deps, p, selectorFromRequest(r))
 			switch status {
 			case oidcResolutionOK:
 				next.ServeHTTP(w, r.WithContext(withAccount(r.Context(), acct)))
@@ -260,26 +293,25 @@ func resolveAccountFromOIDC(ctx context.Context, deps Deps, p *auth.Principal, s
 }
 
 // accountUsable reports whether an account is in a state that admits
-// MCP traffic. Mirrors the SPEC-0005 "active session" contract: only
-// accounts in StateActive (and the freshly-created
-// StatePendingProtonSetup, since the wizard relies on the same
-// listener) are usable; suspended and soft-deleted accounts are not.
+// MCP traffic. Only StateActive accounts are usable: a
+// StatePendingProtonSetup account has not finished the wizard and so
+// has no usable Proton credentials (the tool surface would fail with
+// proton.ErrNotUnlocked); suspended and soft-deleted accounts are
+// offline by the SPEC-0005 "drop sessions on state change" contract.
 //
-// We deliberately accept StatePendingProtonSetup because tests in this
-// scaffolding story seed accounts in that state and would otherwise
-// require state-flip plumbing through every fixture. Real tool
-// implementations (issue #28-#30) will tighten to StateActive only --
-// this is enforceable in the per-tool handler with no further
-// middleware change.
+// This was loosened to also admit StatePendingProtonSetup during the
+// auth+concurrency scaffolding story (#13) so fixtures didn't need
+// state-flip plumbing. Now that the tool surface (#14) has landed,
+// pending accounts can reach real tools but have no credentials to
+// service them, so we tighten to active-only here -- failing closed at
+// the auth boundary rather than surfacing a confusing decrypt error
+// from deep inside a tool handler.
+//
+// Governing: SPEC-0006 REQ "Bearer Authentication Required" (requests
+// bind to a usable account); SPEC-0005 "drop sessions" contract for
+// non-active states.
 func accountUsable(a *account.Account) bool {
-	if a == nil {
-		return false
-	}
-	switch a.State {
-	case account.StateActive, account.StatePendingProtonSetup:
-		return true
-	}
-	return false
+	return a != nil && a.State == account.StateActive
 }
 
 // respondUnauthenticated emits the standard 401 shape for missing /

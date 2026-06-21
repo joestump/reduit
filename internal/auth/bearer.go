@@ -280,9 +280,29 @@ func RequireBearer(v *BearerValidator, next http.Handler) http.Handler {
 	})
 }
 
-func respondUnauthorized(w http.ResponseWriter, msg string) {
-	w.Header().Set("WWW-Authenticate", `Bearer realm="reduit"`)
-	http.Error(w, msg, http.StatusUnauthorized)
+// respondUnauthorized emits the standard 401 shape for missing /
+// invalid / revoked bearers on the MCP surface. The body is the same
+// generic JSON envelope mcpserver.respondUnauthenticated writes, so the
+// two 401 paths are byte-identical on the wire (a caller cannot tell
+// which middleware layer rejected it). The WWW-Authenticate header
+// names the Bearer scheme but MUST NOT carry a realm parameter: per
+// SPEC-0006 REQ "Bearer Authentication Required" Scenario
+// "Unauthenticated MCP request is rejected", the realm MUST NOT leak
+// deployment-internal identifiers. We emit a bare `Bearer` to avoid
+// the question entirely.
+//
+// The msg argument is retained for call-site readability (it documents
+// WHY the request was rejected) but is deliberately NOT written to the
+// wire -- a generic body keeps the failure modes (missing vs invalid
+// vs revoked) indistinguishable to an unauthenticated caller.
+//
+// Governing: SPEC-0006 REQ "Bearer Authentication Required" Scenario
+// "Unauthenticated MCP request is rejected".
+func respondUnauthorized(w http.ResponseWriter, _ string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("WWW-Authenticate", "Bearer")
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = w.Write([]byte(`{"error":"unauthenticated"}`))
 }
 
 func (v *BearerValidator) now() time.Time {

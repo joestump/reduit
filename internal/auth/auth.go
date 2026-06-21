@@ -91,7 +91,41 @@ func IsAllowlisted(path string) bool {
 			return true
 		}
 	}
-	return false
+	// The path-prefixed MCP route `/accounts/{id}/mcp` is bearer-
+	// authenticated (it shares the MCP handler with the bare `/mcp`
+	// route), so it MUST bypass the SCS session gate exactly like
+	// `/mcp` -- otherwise an MCP client gets a 302 to /auth/login it
+	// cannot follow. We match it structurally rather than adding an
+	// `/accounts/*` prefix entry, because that prefix would wrongly
+	// allowlist the entire session-gated account dashboard.
+	//
+	// Governing: SPEC-0006 REQ "Selector Precedence", ADR-0008;
+	// SPEC-0005 REQ "Authentication Gating".
+	return isAccountMCPPath(path)
+}
+
+// isAccountMCPPath reports whether path is exactly `/accounts/{id}/mcp`
+// with a single non-empty `{id}` segment. It deliberately rejects
+// deeper paths (e.g. `/accounts/{id}/mcp/extra`) and an empty id so the
+// allowlist exemption is no broader than the route mounted in
+// internal/server.
+func isAccountMCPPath(path string) bool {
+	const prefix = "/accounts/"
+	const suffix = "/mcp"
+	// Guard the slice below: the path must be long enough that the
+	// prefix and suffix don't overlap (e.g. `/accounts/mcp` ends with
+	// `/mcp` but has no id segment). len(prefix)+len(suffix) is the
+	// minimum length of a zero-length id, which we then reject anyway.
+	if len(path) <= len(prefix)+len(suffix) {
+		return false
+	}
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return false
+	}
+	id := path[len(prefix) : len(path)-len(suffix)]
+	// Exactly one path segment for the id: non-empty and no further
+	// slashes.
+	return id != "" && !strings.Contains(id, "/")
 }
 
 // SessionGate is the dependencies RequireSession needs to make a

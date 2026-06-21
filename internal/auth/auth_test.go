@@ -66,6 +66,20 @@ func TestIsAllowlisted(t *testing.T) {
 		{"/healthz.json", false},  // exact match required for non-prefix entries
 		{"/healthz/extra", false}, // ditto
 		{"/staticky", false},      // not a prefix match
+		// /accounts/{id}/mcp is the path-prefixed bearer-authenticated
+		// MCP route (#15, SPEC-0006 "Selector Precedence"). It bypasses
+		// the SCS session gate exactly like /mcp because it carries
+		// bearer auth, not a browser session.
+		{"/accounts/0190abcd-ef01-7000-8000-000000000000/mcp", true},
+		{"/accounts/acct-1/mcp", true},
+		// The exemption is structurally narrow: it MUST NOT leak onto
+		// the session-gated account dashboard or its sub-routes, and
+		// MUST NOT match a deeper or empty-id path.
+		{"/accounts/acct-1", false},
+		{"/accounts/acct-1/credentials", false},
+		{"/accounts/acct-1/mcp/extra", false},
+		{"/accounts//mcp", false}, // empty id segment
+		{"/accounts/mcp", false},  // missing id segment
 	} {
 		tc := tc
 		t.Run(tc.path, func(t *testing.T) {

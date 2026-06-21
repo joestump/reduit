@@ -432,6 +432,22 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// Governing: ADR-0008, SPEC-0006.
 	if s.deps.MCPHandler != nil {
 		mux.Handle("/mcp", s.deps.MCPHandler)
+
+		// Path-prefixed account selector per SPEC-0006 REQ "Selector
+		// Precedence": `/accounts/{id}/mcp` carries the account as a
+		// path parameter. The MCP handler reads it via r.PathValue("id")
+		// (stamped here by the mux) and, when present, ignores the
+		// X-Reduit-Account header entirely -- the path wins. This route
+		// is the canonical selector for OIDC-bearer clients that can
+		// shape a URL but not set a custom header. It shares the exact
+		// same handler -- and therefore the same bearer auth and
+		// per-account concurrency cap -- as the bare `/mcp` route above.
+		//
+		// Allowlisted from the SCS session gate (auth.Allowlist) just
+		// like `/mcp`; bearer auth replaces the session gate here.
+		//
+		// Governing: ADR-0008, SPEC-0006 REQ "Selector Precedence".
+		mux.Handle("/accounts/{id}/mcp", s.deps.MCPHandler)
 	}
 
 	// Per-user credentials view and rotation per SPEC-0005 REQ

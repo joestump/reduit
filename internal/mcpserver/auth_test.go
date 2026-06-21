@@ -48,22 +48,15 @@ func TestMCPAuth_MissingBearer(t *testing.T) {
 	if wa == "" {
 		t.Errorf("WWW-Authenticate header missing on 401")
 	}
-	// SPEC-0006 forbids a realm parameter that leaks deployment-
-	// internal identifiers. The product name "reduit" is not a
-	// deployment-internal identifier (it's static across every
-	// install), so we permit `Bearer realm="reduit"` but reject
-	// any realm that contains a host-shaped value or other
-	// deployment-specific marker. Pin a tight allowlist so a
-	// future change that broadens the realm to e.g. the OIDC
-	// issuer URL trips this assertion immediately.
+	// SPEC-0006 REQ "Bearer Authentication Required" Scenario
+	// "Unauthenticated MCP request is rejected": the header MAY name
+	// the Bearer scheme but MUST NOT include a realm parameter. We
+	// emit a bare `Bearer` and assert there is no realm at all -- not
+	// even `realm="reduit"` -- so the header carries zero parameters
+	// that could ever leak a deployment-internal identifier.
 	lower := strings.ToLower(wa)
 	if strings.Contains(lower, "realm") {
-		// The single allowlisted form is `Bearer realm="reduit"`
-		// (case-insensitive on the scheme + key, exact on the
-		// value). Anything else fails the leak check.
-		if !strings.Contains(lower, `realm="reduit"`) {
-			t.Errorf("WWW-Authenticate %q realm leak: only realm=\"reduit\" is permitted", wa)
-		}
+		t.Errorf("WWW-Authenticate %q includes a realm parameter; SPEC-0006 forbids any realm", wa)
 	}
 	if f.lastSeenAccountID() != "" {
 		t.Errorf("downstream handler ran without auth (saw account_id=%q)", f.lastSeenAccountID())
@@ -239,6 +232,220 @@ func TestMCPAuth_OIDC_Valid_WithSelectorHeader(t *testing.T) {
 	}
 	if got := f.lastSeenAccountID(); got != acctID {
 		t.Errorf("downstream saw account_id=%q, want %q", got, acctID)
+	}
+}
+
+// TestMCPAuth_OIDC_Valid_WithPathSelector covers SPEC-0006 REQ
+// "Selector Precedence" Scenario "Header consulted only when path has
+// no selector" from the path side: a valid JWT hitting
+// `/accounts/{id}/mcp` (no X-Reduit-Account header) MUST resolve the
+// account from the path parameter and bind to it.
+func TestMCPAuth_OIDC_Valid_WithPathSelector(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t)
+	defer f.close()
+
+	const sub = "oidc-path-joe"
+	userID := storetest.SeedUser(t, f.st, sub)
+	const acctID = "acct-oidc-path-1"
+	if _, err := f.st.DB.ExecContext(context.Background(),
+		`INSERT INTO accounts (id, user_id, state, key_envelope) VALUES (?, ?, 'active', X'00')`,
+		acctID, userID); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	jwt := f.signJWT(t, sub)
+	resp := f.postPath(t, acctID, "Bearer "+jwt, nil, `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	if got := f.lastSeenAccountID(); got != acctID {
+		t.Errorf("downstream saw account_id=%q, want %q (path selector)", got, acctID)
+	}
+}
+
+// TestMCPAuth_OIDC_PathWinsOverHeader covers SPEC-0006 REQ "Selector
+// Precedence" Scenario "Path parameter wins over header": when both
+// `/accounts/A/mcp` and `X-Reduit-Account: B` are present, the request
+// MUST bind to account A and the header value B MUST NOT influence
+// routing. We make B a real, distinct account owned by the SAME user
+// (so a header-wins bug would surface as a 200 bound to B, not a 403)
+// and assert the bound account is A.
+func TestMCPAuth_OIDC_PathWinsOverHeader(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t)
+	defer f.close()
+
+	const sub = "oidc-precedence-joe"
+	userID := storetest.SeedUser(t, f.st, sub)
+	const acctA = "acct-precedence-A"
+	const acctB = "acct-precedence-B"
+	for _, id := range []string{acctA, acctB} {
+		if _, err := f.st.DB.ExecContext(context.Background(),
+			`INSERT INTO accounts (id, user_id, state, key_envelope) VALUES (?, ?, 'active', X'00')`,
+			id, userID); err != nil {
+			t.Fatalf("seed account %s: %v", id, err)
+		}
+	}
+
+	jwt := f.signJWT(t, sub)
+	resp := f.postPath(t, acctA, "Bearer "+jwt, http.Header{"X-Reduit-Account": {acctB}}, `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	if got := f.lastSeenAccountID(); got != acctA {
+		t.Errorf("bound to %q, want %q -- path MUST win over header", got, acctA)
+	}
+}
+
+// TestMCPAuth_OIDC_PathWins_HeaderNotParsed hardens the "header MUST
+// NOT be parsed/validated" half of SPEC-0006 REQ "Selector
+// Precedence". When a valid path selector is present, an
+// X-Reduit-Account header naming a DIFFERENT, non-existent account
+// MUST be ignored entirely (not parsed, not validated, not error-
+// reported) -- so the request still succeeds and binds to the path
+// account. A bug that consulted the header would 403 on the
+// unknown-account value instead of 200.
+func TestMCPAuth_OIDC_PathWins_HeaderNotParsed(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t)
+	defer f.close()
+
+	const sub = "oidc-header-ignored"
+	userID := storetest.SeedUser(t, f.st, sub)
+	const acctID = "acct-header-ignored"
+	if _, err := f.st.DB.ExecContext(context.Background(),
+		`INSERT INTO accounts (id, user_id, state, key_envelope) VALUES (?, ?, 'active', X'00')`,
+		acctID, userID); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	jwt := f.signJWT(t, sub)
+	resp := f.postPath(t, acctID, "Bearer "+jwt,
+		http.Header{"X-Reduit-Account": {"acct-that-does-not-exist"}}, `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200 (header MUST be ignored when path present); body=%s", resp.StatusCode, body)
+	}
+	if got := f.lastSeenAccountID(); got != acctID {
+		t.Errorf("bound to %q, want %q", got, acctID)
+	}
+}
+
+// TestMCPAuth_OIDC_PathSelectorForbiddenWhenNotOwned proves the path
+// selector flows through the SAME ownership + indistinguishability
+// path as the header selector: a path-referenced account owned by a
+// DIFFERENT user MUST yield the byte-identical 403 forbidden response.
+func TestMCPAuth_OIDC_PathSelectorForbiddenWhenNotOwned(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t)
+	defer f.close()
+
+	storetest.SeedUser(t, f.st, "oidc-path-attacker")
+	otherUserID := storetest.SeedUser(t, f.st, "oidc-path-victim")
+	const victimAcct = "acct-path-victim"
+	if _, err := f.st.DB.ExecContext(context.Background(),
+		`INSERT INTO accounts (id, user_id, state, key_envelope) VALUES (?, ?, 'active', X'00')`,
+		victimAcct, otherUserID); err != nil {
+		t.Fatalf("seed victim account: %v", err)
+	}
+
+	jwt := f.signJWT(t, "oidc-path-attacker")
+	resp := f.postPath(t, victimAcct, "Bearer "+jwt, nil, `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if got := strings.TrimSpace(string(body)); got != `{"error":"forbidden"}` {
+		t.Errorf("body = %q, want forbidden", got)
+	}
+	if f.lastSeenAccountID() != "" {
+		t.Errorf("downstream ran on a non-owned path selector (saw %q)", f.lastSeenAccountID())
+	}
+}
+
+// TestMCPAuth_PendingAccountRejected covers the #15 tightening of
+// accountUsable: a per-account MCP token bound to an account still in
+// state=pending_proton_setup MUST be rejected (401), because a pending
+// account has no usable Proton credentials. Before #14 landed the tool
+// surface, accountUsable accepted pending for scaffolding convenience;
+// this asserts the tightened active-only contract.
+func TestMCPAuth_PendingAccountRejected(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t)
+	defer f.close()
+
+	const acctID = "acct-pending-1"
+	storetest.SeedUserAccountPending(t, f.st, acctID)
+
+	tok, err := f.tokens.Issue(context.Background(), mcptoken.IssueParams{AccountID: acctID})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	resp := f.post(t, "Bearer "+tok.Plaintext, nil, `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (pending account is not usable)", resp.StatusCode)
+	}
+	if f.lastSeenAccountID() != "" {
+		t.Errorf("downstream ran for a pending account (saw %q)", f.lastSeenAccountID())
+	}
+}
+
+// TestMCPAuth_401BodyConsistency covers #15 item 3: the missing-bearer
+// 401 (emitted by auth.RequireBearer's respondUnauthorized) and the
+// post-auth 401 paths (emitted by mcpserver.respondUnauthenticated,
+// e.g. a pending/non-usable account) MUST carry the byte-identical
+// generic JSON body and the same bare `Bearer` WWW-Authenticate header
+// -- so a caller cannot tell which layer rejected it.
+func TestMCPAuth_401BodyConsistency(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t)
+	defer f.close()
+
+	// 401 path 1: no bearer at all -> auth.RequireBearer.respondUnauthorized.
+	respMissing := f.post(t, "", nil, `{}`)
+	bodyMissing, _ := io.ReadAll(respMissing.Body)
+	respMissing.Body.Close()
+
+	// 401 path 2: valid bearer, but a pending (non-usable) account ->
+	// mcpserver.respondUnauthenticated.
+	const acctID = "acct-401-consistency"
+	storetest.SeedUserAccountPending(t, f.st, acctID)
+	tok, err := f.tokens.Issue(context.Background(), mcptoken.IssueParams{AccountID: acctID})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	respPending := f.post(t, "Bearer "+tok.Plaintext, nil, `{}`)
+	bodyPending, _ := io.ReadAll(respPending.Body)
+	respPending.Body.Close()
+
+	if respMissing.StatusCode != http.StatusUnauthorized || respPending.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("statuses = %d, %d, want both 401", respMissing.StatusCode, respPending.StatusCode)
+	}
+	if string(bodyMissing) != string(bodyPending) {
+		t.Errorf("401 bodies differ:\n missing=%q\n pending=%q", bodyMissing, bodyPending)
+	}
+	if got := strings.TrimSpace(string(bodyMissing)); got != `{"error":"unauthenticated"}` {
+		t.Errorf("401 body = %q, want unauthenticated", got)
+	}
+	waMissing := respMissing.Header.Get("WWW-Authenticate")
+	waPending := respPending.Header.Get("WWW-Authenticate")
+	if waMissing != waPending {
+		t.Errorf("WWW-Authenticate differs: missing=%q pending=%q", waMissing, waPending)
+	}
+	if waMissing != "Bearer" {
+		t.Errorf("WWW-Authenticate = %q, want bare \"Bearer\" (no realm)", waMissing)
+	}
+	if ct := respMissing.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("missing-bearer Content-Type = %q, want application/json", ct)
 	}
 }
 
@@ -427,7 +634,17 @@ func newAuthFixture(t *testing.T) *authFixture {
 		Limiter:   mcpserver.NoLimiter(),
 	}, terminal)
 
-	f.srv = httptest.NewServer(mcpSrv.Handler())
+	// Mount the handler under a real ServeMux carrying BOTH routes so
+	// the path-prefixed selector test exercises r.PathValue("id") the
+	// same way the production mount in internal/server does. The bare
+	// `/mcp` route is what f.post hits; the `/accounts/{id}/mcp` route
+	// is what f.postPath hits. Both share one handler -- and therefore
+	// one bearer-auth + concurrency chain -- mirroring server.routes.
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", mcpSrv.Handler())
+	mux.Handle("/accounts/{id}/mcp", mcpSrv.Handler())
+
+	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
 }
@@ -435,13 +652,25 @@ func newAuthFixture(t *testing.T) *authFixture {
 func (f *authFixture) close() { f.st.Close() }
 
 func (f *authFixture) post(t *testing.T, authz string, extraHeaders http.Header, body string) *http.Response {
+	return f.postTo(t, "/mcp", authz, extraHeaders, body)
+}
+
+// postPath posts to the path-prefixed `/accounts/{id}/mcp` route so the
+// MCP handler resolves the account selector from r.PathValue("id")
+// rather than the X-Reduit-Account header. Used by the selector-
+// precedence tests.
+func (f *authFixture) postPath(t *testing.T, accountID, authz string, extraHeaders http.Header, body string) *http.Response {
+	return f.postTo(t, "/accounts/"+accountID+"/mcp", authz, extraHeaders, body)
+}
+
+func (f *authFixture) postTo(t *testing.T, path, authz string, extraHeaders http.Header, body string) *http.Response {
 	t.Helper()
 	// Reset the sniffer between requests so a stale value from a
 	// prior call doesn't false-positive an "auth bound it" assertion
 	// when actually the current request short-circuited 401.
 	f.observed.set("")
 
-	req, err := http.NewRequest(http.MethodPost, f.srv.URL, strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, f.srv.URL+path, strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
 	}
