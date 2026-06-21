@@ -873,6 +873,73 @@ func TestWizard_DuplicateProtonAccount_AbortsWithTerminalError(t *testing.T) {
 	}
 }
 
+// TestWizard_ProtonIdentityMismatch_AbortsWithFriendlyError pins the
+// spec-review gap: when commitWizard's SetProtonIdentity trips
+// ErrProtonIdentityMismatch (the pending row was already stamped with a
+// DIFFERENT Proton identity on a prior run), the wizard MUST surface a
+// friendly terminal error and tear the in-flight state down -- NOT fall
+// through the default arm and 500.
+//
+// Governing: SPEC-0001 REQ "Account Identity".
+func TestWizard_ProtonIdentityMismatch_AbortsWithFriendlyError(t *testing.T) {
+	t.Parallel()
+	f := newWizardFixture(t, 0)
+	c, userID := f.makeUser(t, "sub-mismatch", "joe@example.com", "Joe")
+
+	stubClient := readyClient()
+	f.stub.push(stubLoginResult{client: stubClient, auth: stubAuth(0)})
+
+	// GET creates the pending row; auth captures the (stub) Proton
+	// session whose UserID is "proton-user-joe".
+	c.Get(f.url + "/accounts/setup")
+	post(t, c, f.url+"/accounts/setup/auth", url.Values{
+		"username": {"joe@protonmail.com"}, "password": {"hunter2"},
+	}).Body.Close()
+
+	// Simulate a prior run having already stamped a DIFFERENT Proton
+	// identity onto this same pending row. The unlock step's
+	// SetProtonIdentity("proton-user-joe") will then mismatch the stored
+	// "proton-user-OTHER" and the guard must reject it.
+	accts, err := f.accSvc.ListByUser(t.Context(), userID)
+	if err != nil || len(accts) != 1 {
+		t.Fatalf("expected 1 pending account after auth, got %d (err=%v)", len(accts), err)
+	}
+	pendingID := accts[0].ID
+	if err := f.accSvc.SetProtonIdentity(t.Context(), pendingID, userID, "proton-user-OTHER", "other@protonmail.com"); err != nil {
+		t.Fatalf("pre-stamp different identity: %v", err)
+	}
+
+	resp := post(t, c, f.url+"/accounts/setup/unlock", url.Values{
+		"passphrase": {"my-mailbox-passphrase"},
+	})
+	body := readBody(t, resp)
+
+	// Friendly terminal copy, NOT a 500.
+	if resp.StatusCode == http.StatusInternalServerError {
+		t.Fatalf("identity mismatch returned 500; want a friendly terminal error. body=%s", body[:min(len(body), 600)])
+	}
+	if !strings.Contains(body, "different Proton account") {
+		t.Errorf("expected identity-mismatch terminal copy; body excerpt=%s", body[:min(len(body), 600)])
+	}
+
+	// The pending row must be soft-deleted by the teardown; its stored
+	// identity ("proton-user-OTHER") must be preserved (never silently
+	// overwritten to "proton-user-joe").
+	accts, _ = f.accSvc.ListByUser(t.Context(), userID)
+	var soft int
+	for _, a := range accts {
+		if a.State == account.StateSoftDeleted {
+			soft++
+			if a.ProtonUserID != "proton-user-OTHER" {
+				t.Errorf("stored ProtonUserID = %q, want proton-user-OTHER (must NOT be silently overwritten)", a.ProtonUserID)
+			}
+		}
+	}
+	if soft != 1 {
+		t.Errorf("expected 1 soft-deleted pending row after mismatch abort, got %d", soft)
+	}
+}
+
 func TestWizard_Cancel_SoftDeletesPendingAccount(t *testing.T) {
 	t.Parallel()
 	f := newWizardFixture(t, 0)

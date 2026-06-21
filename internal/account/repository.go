@@ -213,11 +213,61 @@ func (r *repository) setPrimaryAlias(ctx context.Context, id string, alias sql.N
 // the UPDATE matches zero rows in that case and surfaces as
 // ErrAccountNotFound via checkOneRow.
 //
+// Silent-overwrite guard: if the row already carries a non-empty
+// proton_user_id that differs from the incoming value, the method
+// returns ErrProtonIdentityMismatch and leaves the stored value
+// untouched. Setting from empty (first login) or to the identical
+// value (idempotent re-login) is permitted. The read of the existing
+// value and the conditional UPDATE run inside one write transaction so
+// a concurrent re-login cannot slip a different identity in between the
+// SELECT and the UPDATE -- the same atomicity strategy transitionState
+// uses (BEGIN, acquire write lock up front, then read-then-write).
+//
 // Governing: ADR-0010, SPEC-0005 REQ "Add-Proton-Account Wizard";
-// PR #78 hostile N3.
+// SPEC-0001 REQ "Account Identity" (mismatch is an error, never a
+// silent overwrite); PR #78 hostile N3.
 func (r *repository) setProtonIdentity(ctx context.Context, id, userID string, protonUserID, email sql.NullString, now time.Time) error {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("account: begin set proton identity tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			slog.Default().LogAttrs(ctx, slog.LevelWarn,
+				"account: set proton identity tx rollback failed",
+				slog.String("account_id", id),
+				slog.Any("err", rbErr),
+			)
+		}
+	}()
+
+	// Promote to a write transaction immediately so a concurrent
+	// re-login serializes here rather than both reading the same NULL
+	// proton_user_id and both proceeding to write different identities.
+	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET id = id WHERE id = ? AND user_id = ?`, id, userID); err != nil {
+		return fmt.Errorf("account: set proton identity acquire write lock: %w", err)
+	}
+
+	var existing sql.NullString
+	if err := tx.GetContext(ctx, &existing, `SELECT proton_user_id FROM accounts WHERE id = ? AND user_id = ?`, id, userID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrAccountNotFound
+		}
+		return fmt.Errorf("account: read existing proton identity: %w", err)
+	}
+	// Guard against silent overwrite: a stored identity that differs
+	// from the incoming one is a SPEC-0001 error, not an update.
+	if existing.Valid && existing.String != "" &&
+		(!protonUserID.Valid || protonUserID.String != existing.String) {
+		return ErrProtonIdentityMismatch
+	}
+
 	const q = `UPDATE accounts SET proton_user_id = ?, email = ?, updated_at = ? WHERE id = ? AND user_id = ?`
-	res, err := r.db.ExecContext(ctx, q, protonUserID, email, now, id, userID)
+	res, err := tx.ExecContext(ctx, q, protonUserID, email, now, id, userID)
 	if err != nil {
 		var sqliteErr *sqlite.Error
 		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE {
@@ -230,7 +280,14 @@ func (r *repository) setProtonIdentity(ctx context.Context, id, userID string, p
 		}
 		return fmt.Errorf("account: set proton identity: %w", err)
 	}
-	return checkOneRow(res, "set proton identity")
+	if err := checkOneRow(res, "set proton identity"); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("account: commit set proton identity: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // list returns all accounts ordered by created_at ascending. UUIDv7

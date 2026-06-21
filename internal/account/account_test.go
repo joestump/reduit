@@ -1052,3 +1052,146 @@ func TestSoftDeleteOldPending(t *testing.T) {
 		t.Error("SoftDeleteOldPending(0) must error")
 	}
 }
+
+// TestSetProtonIdentityGuardsAgainstSilentOverwrite pins SPEC-0001 REQ
+// "Account Identity": once an account carries a proton_user_id, a
+// subsequent login presenting a DIFFERENT Proton user ID is an error
+// and MUST NOT silently overwrite the stored value. Setting from empty
+// (first login) and re-stamping the identical id (idempotent re-login)
+// both succeed.
+//
+// Governing: SPEC-0001 REQ "Account Identity".
+func TestSetProtonIdentityGuardsAgainstSilentOverwrite(t *testing.T) {
+	t.Parallel()
+	svc, st := newTestService(t)
+	ctx := context.Background()
+
+	uid := storetest.SeedUser(t, st, "sub-identity-guard")
+	a, err := svc.Create(ctx, CreateParams{UserID: uid})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// First set: empty -> "proton-A" is allowed.
+	if err := svc.SetProtonIdentity(ctx, a.ID, uid, "proton-A", "joe@proton.me"); err != nil {
+		t.Fatalf("first SetProtonIdentity: %v", err)
+	}
+	got, err := svc.GetByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("GetByID after first set: %v", err)
+	}
+	if got.ProtonUserID != "proton-A" {
+		t.Fatalf("ProtonUserID = %q, want proton-A", got.ProtonUserID)
+	}
+
+	// Idempotent: re-stamping the SAME id succeeds and may update email.
+	if err := svc.SetProtonIdentity(ctx, a.ID, uid, "proton-A", "joe2@proton.me"); err != nil {
+		t.Fatalf("idempotent SetProtonIdentity: %v", err)
+	}
+	got, err = svc.GetByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("GetByID after idempotent set: %v", err)
+	}
+	if got.ProtonUserID != "proton-A" {
+		t.Errorf("ProtonUserID after idempotent set = %q, want proton-A", got.ProtonUserID)
+	}
+	if got.Email != "joe2@proton.me" {
+		t.Errorf("Email after idempotent set = %q, want joe2@proton.me", got.Email)
+	}
+
+	// Mismatch: a DIFFERENT id must error AND leave the stored value
+	// untouched (no silent overwrite).
+	err = svc.SetProtonIdentity(ctx, a.ID, uid, "proton-B", "evil@proton.me")
+	if !errors.Is(err, ErrProtonIdentityMismatch) {
+		t.Fatalf("mismatch SetProtonIdentity error = %v, want ErrProtonIdentityMismatch", err)
+	}
+	got, err = svc.GetByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("GetByID after mismatch: %v", err)
+	}
+	if got.ProtonUserID != "proton-A" {
+		t.Errorf("ProtonUserID after rejected mismatch = %q, want proton-A (must be preserved)", got.ProtonUserID)
+	}
+	if got.Email != "joe2@proton.me" {
+		t.Errorf("Email after rejected mismatch = %q, want joe2@proton.me (must be preserved)", got.Email)
+	}
+}
+
+// TestSetProtonIdentityIsAtomicUnderConcurrency races two goroutines
+// setting DIFFERENT Proton identities on the same freshly-created
+// (proton_user_id NULL) row. The read-compare guard runs inside one
+// write transaction, so exactly one writer MUST win (stamps its id) and
+// the other MUST observe the now-non-empty differing value and get
+// ErrProtonIdentityMismatch — never a silent overwrite, never both
+// succeeding. The stored value MUST equal whichever id won; the loser's
+// id MUST NOT be the stored value. Mirrors
+// TestTransitionIsAtomicUnderConcurrency's atomicity pin.
+//
+// Governing: SPEC-0001 REQ "Account Identity".
+func TestSetProtonIdentityIsAtomicUnderConcurrency(t *testing.T) {
+	t.Parallel()
+	svc, st := newTestService(t)
+	ctx := context.Background()
+
+	uid := storetest.SeedUser(t, st, "sub-identity-race")
+	a, err := svc.Create(ctx, CreateParams{UserID: uid})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var (
+		successes  int32
+		mismatches int32
+		wg         sync.WaitGroup
+		start      = make(chan struct{})
+		winnerMu   sync.Mutex
+		winner     string
+	)
+
+	race := func(protonID string) {
+		defer wg.Done()
+		<-start // align goroutine launches
+		err := svc.SetProtonIdentity(ctx, a.ID, uid, protonID, protonID+"@protonmail.com")
+		switch {
+		case err == nil:
+			atomic.AddInt32(&successes, 1)
+			winnerMu.Lock()
+			winner = protonID
+			winnerMu.Unlock()
+		case errors.Is(err, ErrProtonIdentityMismatch):
+			atomic.AddInt32(&mismatches, 1)
+		default:
+			t.Errorf("unexpected error from SetProtonIdentity(%s): %v", protonID, err)
+		}
+	}
+
+	wg.Add(2)
+	go race("proton-A")
+	go race("proton-B")
+	close(start)
+	wg.Wait()
+
+	// Exactly one winner, exactly one mismatch. The guard's
+	// read-compare-write atomicity forbids both succeeding (which would
+	// be a silent overwrite) and both mismatching (which would mean
+	// neither ever stamped the NULL row).
+	if got := atomic.LoadInt32(&successes); got != 1 {
+		t.Fatalf("successes = %d, want exactly 1 (the other MUST mismatch)", got)
+	}
+	if got := atomic.LoadInt32(&mismatches); got != 1 {
+		t.Fatalf("mismatches = %d, want exactly 1", got)
+	}
+
+	// Stored value MUST be the winner's id — deterministic, never the
+	// loser's, never a torn value.
+	final, err := svc.GetByID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	winnerMu.Lock()
+	wantID := winner
+	winnerMu.Unlock()
+	if final.ProtonUserID != wantID {
+		t.Errorf("stored ProtonUserID = %q, want the winner %q", final.ProtonUserID, wantID)
+	}
+}

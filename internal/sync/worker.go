@@ -124,6 +124,14 @@ func (w *worker) start() {
 		w.bootstrapFailed()
 		return
 	}
+	// The detached permanent-transition goroutine must outlive this
+	// worker's own context (a permanent failure cancels w.ctx, but the
+	// transition it dispatches still has to run). Hand it the
+	// supervisor's rootCtx so it abandons quietly only when the WHOLE
+	// supervisor shuts down, not when this single worker stops.
+	//
+	// Governing: SPEC-0002 REQ "Graceful Shutdown".
+	proc.lifetimeCtx = w.sup.rootCtx
 	w.proc = proc
 
 	go w.run()
@@ -282,15 +290,17 @@ func (w *worker) tick() {
 			if errors.Is(err, errProtonSlotUnavailable) {
 				return
 			}
-			// Refresh-token-revoked is the SPEC-0002 permanent-failure
-			// path: processOnce has already transitioned the account
-			// back to pending_proton_setup, so the worker MUST exit
+			// Permanent-failure paths: processOnce has already dispatched
+			// the account transition (both refresh-token-revoked and any
+			// other unrecoverable authorization failure revert the
+			// account to pending_proton_setup), so the worker MUST exit
 			// without logging another error or bumping backoff. Cancel
 			// our own context so the run loop's outer select hits
 			// ctx.Done on the next iteration.
 			//
-			// Governing: SPEC-0002 REQ "Backoff on Failure".
-			if errors.Is(err, errRefreshTokenRevoked) {
+			// Governing: SPEC-0002 REQ "Backoff on Failure" — "Permanent
+			// errors do not retry indefinitely".
+			if errors.Is(err, errRefreshTokenRevoked) || errors.Is(err, errUnrecoverableAuth) {
 				w.cancel()
 				return
 			}
@@ -301,15 +311,11 @@ func (w *worker) tick() {
 			// exponentially up to BackoffMax; a successful tick later
 			// resets the curve via bo.reset().
 			//
-			// Permanent-error classification (refresh-token-revoked
-			// → pending_proton_setup) is deliberately deferred to a
-			// follow-up — it requires AccountSnapshot wiring and a
-			// state-transition path that's still being designed.
-			// Until then every non-cancel error walks the same
-			// backoff curve. This is correct for transient errors
-			// (network blips, Proton 5xx) and merely suboptimal for
-			// permanent ones (we retry on the curve until an operator
-			// suspends the account manually).
+			// Permanent failures never reach here: processOnce
+			// classifies refresh-token-revoked and other permanent
+			// Proton failures upstream and returns the dedicated
+			// sentinels handled above, so only genuinely transient
+			// errors (network blips, Proton 5xx/429) walk this curve.
 			delay := w.bo.next()
 			w.logger.LogAttrs(w.ctx, slog.LevelError,
 				"sync: event processing failed; backing off before retry",

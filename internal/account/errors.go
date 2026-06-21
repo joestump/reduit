@@ -35,3 +35,21 @@ var ErrAccountNotFound = errors.New("account: not found")
 //
 // Governing: SPEC-0001 REQ "Account Lifecycle States".
 var ErrInvalidTransition = errors.New("account: invalid state transition")
+
+// ErrProtonIdentityMismatch is returned by SetProtonIdentity when the
+// account row already carries a non-empty proton_user_id that differs
+// from the incoming value. SPEC-0001 REQ "Account Identity" mandates
+// that a subsequent login observing a different Proton user ID is an
+// error and MUST NOT silently overwrite the stored value -- otherwise
+// a re-login against the wrong Proton mailbox could silently re-point
+// an existing account at a different identity. Setting the column from
+// empty (first login) or to the identical value (idempotent re-login)
+// is allowed and does NOT return this error.
+//
+// This is distinct from ErrAccountAlreadyExists: the latter fires when
+// the SAME Proton id is already bound to ANOTHER row owned by the user
+// (the unique index trips); this fires when a DIFFERENT Proton id is
+// being written over THIS row's existing identity.
+//
+// Governing: SPEC-0001 REQ "Account Identity".
+var ErrProtonIdentityMismatch = errors.New("account: proton identity mismatch")

@@ -1,8 +1,9 @@
 // Governing: ADR-0001 (go-proton-api as Proton client),
 //             SPEC-0002 REQ "Event Cursor Persistence",
 //             SPEC-0002 REQ "Concurrency Limits",
-//             SPEC-0002 REQ "Backoff on Failure" (refresh-token-revoked
-//             permanent-failure path),
+//             SPEC-0002 REQ "Backoff on Failure" (permanent-failure
+//             paths: refresh-token-revoked and other unrecoverable
+//             authorization failures both -> pending_proton_setup),
 //             SPEC-0002 REQ "IMAP Update Notification".
 
 package sync
@@ -12,6 +13,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"time"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 
@@ -49,6 +51,48 @@ func (nopPublisher) Publish(string, pubsub.Update) {}
 // not retry indefinitely".
 var errRefreshTokenRevoked = errors.New("sync: refresh token revoked; account returned to pending_proton_setup")
 
+// errUnrecoverableAuth is the sentinel returned by processOnce after a
+// NON-token authorization failure that the worker cannot make progress
+// against (HTTP 403 — the session/token is forbidden from the events
+// endpoint: account locked, token scope insufficient, mailbox needs
+// re-unlock, or in the worst case the account was disabled). SPEC-0002
+// REQ "Backoff on Failure" requires that permanent errors do not retry
+// indefinitely; a 403 reaching the worker means the current session
+// can never make the call succeed by retrying, so the worker MUST stop.
+//
+// We route this to pending_proton_setup (the same recoverable terminal
+// the refresh-token-revoked path uses), NOT to suspended. A 403 from
+// Proton is frequently RECOVERABLE (locked / insufficient scope / needs
+// re-unlock), and the vendored go-proton-api exposes no account-deleted
+// /disabled code to distinguish a truly-dead account from a recoverable
+// one. Suspending on an ambiguous 403 would permanently halt a HEALTHY
+// account; pending_proton_setup instead stops the infinite-retry loop,
+// stops the worker, and surfaces to the admin to re-run the wizard. The
+// `suspended` state is reserved for a future explicit upstream
+// account-deleted signal (see isUnrecoverableProtonError).
+//
+// The worker's tick loop treats this sentinel like errRefreshTokenRevoked
+// — exit cleanly, no backoff — because the account transition has
+// already been dispatched.
+//
+// Governing: SPEC-0002 REQ "Backoff on Failure" — "Permanent errors do
+// not retry indefinitely".
+var errUnrecoverableAuth = errors.New("sync: unrecoverable proton authorization failure; account returned to pending_proton_setup")
+
+// permanentTransitionRetries bounds the detached transition goroutine's
+// retry loop. A handful of attempts covers a transient SQLite lock
+// contention window; if the transition still fails after that the
+// worker falls back to marking the account crashed so it does NOT
+// remain silently active (see dispatchPermanentTransition).
+const permanentTransitionRetries = 5
+
+// permanentTransitionRetryDelay is the fixed gap between transition
+// retries in the detached goroutine. Short because the only expected
+// failure is brief SQLite write-lock contention; a longer delay would
+// widen the window during which the account is still active and the
+// worker has already exited.
+const permanentTransitionRetryDelay = 200 * time.Millisecond
+
 // eventProcessor owns one worker's interaction with Proton's event
 // stream. It is constructed by worker.start() (synchronously, before
 // the goroutine spins up) — a previous version did the bootstrap
@@ -65,10 +109,16 @@ var errRefreshTokenRevoked = errors.New("sync: refresh token revoked; account re
 // ClientFactory between ticks would not pick up a token rotation
 // any faster than the upstream auth handler already does.
 //
-// Steady-state Proton failure (refresh token revoked server-side,
-// account blocked, etc.) is deferred to story #17, which will add
-// classification + state transition; for #16 the worker logs at
-// ERROR each tick and the next tick retries the same dead processor.
+// Steady-state Proton failure is classified in processOnce: a
+// refresh-token-revoked error and any other unrecoverable authorization
+// failure (HTTP 403) both revert the account to pending_proton_setup so
+// the admin re-runs the wizard. Both stop the worker without walking the
+// backoff curve. (The `suspended` state is reserved for a future
+// explicit upstream account-deleted signal — see
+// isUnrecoverableProtonError.)
+//
+// Governing: SPEC-0002 REQ "Backoff on Failure" — "Permanent errors do
+// not retry indefinitely".
 //
 // The processor caches the current cursor in-process so the per-tick
 // path is one Proton round-trip plus one DB write, not a Proton
@@ -94,6 +144,32 @@ type eventProcessor struct {
 	// Mutation is single-goroutine (only the worker.run loop calls
 	// processOnce), so no lock is required.
 	cursor string
+
+	// lifetimeCtx is the supervisor-lifetime context the detached
+	// permanent-transition goroutine derives its work from. It is the
+	// supervisor's rootCtx (set in worker.start), which is cancelled
+	// only when the WHOLE supervisor stops -- NOT when this individual
+	// worker's per-tick context is cancelled (a permanent failure
+	// cancels the worker's own ctx, but the transition it dispatched
+	// must still run). When nil (unit tests that build a processor
+	// directly) it falls back to context.Background via
+	// transitionCtx(). Cancelling it makes the detached retry loop
+	// abandon quietly on shutdown instead of hammering a closing DB and
+	// logging spurious "account may remain active" ERRORs.
+	//
+	// Governing: SPEC-0002 REQ "Graceful Shutdown".
+	lifetimeCtx context.Context
+}
+
+// transitionCtx returns the context the detached permanent-transition
+// goroutine should use: the supervisor-lifetime context when one was
+// wired (production via worker.start), or context.Background otherwise
+// (unit tests constructing a processor directly). Never returns nil.
+func (p *eventProcessor) transitionCtx() context.Context {
+	if p.lifetimeCtx != nil {
+		return p.lifetimeCtx
+	}
+	return context.Background()
 }
 
 // newEventProcessor bootstraps a processor for the supplied account.
@@ -195,32 +271,32 @@ func (p *eventProcessor) processOnce(ctx context.Context) (bool, error) {
 		// Governing: SPEC-0002 REQ "Backoff on Failure" — "Permanent
 		// errors do not retry indefinitely".
 		if isRefreshTokenRevokedError(err) {
-			// The Transition fires the supervisor's OnTransition
-			// callback synchronously, which dispatches to stopWorker
-			// on the active->pending edge. stopWorker.waitDone blocks
-			// on the worker's run goroutine — and we ARE that goroutine.
-			// Running Transition inline would therefore deadlock.
-			//
-			// We spin Transition into a fresh goroutine so the
-			// supervisor's stopWorker can wait on us draining via
-			// ctx.Done. The worker's tick() consumes the sentinel by
-			// cancelling its own context, so the run loop exits, the
-			// done channel closes, and stopWorker.waitDone returns.
-			//
-			// Governing: SPEC-0002 REQ "Backoff on Failure".
-			go func(svc account.Service, id string) {
-				if _, terr := svc.Transition(context.Background(), id, account.StatePendingProtonSetup); terr != nil {
-					p.logger.LogAttrs(context.Background(), slog.LevelError,
-						"sync: refresh token revoked but transition to pending failed",
-						slog.Any("err", terr),
-					)
-				}
-			}(p.svc, p.accountID)
+			p.dispatchPermanentTransition(account.StatePendingProtonSetup, err)
 			p.logger.LogAttrs(ctx, slog.LevelWarn,
 				"sync: refresh token revoked; account returned to pending_proton_setup, worker exiting",
 				slog.Any("err", err),
 			)
 			return false, errRefreshTokenRevoked
+		}
+		// Non-token unrecoverable authorization failure (HTTP 403): the
+		// current Proton session is forbidden from the events endpoint
+		// and retrying cannot fix it. Without this classification these
+		// fall through to the transient backoff curve below and retry
+		// forever. SPEC-0002 REQ "Backoff on Failure" requires permanent
+		// errors to stop; we route to pending_proton_setup (recoverable)
+		// rather than suspended because a 403 is often a recoverable
+		// condition and the upstream gives us no account-deleted signal
+		// to justify a permanent suspension (see isUnrecoverableProtonError).
+		//
+		// Governing: SPEC-0002 REQ "Backoff on Failure" — "Permanent
+		// errors do not retry indefinitely".
+		if isUnrecoverableProtonError(err) {
+			p.dispatchPermanentTransition(account.StatePendingProtonSetup, err)
+			p.logger.LogAttrs(ctx, slog.LevelWarn,
+				"sync: unrecoverable proton authorization failure; account returned to pending_proton_setup, worker exiting",
+				slog.Any("err", err),
+			)
+			return false, errUnrecoverableAuth
 		}
 		// Stale-cursor recovery. The bookmark we have is older than
 		// Proton's retention window; the only correct response is to
@@ -432,6 +508,148 @@ func isRefreshTokenRevokedError(err error) bool {
 	// so a 401 reaching us here strongly implies the refresh path
 	// has already given up.
 	return apiErr.Status == http.StatusUnauthorized
+}
+
+// dispatchPermanentTransition drives the account to `next` in a fresh
+// goroutine and ensures a transition FAILURE does not leave the account
+// silently active. It is the shared permanent-failure handler for both
+// the refresh-token-revoked (next=pending_proton_setup) and the other-
+// permanent-failure (next=suspended) paths.
+//
+// Why a goroutine at all: Transition fires the supervisor's
+// OnTransition callback synchronously, which on the active->!active
+// edge calls stopWorker.waitDone — and waitDone blocks on THIS worker's
+// run goroutine. Running Transition inline from processOnce (which runs
+// on that same goroutine) would deadlock. Spinning it out lets the
+// worker's tick() consume the returned sentinel, cancel its own
+// context, and let the run loop exit so waitDone returns.
+//
+// Why this is no longer fire-and-forget: the previous version logged a
+// transition error and moved on, leaving the account in `active` with
+// no running worker -- a silent stuck state. We now retry a bounded
+// number of times against SQLite write-lock contention, and if the
+// transition STILL fails we mark the account `crashed`. MarkCrashed
+// does NOT change the lifecycle State: the account stays `active` but
+// gains the operator-visible `crashed` flag (admin-UI "needs manual
+// reset"), so it no longer looks healthy-and-syncing when in fact no
+// worker is running. The crashed flag is the same stuck-state signal a
+// panic raises (SPEC-0002 REQ "Panic Isolation"); reusing it here means
+// a failed permanent-transition surfaces to an operator instead of
+// silently appearing active.
+//
+// Shutdown-aware: the retry loop sleeps against the supervisor-lifetime
+// context (transitionCtx). When the supervisor is stopping, that ctx is
+// cancelled, the loop abandons immediately, and the abandonment is
+// logged at DEBUG (not ERROR) -- a transition failure during shutdown
+// is benign (the DB is closing) and must not emit a scary "account may
+// remain active" ERROR on every clean stop.
+//
+// Governing: SPEC-0002 REQ "Backoff on Failure" (permanent-failure
+// transition), SPEC-0002 REQ "Panic Isolation" (crashed-flag fallback
+// keeps a failed transition from leaving the account looking active),
+// SPEC-0002 REQ "Graceful Shutdown" (quiet abandonment on stop).
+func (p *eventProcessor) dispatchPermanentTransition(next account.State, cause error) {
+	go func(svc account.Service, id string, next account.State) {
+		ctx := p.transitionCtx()
+		var lastErr error
+		for attempt := 0; attempt < permanentTransitionRetries; attempt++ {
+			if attempt > 0 {
+				// Cancel-aware sleep: a supervisor shutdown wakes us
+				// immediately so we stop hammering a closing DB.
+				if err := sleepCtx(ctx, permanentTransitionRetryDelay); err != nil {
+					p.logger.LogAttrs(context.Background(), slog.LevelDebug,
+						"sync: permanent-failure transition abandoned during shutdown",
+						slog.String("target_state", string(next)),
+						slog.Any("last_err", lastErr),
+					)
+					return
+				}
+			}
+			_, terr := svc.Transition(ctx, id, next)
+			if terr == nil {
+				return
+			}
+			// An invalid-transition error is not retryable: the account
+			// already moved out of active (e.g. an admin suspended or
+			// deleted it concurrently), so the worker-stop intent is
+			// already satisfied. Stop retrying and do NOT mark crashed.
+			if errors.Is(terr, account.ErrInvalidTransition) {
+				p.logger.LogAttrs(context.Background(), slog.LevelInfo,
+					"sync: permanent-failure transition skipped; account already left active",
+					slog.String("target_state", string(next)),
+					slog.Any("err", terr),
+				)
+				return
+			}
+			lastErr = terr
+		}
+		// Exhausted retries. If the supervisor is shutting down, the
+		// failure is benign (the DB is closing) -- abandon quietly at
+		// DEBUG rather than alarming the operator with an ERROR.
+		if ctx.Err() != nil {
+			p.logger.LogAttrs(context.Background(), slog.LevelDebug,
+				"sync: permanent-failure transition abandoned during shutdown after retries",
+				slog.String("target_state", string(next)),
+				slog.Any("last_err", lastErr),
+			)
+			return
+		}
+		// Steady-state failure: the account would otherwise stay `active`
+		// with no worker. Mark it crashed so the stuck state is visible.
+		p.logger.LogAttrs(context.Background(), slog.LevelError,
+			"sync: permanent-failure transition failed after retries; marking account crashed so it is not left looking active",
+			slog.String("target_state", string(next)),
+			slog.Any("transition_err", lastErr),
+			slog.Any("cause", cause),
+		)
+		if mcErr := svc.MarkCrashed(context.Background(), id); mcErr != nil {
+			p.logger.LogAttrs(context.Background(), slog.LevelError,
+				"sync: failed to mark account crashed after transition failure; account left active without a worker",
+				slog.Any("err", mcErr),
+			)
+		}
+	}(p.svc, p.accountID, next)
+}
+
+// isUnrecoverableProtonError reports whether err is a NON-token
+// authorization failure that the worker cannot make progress against by
+// retrying. SPEC-0002 REQ "Backoff on Failure" requires permanent
+// errors to stop rather than retry indefinitely:
+//
+//   - HTTP 403 Forbidden means the current Proton session is not
+//     permitted to call the events endpoint. Retrying the same call on
+//     the backoff curve can never succeed, so the worker must stop.
+//
+// IMPORTANT: a 403 does NOT imply the account is dead. Proton returns
+// 403 for several RECOVERABLE conditions (account temporarily locked,
+// insufficient token scope, mailbox needs re-unlock), and the vendored
+// go-proton-api (response.go) exposes NO account-deleted/disabled error
+// code that would let us reliably distinguish a truly-dead account from
+// a recoverable one. Because of that ambiguity the caller routes this
+// to pending_proton_setup (recoverable: stops the loop, stops the
+// worker, prompts re-auth) and NOT to suspended — suspending on an
+// ambiguous 403 would permanently halt a healthy account. The
+// `suspended` lifecycle state is intentionally reserved for a future
+// explicit upstream account-deleted signal; when go-proton-api adds
+// such a code, classify it here and route THAT to suspended.
+//
+// We deliberately do NOT classify here:
+//   - refresh-token-revoked (10013 / 401) — handled by
+//     isRefreshTokenRevokedError, also reverts to pending_proton_setup.
+//   - 422 + InvalidValue — that is the stale-cursor recovery path.
+//   - 429 / dial / drop — go-proton-api's transport layer retries these
+//     (catchTooManyRequests / catchDialError / catchDropError, see its
+//     manager_builder.go); it does NOT add a generic 5xx retry, so a
+//     5xx surfaces here and walks the worker's own transient backoff
+//     curve rather than this stop path.
+//
+// Governing: SPEC-0002 REQ "Backoff on Failure".
+func isUnrecoverableProtonError(err error) bool {
+	var apiErr *gpa.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Status == http.StatusForbidden
 }
 
 // isStaleCursorError reports whether err indicates the cursor we

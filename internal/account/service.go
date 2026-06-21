@@ -142,7 +142,11 @@ type Service interface {
 	// than the OIDC callback. Returns ErrAccountAlreadyExists when
 	// the same Proton user is already bound to a different row owned
 	// by the same Reduit user (the unique index on (user_id,
-	// proton_user_id) enforces this).
+	// proton_user_id) enforces this). Returns ErrProtonIdentityMismatch
+	// when THIS row already carries a different non-empty
+	// proton_user_id: per SPEC-0001 a Proton user ID mismatch on a
+	// subsequent login is an error and MUST NOT silently overwrite the
+	// stored value. Re-stamping the identical id is idempotent.
 	//
 	// userID is included as a WHERE predicate (defense in depth) so
 	// a future caller bug that passes the wrong accountID cannot
@@ -378,6 +382,11 @@ func (s *service) GetByPrimaryAlias(ctx context.Context, alias string) (*Account
 // protonUserID is treated as a programmer error (the wizard always
 // has a value at the call site); empty email is permitted because
 // some Proton accounts use a non-email login name.
+//
+// The read-compare guard that rejects a mismatching overwrite lives in
+// the repository so the compare and the write share one transaction.
+//
+// Governing: SPEC-0001 REQ "Account Identity".
 func (s *service) SetProtonIdentity(ctx context.Context, accountID, userID, protonUserID, email string) error {
 	protonUserID = strings.TrimSpace(protonUserID)
 	if protonUserID == "" {

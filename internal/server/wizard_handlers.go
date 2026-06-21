@@ -611,7 +611,13 @@ func (s *Server) handleWizardUnlock(w http.ResponseWriter, r *http.Request) {
 		//     Tear the wizard down (we can't pin a duplicate
 		//     identity onto the pending row) and surface a clear
 		//     message.
-		//  4. anything else: 500.
+		//  4. ErrProtonIdentityMismatch: the pending row was already
+		//     stamped with a DIFFERENT Proton identity on a prior run
+		//     and this attempt logged into a different Proton account.
+		//     SPEC-0001 "Account Identity" forbids silently overwriting
+		//     the stored id, so tear the wizard down and tell the user
+		//     to start a fresh add-account flow for the other mailbox.
+		//  5. anything else: 500.
 		switch {
 		case errors.Is(err, errWizardUnlock):
 			s.renderWizard(w, r, sess,
@@ -636,6 +642,22 @@ func (s *Server) handleWizardUnlock(w http.ResponseWriter, r *http.Request) {
 			}
 			s.renderWizardError(w, r,
 				"This Proton account is already linked to one of your Reduit accounts. Open the dashboard to manage it.")
+			return
+		case errors.Is(err, account.ErrProtonIdentityMismatch):
+			// Governing: SPEC-0001 REQ "Account Identity" -- a Proton
+			// user ID mismatch on a subsequent login is an error and
+			// MUST NOT silently overwrite the stored value. Same
+			// teardown as the duplicate case: drop the in-flight wizard
+			// state and soft-delete the pending row so a clean retry
+			// can start fresh.
+			_ = sess.Client.Logout(r.Context())
+			s.deps.WizardSessions.Drop(accountID)
+			s.deps.SessionManager.Remove(r.Context(), wizardSessionKey)
+			if _, delErr := s.deps.AccountService.Delete(r.Context(), accountID); delErr != nil {
+				s.deps.Logger.Warn("wizard/unlock: soft-delete after identity mismatch: " + delErr.Error())
+			}
+			s.renderWizardError(w, r,
+				"This add-account flow was started for a different Proton account than the one you just signed into. Start a new add-account flow to link this mailbox.")
 			return
 		default:
 			s.deps.Logger.Error("wizard/unlock: commit",
