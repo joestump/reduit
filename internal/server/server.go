@@ -422,23 +422,37 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// Add-Proton-account wizard per SPEC-0005 REQ "Add-Proton-Account
 	// Wizard". GET renders whichever step the in-flight wizard
 	// session is on (or step 1 if none); POSTs advance the flow.
+	//
+	// Every wizard POST is CSRF-protected (csrfProtect): the multi-step
+	// HTMX flow threads the per-session token through the hx-headers
+	// X-CSRF-Token on <body> AND each step form carries the hidden
+	// csrf_token field, so both the HTMX and no-JS submit paths validate.
+	// Fail-closed: a missing/invalid token 403s before any Proton-side
+	// state change.
+	//
+	// Governing: SPEC-0005 design "Content security and CSRF"; issue #26.
 	mux.HandleFunc("GET /accounts/setup", s.handleWizardStart)
-	mux.HandleFunc("POST /accounts/setup/auth", s.handleWizardAuth)
-	mux.HandleFunc("POST /accounts/setup/2fa", s.handleWizardTOTP)
-	mux.HandleFunc("POST /accounts/setup/unlock", s.handleWizardUnlock)
-	mux.HandleFunc("POST /accounts/setup/complete", s.handleWizardComplete)
-	mux.HandleFunc("POST /accounts/setup/cancel", s.handleWizardCancel)
+	mux.Handle("POST /accounts/setup/auth", s.csrfProtectFunc(s.handleWizardAuth))
+	mux.Handle("POST /accounts/setup/2fa", s.csrfProtectFunc(s.handleWizardTOTP))
+	mux.Handle("POST /accounts/setup/unlock", s.csrfProtectFunc(s.handleWizardUnlock))
+	mux.Handle("POST /accounts/setup/complete", s.csrfProtectFunc(s.handleWizardComplete))
+	mux.Handle("POST /accounts/setup/cancel", s.csrfProtectFunc(s.handleWizardCancel))
 
 	// Per-account actions on the dashboard cards. Each handler
 	// verifies session-bound ownership (or admin) before any state
-	// change. See dashboard_actions.go.
+	// change. See dashboard_actions.go. All are CSRF-protected
+	// (csrfProtect) — the no-JS <form> submits carry the hidden
+	// csrf_token field; the HTMX rotate button carries the X-CSRF-Token
+	// header via base.html's hx-headers. Fail-closed: 403 on a
+	// missing/invalid token before the ownership check or state change.
 	//
 	// Governing: SPEC-0005 REQ "Account Dashboard" (Scenario "User
-	// manages account state"); issues #102, #103.
-	mux.HandleFunc("POST /accounts/{id}/delete", s.handleAccountDelete)
-	mux.HandleFunc("POST /accounts/{id}/suspend", s.handleAccountSuspend)
-	mux.HandleFunc("POST /accounts/{id}/reactivate", s.handleAccountReactivate)
-	mux.HandleFunc("POST /accounts/{id}/imap-password/rotate", s.handleAccountIMAPRotate)
+	// manages account state"), SPEC-0005 design "Content security and
+	// CSRF"; issues #102, #103, #26.
+	mux.Handle("POST /accounts/{id}/delete", s.csrfProtectFunc(s.handleAccountDelete))
+	mux.Handle("POST /accounts/{id}/suspend", s.csrfProtectFunc(s.handleAccountSuspend))
+	mux.Handle("POST /accounts/{id}/reactivate", s.csrfProtectFunc(s.handleAccountReactivate))
+	mux.Handle("POST /accounts/{id}/imap-password/rotate", s.csrfProtectFunc(s.handleAccountIMAPRotate))
 
 	// Live sync-status stream per SPEC-0005 REQ "Sync Status via SSE".
 	// Server-Sent Events keyed on the account; the dashboard subscribes
@@ -483,9 +497,14 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// fresh password and returns a one-time-display HTMX modal.
 	// Gated: account.user_id == session.user_id || session.is_admin.
 	//
-	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials".
+	// The rotate POST is CSRF-protected (csrfProtect): the credentials
+	// page's HTMX rotate button carries the X-CSRF-Token header via
+	// base.html's hx-headers. Fail-closed 403 on a missing/invalid token.
+	//
+	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials",
+	// SPEC-0005 design "Content security and CSRF"; issue #26.
 	mux.HandleFunc("GET /accounts/{id}/credentials", s.handleAccountCredentials)
-	mux.HandleFunc("POST /accounts/{id}/credentials/rotate", s.handleAccountCredentialsRotate)
+	mux.Handle("POST /accounts/{id}/credentials/rotate", s.csrfProtectFunc(s.handleAccountCredentialsRotate))
 
 	// Admin-only account management routes. All routes below are
 	// wrapped by auth.RequireAdmin so a 403 is returned for any
@@ -498,17 +517,35 @@ func (s *Server) routes(mux *http.ServeMux) {
 		}
 		return h
 	}
+	// adminPOSTHandler is adminHandler with CSRF validation composed
+	// INSIDE the admin gate: RequireAdmin runs first (so a non-admin
+	// gets the 403-forbidden admin shape, not a CSRF 403), then
+	// csrfProtect rejects a missing/invalid token before the handler.
+	// Both layers reject before any state change. The admin templates'
+	// no-JS <form> submits carry the hidden csrf_token field.
+	//
+	// Governing: SPEC-0005 REQ "Admin Account Management", SPEC-0005
+	// design "Content security and CSRF"; issue #26.
+	adminPOSTHandler := func(h http.HandlerFunc) http.Handler {
+		csrfed := s.csrfProtect(h)
+		if s.deps.SessionManager != nil {
+			return auth.RequireAdmin(s.deps.SessionManager, csrfed)
+		}
+		return csrfed
+	}
 	mux.Handle("GET /admin/accounts", adminHandler(s.handleAdminAccounts))
-	mux.Handle("POST /admin/accounts/{id}/suspend", adminHandler(s.handleAdminAccountSuspend))
-	mux.Handle("POST /admin/accounts/{id}/unsuspend", adminHandler(s.handleAdminAccountUnsuspend))
-	mux.Handle("POST /admin/accounts/{id}/delete", adminHandler(s.handleAdminAccountDelete))
+	mux.Handle("POST /admin/accounts/{id}/suspend", adminPOSTHandler(s.handleAdminAccountSuspend))
+	mux.Handle("POST /admin/accounts/{id}/unsuspend", adminPOSTHandler(s.handleAdminAccountUnsuspend))
+	mux.Handle("POST /admin/accounts/{id}/delete", adminPOSTHandler(s.handleAdminAccountDelete))
 
 	// Admin-notification acknowledge route. Dismisses one notification
 	// (worker crash / auto-revert) so it drops off the admin banner.
+	// CSRF-protected like the other admin POSTs.
 	//
 	// Governing: SPEC-0002 REQ "Panic Isolation" (the crash surfaces to
-	// the operator; acknowledging is how they clear it from view).
-	mux.Handle("POST /admin/notifications/{id}/ack", adminHandler(s.handleAdminNotificationAck))
+	// the operator; acknowledging is how they clear it from view);
+	// SPEC-0005 design "Content security and CSRF"; issue #26.
+	mux.Handle("POST /admin/notifications/{id}/ack", adminPOSTHandler(s.handleAdminNotificationAck))
 }
 
 // handleHealthz returns 200 OK if the process is up. It does not

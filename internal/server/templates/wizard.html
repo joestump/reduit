@@ -73,6 +73,10 @@
 </p>
 
 <form method="POST" action="/accounts/setup/auth" class="space-y-4">
+  <!-- CSRF: per-session synchronizer token; also covers the Cancel
+       button's formaction=/accounts/setup/cancel submit (same form).
+       Governing: SPEC-0005 design "Content security and CSRF"; #26. -->
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <div>
     <label for="username" class="block text-sm font-medium mb-1.5">Proton email</label>
     <input id="username" type="email" name="username" required autocomplete="username"
@@ -109,6 +113,8 @@
 </p>
 
 <form method="POST" action="/accounts/setup/2fa" class="space-y-4">
+  <!-- CSRF token (also covers the Cancel formaction submit). #26. -->
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <div>
     <label for="code" class="block text-sm font-medium mb-1.5">Authenticator code</label>
     <input id="code" type="text" name="code" required
@@ -145,6 +151,8 @@
 </div>
 
 <form method="POST" action="/accounts/setup/unlock" class="space-y-4">
+  <!-- CSRF token (also covers the Cancel formaction submit). #26. -->
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <div>
     <label for="passphrase" class="block text-sm font-medium mb-1.5">Mailbox passphrase</label>
     <input id="passphrase" type="password" name="passphrase" required autocomplete="off"
@@ -198,6 +206,8 @@
 </div>
 
 <form method="POST" action="/accounts/setup/complete" class="flex items-center justify-end gap-3">
+  <!-- CSRF token. #26. -->
+  <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
   <button type="submit"
           class="px-5 py-2 rounded-lg font-semibold text-white inline-flex items-center gap-2"
           style="background:#4F46E5">

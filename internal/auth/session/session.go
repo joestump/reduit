@@ -435,11 +435,14 @@ func Clear(ctx context.Context, mgr *scs.SessionManager) {
 // rides the same HttpOnly cookie as the rest of the identity and is
 // renewed (via PutIdentity's RenewToken) on each login.
 //
-// State-changing form handlers (currently only POST /auth/logout) embed
-// this value as a hidden field and validate it with ValidCSRF on
-// submission. Because the token lives in the SCS session and not in a
-// readable cookie, a cross-site attacker cannot read it to forge a
-// matching field.
+// State-changing form handlers embed this value as a hidden field (and
+// HTMX requests carry it as the X-CSRF-Token header) and the csrfProtect
+// middleware validates it with ValidCSRF on submission. As of issue #26
+// every destructive POST is covered (account actions, credential
+// rotation, the admin routes, and the wizard); issue #11 originally
+// wired only POST /auth/logout. Because the token lives in the SCS
+// session and not in a readable cookie, a cross-site attacker cannot
+// read it to forge a matching field or header.
 //
 // Pattern choice: SPEC-0005 design "Content security and CSRF"
 // illustrates the double-submit-cookie pattern. We use the

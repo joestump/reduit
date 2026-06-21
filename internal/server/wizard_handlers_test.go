@@ -91,6 +91,17 @@ func (s *stubProton) push(r stubLoginResult) {
 	s.queue = append(s.queue, r)
 }
 
+// loginCalls returns a snapshot copy of the recorded NewClientWithLogin
+// calls. Used by the CSRF tests to assert the gate rejects a token-less
+// wizard POST before the handler reaches the Proton login.
+func (s *stubProton) loginCalls() []stubLoginCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]stubLoginCall, len(s.calls))
+	copy(out, s.calls)
+	return out
+}
+
 // stubProtonClient is a controllable proton.Client.
 type stubProtonClient struct {
 	mu sync.Mutex
@@ -379,8 +390,25 @@ func (f *wizardFixture) usrIDFor(t *testing.T, sub string) string {
 	return u.ID
 }
 
-// post is a tiny POST helper for form-urlencoded bodies.
+// post is a tiny POST helper for form-urlencoded bodies. It attaches a
+// valid per-session CSRF token via the X-CSRF-Token header (scraped
+// from a rendered page over the same cookie jar) so the csrfProtect
+// middleware (issue #26) admits the request. This both keeps the
+// existing action/wizard/admin tests passing and exercises the HTMX
+// header-delivery path on every POST. Tests that assert the fail-closed
+// 403 use postNoCSRF instead.
+//
+// Governing: SPEC-0005 design "Content security and CSRF"; issue #26.
 func post(t *testing.T, c *http.Client, target string, values url.Values) *http.Response {
+	t.Helper()
+	resp := postNoCSRF(t, c, target, values, csrfTokenFor(t, c, target))
+	return resp
+}
+
+// postNoCSRF issues the POST with an explicit token (possibly empty or
+// wrong). An empty token sends no X-CSRF-Token header at all, which is
+// the genuine token-less shape the fail-closed tests assert on.
+func postNoCSRF(t *testing.T, c *http.Client, target string, values url.Values, token string) *http.Response {
 	t.Helper()
 	body := strings.NewReader(values.Encode())
 	req, err := http.NewRequest(http.MethodPost, target, body)
@@ -388,11 +416,42 @@ func post(t *testing.T, c *http.Client, target string, values url.Values) *http.
 		t.Fatalf("NewRequest: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if token != "" {
+		req.Header.Set("X-CSRF-Token", token)
+	}
 	resp, err := c.Do(req)
 	if err != nil {
 		t.Fatalf("POST %s: %v", target, err)
 	}
 	return resp
+}
+
+// csrfTokenFor scrapes a valid per-session CSRF token for the client
+// behind target by GETting /accounts (the navbar logout form's hidden
+// csrf_token field is present on every base-layout page). Derives the
+// scheme+host from target so it works for any of the fixtures' base
+// URLs.
+func csrfTokenFor(t *testing.T, c *http.Client, target string) string {
+	t.Helper()
+	u, err := url.Parse(target)
+	if err != nil {
+		t.Fatalf("parse target %q: %v", target, err)
+	}
+	base := u.Scheme + "://" + u.Host
+	resp, err := c.Get(base + "/accounts")
+	if err != nil {
+		t.Fatalf("GET /accounts for csrf token: %v", err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read /accounts body: %v", err)
+	}
+	tok := scrapeCSRF(string(b))
+	if tok == "" {
+		t.Fatalf("no csrf_token in /accounts body (status %d)", resp.StatusCode)
+	}
+	return tok
 }
 
 // readBody drains and closes the response body, returning the contents.

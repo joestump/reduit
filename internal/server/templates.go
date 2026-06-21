@@ -163,17 +163,23 @@ type pageData struct {
 	Title    string
 	Identity identityView
 	IsAdmin  bool
-	// CSRFToken is the per-session CSRF token. Today it protects exactly
-	// one form: base.html's navbar logout POST. It is made available on
+	// CSRFToken is the per-session CSRF token. It is made available on
 	// every base-layout page (populated centrally in renderPage so no
-	// construction site has to remember it) so any base-layout form that
-	// later needs CSRF can opt in by embedding the same hidden field --
-	// but only logout validates it at present. Extending CSRF validation
-	// to the other state-changing POSTs (wizard, account actions,
-	// rotation) is tracked as a separate issue, NOT done here. Empty on
-	// fragments (which render outside the base layout).
+	// construction site has to remember it) and consumed two ways:
 	//
-	// Governing: SPEC-0005 design "Content security and CSRF".
+	//   - base.html sets it as the X-CSRF-Token header on every HTMX
+	//     request via the <body> hx-headers attribute (the HTMX path).
+	//   - Each state-changing <form> embeds it as a hidden csrf_token
+	//     input (the no-JS path).
+	//
+	// The csrfProtect middleware (csrf.go) validates the token from
+	// EITHER source on every state-changing POST (issue #26 extended
+	// this from logout-only to all destructive POSTs). Empty on
+	// fragments (which render outside the base layout) -- fragments are
+	// only ever returned FROM an already-CSRF-validated POST, so they
+	// carry no form that needs its own token.
+	//
+	// Governing: SPEC-0005 design "Content security and CSRF"; issue #26.
 	CSRFToken string
 }
 

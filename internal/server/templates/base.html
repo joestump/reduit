@@ -62,7 +62,24 @@
   }
 </style>
 </head>
-<body class="min-h-screen flex flex-col">
+<!--
+  hx-headers on <body> injects the per-session CSRF token as the
+  X-CSRF-Token request header on EVERY HTMX request issued from any
+  descendant element (HTMX inherits hx-headers down the DOM). This is
+  how the dashboard's HTMX rotate button (and any future HTMX POST)
+  satisfies the csrfProtect middleware without a hidden form field --
+  the middleware accepts the token from this header OR the field. The
+  token is the same per-session synchronizer value the no-JS <form>
+  submits carry via the hidden csrf_token input; it lives in the
+  HttpOnly SCS session, so a cross-site attacker cannot read it to
+  forge a matching header (the value is rendered server-side here, not
+  exposed to off-origin JS). Same-origin only, so the CSP's
+  connect-src 'self' is unaffected.
+
+  Governing: SPEC-0005 design "Content security and CSRF"; ADR-0005
+  (HTMX); issue #26.
+-->
+<body class="min-h-screen flex flex-col" hx-headers='{"X-CSRF-Token": "{{.CSRFToken}}"}'>
   <!-- Top bar -->
   <header class="flex items-center justify-between px-8 py-5 border-b border-slate-700">
     <div class="flex items-center gap-3">
