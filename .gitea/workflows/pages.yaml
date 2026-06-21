@@ -1,0 +1,47 @@
+---
+# Builds the Docusaurus docs site (docs-site/) and publishes it to
+# Gitea Pages via Garage S3. Live at: https://joestump.pages.stump.rocks/reduit/
+#
+# Requires repo secrets PAGES_ACCESS_KEY_ID / PAGES_SECRET_ACCESS_KEY,
+# provisioned by stumpcloud/infra playbooks/services/pages.yaml.
+name: Deploy Docs to Gitea Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs-site/**'
+      - 'docs/adrs/**'
+      - 'docs/openspec/**'
+      - '.gitea/workflows/pages.yaml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: docs-site/package-lock.json
+
+      - name: Install dependencies
+        working-directory: docs-site
+        run: npm ci
+
+      - name: Build
+        working-directory: docs-site
+        run: npm run build
+
+      - name: Deploy to Gitea Pages
+        uses: https://gitea.stump.rocks/stumpcloud/garage-pages-deploy@v1
+        with:
+          source_dir: docs-site/build
+          access_key_id: ${{ secrets.PAGES_ACCESS_KEY_ID }}
+          secret_access_key: ${{ secrets.PAGES_SECRET_ACCESS_KEY }}

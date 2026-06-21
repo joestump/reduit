@@ -25,3 +25,6 @@ web/package-lock.json
 
 # Worktrees
 .claude/worktrees/
+
+# Docusaurus generated content (built by docs-site/scripts/, not committed)
+/docs-generated/
