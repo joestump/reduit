@@ -25,6 +25,7 @@ import (
 	"github.com/joestump/reduit/internal/imapserver"
 	"github.com/joestump/reduit/internal/mcpserver"
 	"github.com/joestump/reduit/internal/proton"
+	"github.com/joestump/reduit/internal/pubsub"
 	"github.com/joestump/reduit/internal/retention"
 	"github.com/joestump/reduit/internal/server"
 	"github.com/joestump/reduit/internal/smtpserver"
@@ -180,6 +181,35 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// so the underlying *sqlx.DB / master key stay singletons.
 	usersService := users.New(st)
 	accountService := account.New(st, masterKey)
+
+	// Status bus + transition publisher for the admin-UI SSE stream.
+	// The account service fires a post-commit callback on every
+	// lifecycle transition (suspend, reactivate, delete, ...); we
+	// republish each as a pubsub StateChanged update keyed on the
+	// account's status topic, which the SSE handler at
+	// GET /sse/accounts/{id}/status fans out to subscribed dashboard
+	// cards. The callback is bounded (a single non-blocking Publish)
+	// per the OnTransition contract. The bus is Closed on shutdown so
+	// any open SSE streams terminate cleanly.
+	//
+	// A dedicated bus (rather than the IMAP IDLE bus) keeps the status
+	// topic ("status:<id>") disjoint from the IDLE topic
+	// ("<id>:<mailbox>"); the sync supervisor and IMAP server are wired
+	// in a later milestone and will get their own bus instance.
+	//
+	// Governing: SPEC-0005 REQ "Sync Status via SSE", ADR-0005
+	// (HTMX + SSE).
+	statusBus := pubsub.New()
+	defer statusBus.Close()
+	unsubscribeStatus := accountService.OnTransition(
+		func(_ context.Context, prev, next account.State, a *account.Account) {
+			statusBus.Publish(pubsub.StatusKey(a.ID), pubsub.Update{
+				Kind: pubsub.StateChanged,
+				From: string(prev),
+				To:   string(next),
+			})
+		})
+	defer unsubscribeStatus()
 
 	// Pending-account retention sweep. The wizard creates a row in
 	// state pending_proton_setup before Proton login completes; if
@@ -364,6 +394,7 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		MCPHandler:     mcpHandler,
 		IMAPSessions:   imapSessions,
 		SMTPSessions:   smtpSessions,
+		StatusBus:      statusBus,
 	})
 
 	errCh := make(chan error, 1)

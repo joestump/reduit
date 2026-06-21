@@ -23,6 +23,7 @@ import (
 	"github.com/joestump/reduit/internal/auth"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	"github.com/joestump/reduit/internal/proton"
+	"github.com/joestump/reduit/internal/pubsub"
 	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/users"
 )
@@ -132,6 +133,19 @@ type Deps struct {
 	//
 	// Governing: ADR-0011 (reverse-proxy fronting), ADR-0009.
 	TrustedProxies []string
+	// StatusBus is the in-process pubsub bus carrying per-account
+	// status updates (lifecycle state changes today; sync-progress and
+	// error events when the sync worker grows them). The SSE handler
+	// at GET /sse/accounts/{id}/status subscribes to
+	// pubsub.StatusKey(accountID) and streams each Update to the
+	// browser. Nil disables the live stream: the SSE handler then
+	// emits only heartbeats (the connection stays open and proxy-
+	// tolerant, it just never carries a state event) so the dashboard
+	// degrades to its server-rendered badge without erroring.
+	//
+	// Governing: SPEC-0005 REQ "Sync Status via SSE", ADR-0005
+	// (HTMX + SSE).
+	StatusBus *pubsub.Bus
 }
 
 // Server holds an http.Server pre-configured with TLS and the
@@ -365,6 +379,15 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /accounts/{id}/suspend", s.handleAccountSuspend)
 	mux.HandleFunc("POST /accounts/{id}/reactivate", s.handleAccountReactivate)
 	mux.HandleFunc("POST /accounts/{id}/imap-password/rotate", s.handleAccountIMAPRotate)
+
+	// Live sync-status stream per SPEC-0005 REQ "Sync Status via SSE".
+	// Server-Sent Events keyed on the account; the dashboard subscribes
+	// per status card via the HTMX SSE extension. Gated by the same
+	// ownership check as the action handlers above (requireOwnedAccount):
+	// a non-owner, non-admin session gets 403. See sse_handlers.go.
+	//
+	// Governing: SPEC-0005 REQ "Sync Status via SSE", ADR-0005.
+	mux.HandleFunc("GET /sse/accounts/{id}/status", s.handleAccountStatusSSE)
 
 	// Embedded MCP server (per ADR-0008). The handler enforces its
 	// own bearer auth + per-account concurrency cap; the SCS session

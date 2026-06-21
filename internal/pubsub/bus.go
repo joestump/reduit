@@ -32,6 +32,16 @@ const (
 	// MessageFlagChanged indicates flags on an existing message
 	// changed (IDLE will emit FETCH with the new flags).
 	MessageFlagChanged
+	// StateChanged indicates an account's lifecycle state transitioned
+	// (e.g. active -> suspended). Carries From/To on the Update; the
+	// admin-UI SSE stream renders these to live-update the dashboard
+	// status badge. Distinct from the message-mutation kinds above so
+	// an IMAP IDLE subscriber (which keys on a per-mailbox topic) never
+	// sees it and an SSE subscriber (which keys on a per-account status
+	// topic) sees only it.
+	//
+	// Governing: SPEC-0005 REQ "Sync Status via SSE".
+	StateChanged
 )
 
 // String returns a stable, human-readable label for k. Useful for
@@ -44,6 +54,8 @@ func (k Kind) String() string {
 		return "MessageRemoved"
 	case MessageFlagChanged:
 		return "MessageFlagChanged"
+	case StateChanged:
+		return "StateChanged"
 	default:
 		return "Unknown"
 	}
@@ -58,6 +70,26 @@ type Update struct {
 	Kind      Kind
 	MessageID string
 	Flags     []string
+	// From and To carry the previous and next lifecycle state for a
+	// StateChanged update (e.g. "active", "suspended"). They are empty
+	// for the message-mutation kinds. Carried as plain strings so this
+	// package stays free of an import on internal/account (avoids an
+	// import cycle: account already depends on nothing here, and the
+	// SSE/sync packages depend on both).
+	//
+	// Governing: SPEC-0005 REQ "Sync Status via SSE".
+	From string
+	To   string
+}
+
+// StatusKey returns the canonical pubsub topic for an account's
+// admin-UI status stream. Kept distinct from the IMAP IDLE key shape
+// ("<accountID>:<mailboxID>", see internal/sync.notifyKey) so a status
+// subscriber never receives message-mutation events and vice versa.
+//
+// Governing: SPEC-0005 REQ "Sync Status via SSE".
+func StatusKey(accountID string) string {
+	return "status:" + accountID
 }
 
 // subscriber is the per-Subscribe handle held inside the bus. The
@@ -184,6 +216,16 @@ func deliver(ch chan Update, u Update) {
 			}
 		}
 	}
+}
+
+// SubscriberCount returns the number of live subscribers on key. It is
+// primarily a test/observability hook: it lets a caller assert that a
+// disconnecting SSE stream actually released its subscription (no leak)
+// rather than relying on indirect signals. Safe for concurrent use.
+func (b *Bus) SubscriberCount(key string) int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.subs[key])
 }
 
 // Close unsubscribes every subscriber and marks the bus shut down.

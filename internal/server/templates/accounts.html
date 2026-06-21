@@ -60,7 +60,21 @@
                 <div class="text-sm text-slate-400">{{.Email}}</div>
               </div>
             </div>
-            <span class="badge {{.StateBadgeClass}}">{{.StateLabel}}</span>
+            <!-- Live sync-status badge per SPEC-0005 REQ "Sync Status
+                 via SSE". The wrapper opens an SSE connection to the
+                 per-account stream; the inner span subscribes to the
+                 `status` event and swaps its own markup (outerHTML) on
+                 each state change without a full-page reload. The
+                 server renders the current badge first, so the card is
+                 correct before the first event arrives. Same-origin SSE
+                 is covered by the CSP's connect-src 'self'.
+                 Governing: SPEC-0005 REQ "Sync Status via SSE";
+                 ADR-0005 (HTMX + SSE); issue #16. -->
+            <div hx-ext="sse" sse-connect="/sse/accounts/{{.ID}}/status">
+              <span class="badge {{.StateBadgeClass}}"
+                    sse-swap="status"
+                    hx-swap="outerHTML">{{.StateLabel}}</span>
+            </div>
           </div>
           <div class="grid grid-cols-2 gap-4 pt-4 border-t border-slate-700">
             <div>

@@ -44,6 +44,7 @@ import (
 	"github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/cryptenv"
 	"github.com/joestump/reduit/internal/proton"
+	"github.com/joestump/reduit/internal/pubsub"
 	"github.com/joestump/reduit/internal/server"
 	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/users"
@@ -227,13 +228,14 @@ func (c *stubProtonClient) LatestRefreshToken() string {
 // --- fixture ------------------------------------------------------
 
 type wizardFixture struct {
-	url     string
-	idp     *fakeIdP
-	stub    *stubProton
-	wizards *server.WizardSessionStore
-	accSvc  account.Service
-	usrSvc  users.Service
-	store   *store.Store
+	url       string
+	idp       *fakeIdP
+	stub      *stubProton
+	wizards   *server.WizardSessionStore
+	accSvc    account.Service
+	usrSvc    users.Service
+	store     *store.Store
+	statusBus *pubsub.Bus
 }
 
 // newWizardFixture spins up a real httptest server with the full
@@ -241,6 +243,17 @@ type wizardFixture struct {
 // WizardSessionStore). The fixture exposes the stub manager so each
 // test can script Proton-side responses.
 func newWizardFixture(t *testing.T, ttl time.Duration) *wizardFixture {
+	t.Helper()
+	return newWizardFixtureWithWriteTimeout(t, ttl, 0)
+}
+
+// newWizardFixtureWithWriteTimeout is newWizardFixture with an explicit
+// http.Server WriteTimeout on the test server. A non-zero timeout
+// reproduces the production admin listener's absolute write deadline so
+// the SSE WriteTimeout regression test can prove the handler survives
+// it. The default httptest.NewServer sets no WriteTimeout, which is
+// exactly why the original bug slipped past the first round of tests.
+func newWizardFixtureWithWriteTimeout(t *testing.T, ttl, writeTimeout time.Duration) *wizardFixture {
 	t.Helper()
 	st := openTempStore(t)
 	master, err := cryptenv.GenerateMasterKey()
@@ -257,6 +270,22 @@ func newWizardFixture(t *testing.T, ttl time.Duration) *wizardFixture {
 	wizardSessions := server.NewWizardSessionStore(ttl)
 	t.Cleanup(wizardSessions.Stop)
 
+	// Status bus + transition publisher, mirroring cli/serve.go so the
+	// SSE handler has a live event source: every account.Transition
+	// republishes as a pubsub.StateChanged update on the account's
+	// status topic.
+	statusBus := pubsub.New()
+	t.Cleanup(statusBus.Close)
+	unsub := accSvc.OnTransition(
+		func(_ context.Context, prev, next account.State, a *account.Account) {
+			statusBus.Publish(pubsub.StatusKey(a.ID), pubsub.Update{
+				Kind: pubsub.StateChanged,
+				From: string(prev),
+				To:   string(next),
+			})
+		})
+	t.Cleanup(unsub)
+
 	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
 	if err != nil {
 		t.Fatalf("session.New: %v", err)
@@ -264,7 +293,15 @@ func newWizardFixture(t *testing.T, ttl time.Duration) *wizardFixture {
 	t.Cleanup(cleanup)
 
 	mux := http.NewServeMux()
-	srv := httptest.NewServer(mux)
+	// Use an unstarted server so we can set WriteTimeout on the
+	// underlying http.Server BEFORE it begins accepting connections --
+	// http.Server reads WriteTimeout when it sets up each accepted
+	// connection, so it must be in place before Start().
+	srv := httptest.NewUnstartedServer(mux)
+	if writeTimeout > 0 {
+		srv.Config.WriteTimeout = writeTimeout
+	}
+	srv.Start()
 	t.Cleanup(srv.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -294,18 +331,20 @@ func newWizardFixture(t *testing.T, ttl time.Duration) *wizardFixture {
 		WizardSessions:  wizardSessions,
 		AutoCreate:      true, // production default; admit fresh test subjects
 		InsecureCookies: true,
+		StatusBus:       statusBus,
 	}
 	_, handler := server.NewForTest(deps)
 	mux.Handle("/", handler)
 
 	return &wizardFixture{
-		url:     srv.URL,
-		idp:     idp,
-		stub:    stub,
-		wizards: wizardSessions,
-		accSvc:  accSvc,
-		usrSvc:  usrSvc,
-		store:   st,
+		url:       srv.URL,
+		idp:       idp,
+		stub:      stub,
+		wizards:   wizardSessions,
+		accSvc:    accSvc,
+		usrSvc:    usrSvc,
+		store:     st,
+		statusBus: statusBus,
 	}
 }
 
