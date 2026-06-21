@@ -64,6 +64,12 @@ type MailboxService interface {
 	ListMessagesInMailbox(ctx context.Context, accountID string, mailboxID int64) ([]*mailbox.MessageInMailbox, error)
 	CountMessagesInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error)
 	CountUnseenInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error)
+	// RecordPendingUnlabel durably records a MOVE source-unlabel failure
+	// so the sync-worker reconciliation pass can retry it.
+	//
+	// Governing: SPEC-0003 REQ "Moving between system folders changes
+	// Proton system flag".
+	RecordPendingUnlabel(ctx context.Context, accountID, protonMessageID, protonLabelID string) error
 }
 
 // Compile-time assertion: the production mailbox.Service MUST satisfy

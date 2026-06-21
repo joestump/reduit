@@ -5,12 +5,14 @@ package proton
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
+	"github.com/bradenaw/juniper/stream"
 )
 
 // Re-exported upstream types form the public surface of the wrapper.
@@ -79,6 +81,19 @@ type (
 	// whose LabelID matches the requested folder to populate total_count
 	// cheaply (one round-trip, no full-mailbox fetch).
 	MessageGroupCount = gpa.MessageGroupCount
+	// MessageFlag is the upstream message-flag bitfield. The IMAP APPEND
+	// path (ImportMessage) stamps Received on every appended message so
+	// Proton classifies it as an inbound message rather than a draft.
+	MessageFlag = gpa.MessageFlag
+)
+
+// MessageFlag constants re-exported for the IMAP APPEND import path.
+// ImportMessage sets MessageFlagReceived so Proton treats an appended
+// message as inbound mail (the conservative default for a client that
+// drags a message into an arbitrary folder).
+const (
+	MessageFlagReceived = gpa.MessageFlagReceived
+	MessageFlagSent     = gpa.MessageFlagSent
 )
 
 // LabelType constants re-exported so callers (the MCP list_labels tool)
@@ -276,6 +291,25 @@ type Client interface {
 	// from each message. Paired with LabelMessages by the IMAP MOVE
 	// handler to materialise the additive model.
 	UnlabelMessages(ctx context.Context, messageIDs []string, labelID string) error
+
+	// ImportMessage uploads one RFC822 message into the account's
+	// mailbox under the supplied Proton label, returning the new Proton
+	// message ID. It is the Proton side of the IMAP APPEND verb: the
+	// client uploads raw message bytes (save-to-Drafts, restore-from-
+	// backup, drag-to-folder) and Reduit imports them via
+	// /mail/v4/messages/import.
+	//
+	// The message is encrypted with the account's primary-address
+	// keyring before upload, so ImportMessage requires an unlocked
+	// session: it returns ErrNotUnlocked if Unlock has not run in this
+	// process. `unread` seeds the \Seen state (APPEND with \Seen ⇒
+	// unread=false); `internalDate` is advisory — Proton stamps its own
+	// receive time, so the returned ID is the authoritative handle.
+	//
+	// Governing: SPEC-0003 REQ "Folder Hierarchy and Mapping" — an
+	// appended message lands in exactly the destination mailbox's Proton
+	// label, mirroring how MOVE/COPY translate folder membership.
+	ImportMessage(ctx context.Context, raw []byte, labelID string, unread bool) (string, error)
 
 	// MarkMessagesRead clears the unread flag on each message. The MCP
 	// mark_read tool calls it only for messages currently unread, so the
@@ -696,6 +730,95 @@ func (c *clientImpl) UnlabelMessages(ctx context.Context, messageIDs []string, l
 	}
 	defer release()
 	return up.UnlabelMessages(ctx, messageIDs, labelID)
+}
+
+// ImportMessage encrypts `raw` with the account's primary-address
+// keyring and uploads it via /mail/v4/messages/import under `labelID`,
+// returning the new Proton message ID.
+//
+// The address selection mirrors what an APPEND must do: a Proton import
+// is anchored to a specific AddressID (the keyring used to encrypt and
+// the From-identity the message is filed under). We pick the primary
+// enabled sending address — the same address the outbox sends as — so
+// an appended Draft / restored message is filed under the user's main
+// identity rather than an alias the keyring map happens to iterate first.
+//
+// Governing: SPEC-0003 REQ "Folder Hierarchy and Mapping".
+func (c *clientImpl) ImportMessage(ctx context.Context, raw []byte, labelID string, unread bool) (string, error) {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
+	addresses, err := up.GetAddresses(ctx)
+	if err != nil {
+		return "", err
+	}
+	addrID := primarySendingAddressID(addresses)
+	if addrID == "" {
+		return "", errors.New("proton: no enabled sending address for import")
+	}
+
+	kr, err := c.keyRingFor(addrID)
+	if err != nil {
+		return "", err
+	}
+
+	req := gpa.ImportReq{
+		Metadata: gpa.ImportMetadata{
+			AddressID: addrID,
+			LabelIDs:  []string{labelID},
+			Unread:    gpa.Bool(unread),
+			// Received marks the message as inbound mail. APPEND has no
+			// notion of "is this a draft I composed vs. mail I received";
+			// Received is the safe default — it keeps the message out of
+			// Proton's "unsent draft" handling, which would otherwise let
+			// the compose UI try to (re)send a restored message.
+			Flags: gpa.MessageFlagReceived,
+		},
+		Message: raw,
+	}
+
+	// workers=1, buffer=1: APPEND imports exactly one message, so the
+	// upstream parallel-map degenerates to a single round-trip. A larger
+	// pool would only spawn idle goroutines.
+	str, err := up.ImportMessages(ctx, kr, 1, 1, req)
+	if err != nil {
+		return "", err
+	}
+	results, err := stream.Collect(ctx, str)
+	if err != nil {
+		return "", err
+	}
+	if len(results) != 1 {
+		return "", fmt.Errorf("proton: import returned %d results, want 1", len(results))
+	}
+	if results[0].Code != gpa.SuccessCode {
+		return "", fmt.Errorf("proton: import failed: %w", results[0].APIError)
+	}
+	return results[0].MessageID, nil
+}
+
+// primarySendingAddressID returns the AddressID of the primary enabled
+// sending address: the lowest-Order address that is both enabled and
+// Send-capable. Proton orders addresses with the primary at Order 1;
+// picking the lowest Order matches the address the user composes as.
+// Returns "" when no address qualifies (a disabled or receive-only
+// account cannot host an import).
+func primarySendingAddressID(addresses []gpa.Address) string {
+	bestID := ""
+	bestOrder := 0
+	for _, a := range addresses {
+		if a.Status != gpa.AddressStatusEnabled || !bool(a.Send) {
+			continue
+		}
+		if bestID == "" || a.Order < bestOrder {
+			bestID = a.ID
+			bestOrder = a.Order
+		}
+	}
+	return bestID
 }
 
 // MarkMessagesRead forwards to the upstream client.

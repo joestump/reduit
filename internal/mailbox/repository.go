@@ -402,3 +402,92 @@ WHERE mu.account_id = ? AND mu.mailbox_id = ?
 	}
 	return n, nil
 }
+
+// PendingUnlabel is one row of the pending_unlabels table — a record
+// that the IMAP MOVE handler tried and failed to remove `ProtonLabelID`
+// from `ProtonMessageID` at Proton. The sync-worker reconciliation pass
+// retries the unlabel and, on success, deletes the row.
+//
+// Governing: SPEC-0003 REQ "Moving between system folders changes Proton
+// system flag", SPEC-0003 REQ "Moving between Labels/ folders adjusts
+// labels additively".
+type PendingUnlabel struct {
+	ID              int64  `db:"id"`
+	AccountID       string `db:"account_id"`
+	ProtonMessageID string `db:"proton_message_id"`
+	ProtonLabelID   string `db:"proton_label_id"`
+	Attempts        int    `db:"attempts"`
+}
+
+// recordPendingUnlabel upserts a (account, message, label) unlabel
+// intent. Idempotent on the natural key: re-recording the same intent
+// bumps the attempts counter and refreshes updated_at rather than
+// inserting a duplicate row.
+func (r *repository) recordPendingUnlabel(ctx context.Context, accountID, protonMessageID, protonLabelID string) error {
+	const q = `
+INSERT INTO pending_unlabels (account_id, proton_message_id, proton_label_id, attempts, created_at, updated_at)
+VALUES (?, ?, ?, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+ON CONFLICT(account_id, proton_message_id, proton_label_id) DO UPDATE
+    SET attempts = pending_unlabels.attempts + 1,
+        updated_at = CURRENT_TIMESTAMP`
+	if _, err := r.writes.ExecContext(ctx, q, accountID, protonMessageID, protonLabelID); err != nil {
+		return fmt.Errorf("mailbox: record pending unlabel: %w", err)
+	}
+	return nil
+}
+
+// listPendingUnlabels returns up to `limit` pending-unlabel rows for the
+// account, oldest first (lowest id), so the reconciler drains them in
+// recording order. A non-positive limit returns all rows.
+//
+// `maxAttempts`, when positive, excludes rows whose attempts counter has
+// reached the ceiling — those are "parked" intents the reconciler has
+// given up retrying (a label deleted server-side, a non-transient 422,
+// etc.). Parking is done by filtering the SELECT rather than deleting the
+// row so a parked intent stays visible to an operator. A non-positive
+// `maxAttempts` disables the filter (returns rows at any attempt count).
+func (r *repository) listPendingUnlabels(ctx context.Context, accountID string, limit, maxAttempts int) ([]*PendingUnlabel, error) {
+	q := `
+SELECT id, account_id, proton_message_id, proton_label_id, attempts
+FROM pending_unlabels
+WHERE account_id = ?`
+	args := []any{accountID}
+	if maxAttempts > 0 {
+		q += " AND attempts < ?"
+		args = append(args, maxAttempts)
+	}
+	q += "\nORDER BY id ASC"
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	var out []*PendingUnlabel
+	if err := r.reads.SelectContext(ctx, &out, q, args...); err != nil {
+		return nil, fmt.Errorf("mailbox: list pending unlabels: %w", err)
+	}
+	return out, nil
+}
+
+// deletePendingUnlabel removes one pending-unlabel row by id (scoped to
+// the account). Called after a successful unlabel retry.
+func (r *repository) deletePendingUnlabel(ctx context.Context, accountID string, id int64) error {
+	const q = `DELETE FROM pending_unlabels WHERE id = ? AND account_id = ?`
+	if _, err := r.writes.ExecContext(ctx, q, id, accountID); err != nil {
+		return fmt.Errorf("mailbox: delete pending unlabel: %w", err)
+	}
+	return nil
+}
+
+// incrementPendingUnlabelAttempts bumps the attempts counter for a row
+// whose unlabel retry failed, so the reconciler can surface stuck
+// intents (a label that keeps failing to clear) to an operator.
+func (r *repository) incrementPendingUnlabelAttempts(ctx context.Context, accountID string, id int64) error {
+	const q = `
+UPDATE pending_unlabels
+SET attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP
+WHERE id = ? AND account_id = ?`
+	if _, err := r.writes.ExecContext(ctx, q, id, accountID); err != nil {
+		return fmt.Errorf("mailbox: bump pending unlabel attempts: %w", err)
+	}
+	return nil
+}

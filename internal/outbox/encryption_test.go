@@ -102,6 +102,9 @@ func (f *fakeProtonClient) LabelMessages(context.Context, []string, string) erro
 func (f *fakeProtonClient) UnlabelMessages(context.Context, []string, string) error {
 	panic("fakeProtonClient: UnlabelMessages not implemented")
 }
+func (f *fakeProtonClient) ImportMessage(context.Context, []byte, string, bool) (string, error) {
+	panic("fakeProtonClient: ImportMessage not implemented")
+}
 func (f *fakeProtonClient) MarkMessagesRead(context.Context, ...string) error {
 	panic("fakeProtonClient: MarkMessagesRead not implemented")
 }

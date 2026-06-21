@@ -250,6 +250,52 @@ func startTestServer(t *testing.T, accounts AccountLookup, sessions *Sessions) *
 	return &testServer{server: srv, addr: srv.LocalAddr().String()}
 }
 
+// startTestServerWithBackend is startTestServer plus the mailbox /
+// proton backends wired, so wire-shape tests (MOVE / COPY / LIST) can
+// drive the full post-auth surface over a real TCP+TLS emersion client.
+func startTestServerWithBackend(t *testing.T, accounts AccountLookup, sessions *Sessions, mboxes MailboxService, p ProtonClientLookup) *testServer {
+	t.Helper()
+	cert := generateTestCert(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	srv, err := New(Config{
+		Addr:      "127.0.0.1:0",
+		Accounts:  accounts,
+		Sessions:  sessions,
+		Mailboxes: mboxes,
+		Proton:    p,
+		Logger:    logger,
+		GetCertificate: func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return &cert, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("imapserver.New: %v", err)
+	}
+	doneCh := make(chan error, 1)
+	go func() { doneCh <- srv.Start() }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for srv.LocalAddr() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("server did not bind within 2s")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		select {
+		case <-doneCh:
+		case <-time.After(2 * time.Second):
+			t.Errorf("server.Start did not return within 2s of Shutdown")
+		}
+	})
+	return &testServer{server: srv, addr: srv.LocalAddr().String()}
+}
+
 // dialTLSClient opens a TLS connection to the test server with
 // InsecureSkipVerify; tests speak the IMAP wire protocol directly
 // against this conn so they can assert on raw bytes.

@@ -140,6 +140,15 @@ type eventProcessor struct {
 	// Governing: SPEC-0002 REQ "IMAP Update Notification".
 	publisher Publisher
 
+	// reconciler drains MOVE Phase-3 unlabel failures after each
+	// successful event batch. nil disables reconciliation; the
+	// MoveReconciler's methods are nil-safe so processOnce can call it
+	// unconditionally.
+	//
+	// Governing: SPEC-0003 REQ "Moving between system folders changes
+	// Proton system flag".
+	reconciler *MoveReconciler
+
 	// cursor is the cached event ID to pass to the next GetEvent call.
 	// Mutation is single-goroutine (only the worker.run loop calls
 	// processOnce), so no lock is required.
@@ -186,7 +195,7 @@ func (p *eventProcessor) transitionCtx() context.Context {
 //
 // Governing: SPEC-0002 REQ "Event Cursor Persistence" (Resume on
 // startup uses persisted cursor).
-func newEventProcessor(ctx context.Context, accountID string, svc account.Service, client proton.Client, logger *slog.Logger, publisher Publisher) (*eventProcessor, error) {
+func newEventProcessor(ctx context.Context, accountID string, svc account.Service, client proton.Client, logger *slog.Logger, publisher Publisher, reconciler *MoveReconciler) (*eventProcessor, error) {
 	if publisher == nil {
 		publisher = nopPublisher{}
 	}
@@ -198,12 +207,13 @@ func newEventProcessor(ctx context.Context, accountID string, svc account.Servic
 			slog.String("cursor", state.LastEventID),
 		)
 		return &eventProcessor{
-			accountID: accountID,
-			svc:       svc,
-			client:    client,
-			logger:    logger,
-			publisher: publisher,
-			cursor:    state.LastEventID,
+			accountID:  accountID,
+			svc:        svc,
+			client:     client,
+			logger:     logger,
+			publisher:  publisher,
+			reconciler: reconciler,
+			cursor:     state.LastEventID,
 		}, nil
 	case errors.Is(err, account.ErrNoSyncState):
 		// First-ever boot: ask Proton for the "now" cursor so we
@@ -220,12 +230,13 @@ func newEventProcessor(ctx context.Context, accountID string, svc account.Servic
 			slog.String("cursor", latest),
 		)
 		return &eventProcessor{
-			accountID: accountID,
-			svc:       svc,
-			client:    client,
-			logger:    logger,
-			publisher: publisher,
-			cursor:    latest,
+			accountID:  accountID,
+			svc:        svc,
+			client:     client,
+			logger:     logger,
+			publisher:  publisher,
+			reconciler: reconciler,
+			cursor:     latest,
 		}, nil
 	default:
 		return nil, err
@@ -399,6 +410,28 @@ func (p *eventProcessor) processOnce(ctx context.Context) (bool, error) {
 	//
 	// Governing: SPEC-0002 REQ "IMAP Update Notification".
 	p.publishMessageEvents(events)
+
+	// Drain any MOVE Phase-3 (source unlabel) failures recorded by the
+	// IMAP server. We do this after the cursor commit + publish so a
+	// reconciliation Proton call never sits on the critical path of
+	// advancing the event cursor — a flaky reconcile must not stall event
+	// processing. The reconciler is nil-safe; reconciliation errors are
+	// logged inside Reconcile and do NOT fail processOnce (they are not a
+	// reason to walk the backoff curve or block the next event batch).
+	//
+	// Governing: SPEC-0003 REQ "Moving between system folders changes
+	// Proton system flag".
+	if resolved, rerr := p.reconciler.Reconcile(ctx, p.accountID, p.client); rerr != nil {
+		p.logger.LogAttrs(ctx, slog.LevelWarn,
+			"sync: move reconciliation pass failed to read pending unlabels",
+			slog.String("err", rerr.Error()),
+		)
+	} else if resolved > 0 {
+		p.logger.LogAttrs(ctx, slog.LevelInfo,
+			"sync: move reconciliation cleared stuck source labels",
+			slog.Int("resolved", resolved),
+		)
+	}
 	return more, nil
 }
 

@@ -26,6 +26,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -364,16 +365,262 @@ func (s *session) Status(name string, options *imap.StatusOptions) (*imap.Status
 	return data, nil
 }
 
-func (s *session) Append(_ string, _ imap.LiteralReader, _ *imap.AppendOptions) (*imap.AppendData, error) {
-	// APPEND is the inbound write path: clients use it for save-to-
-	// Drafts, restore-from-backup (imapsync, offlineimap), and
-	// drag-to-folder workflows. It is independent from SMTP submission
-	// (#22, the *outbound* path) and lands in its own story.
-	//
-	// Tracking issue: #44 — IMAP APPEND support. While APPEND is
-	// unimplemented, Apple Mail's save-to-Drafts pops a "Could not save
-	// to Drafts" alert and `imapsync` migrations cannot complete.
-	return nil, errMailboxReadOnly
+// appendMaxLiteralBytes caps the size of an APPEND literal Reduit will
+// buffer in memory before encrypt + import. Proton's import endpoint
+// rejects messages over ~50 MiB (proton.MaxImportSize accounts for the
+// ~33% base64 overhead on top); we reject earlier at the raw-byte
+// boundary so a hostile client cannot make us buffer an unbounded
+// literal before the upstream size check fires. 50 MiB of raw bytes is
+// already past what Proton accepts post-encoding, so this is a generous
+// ceiling, not a new restriction.
+const appendMaxLiteralBytes = 50 * 1024 * 1024
+
+// AppendLimit implements emersion's optional SessionAppendLimit
+// interface. Returning a non-zero limit makes the server advertise
+// `APPENDLIMIT=<n>` in CAPABILITY (RFC 7889) AND makes emersion reject an
+// oversized APPEND literal with `[TOOBIG]` BEFORE the client streams the
+// body — so a client learns the ceiling up front and gets an early
+// rejection instead of uploading up to 50 MiB only to be refused.
+//
+// The value is the same appendMaxLiteralBytes the Append handler enforces
+// as a defense-in-depth second check (a hostile LiteralReader could
+// under-report Size()). appendMaxLiteralBytes fits in a uint32 (50 MiB ≪
+// 4 GiB), so the conversion is lossless.
+//
+// Governing: SPEC-0003 REQ "Folder Hierarchy and Mapping".
+func (s *session) AppendLimit() uint32 {
+	return uint32(appendMaxLiteralBytes)
+}
+
+// Append implements the IMAP APPEND verb: a client uploads a full
+// RFC822 message into the named mailbox. Reduit translates this into a
+// Proton import under the destination mailbox's label, then materialises
+// the imported message into local mailbox state so the new UID is
+// returned in the APPENDUID response (RFC 4315) and the message is
+// immediately visible to a subsequent SELECT/FETCH.
+//
+// Clients use APPEND for save-to-Drafts (Apple Mail), restore-from-
+// backup (imapsync / offlineimap), and drag-to-folder. It is the inbound
+// counterpart to SMTP submission (the outbound path) and is independent
+// of it.
+//
+// Order of operations (import-before-materialise, mirroring MOVE/COPY's
+// "Proton authoritative, local mirror follows"):
+//  1. Resolve the destination mailbox (account-scoped). A non-owned or
+//     unknown name returns the byte-identical not-found response.
+//  2. Read the literal into memory (bounded by appendMaxLiteralBytes).
+//  3. ImportMessage at Proton under the mailbox's label. On failure,
+//     nothing has touched local state, so we surface a transient NO and
+//     the client retries the whole APPEND.
+//  4. Upsert the message row + AssignUID in the destination mailbox.
+//     The assigned UID is the APPENDUID.
+//
+// Deferred (reported precisely): APPEND does not yet round-trip the
+// supplied \Answered / \Flagged / \Draft flags or the client InternalDate
+// onto Proton beyond the unread (\Seen) bit and the import's own receive
+// time — Proton's import metadata models neither IMAP keywords nor a
+// caller-chosen internal date. The flags the client sent ARE persisted
+// on the local message row so a same-session FETCH reflects them; they
+// are reconciled to Proton's authoritative view on the next sync.
+//
+// Governing: SPEC-0003 REQ "Folder Hierarchy and Mapping" — the appended
+// message lands in exactly the destination mailbox's Proton label, the
+// same translation MOVE/COPY use; SPEC-0003 REQ "Account Isolation in
+// IMAP Operations" — an APPEND to a non-owned mailbox is indistinguishable
+// from a genuine not-found.
+func (s *session) Append(mailboxName string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
+	if s.backend.mailboxes == nil || s.backend.proton == nil {
+		// Without both the mailbox store and the Proton client there is
+		// no path to durably accept the message; refuse rather than
+		// silently dropping the upload.
+		return nil, errMailboxReadOnly
+	}
+	acctID := s.snapshotAccountID()
+	if acctID == "" {
+		return nil, errMailboxNotFound
+	}
+
+	// Resolve the destination FIRST so a non-owned / unknown mailbox is
+	// rejected before we buffer the (potentially large) literal. The
+	// literal still has to be drained for the protocol to stay in sync,
+	// but emersion drains any unread literal bytes when the handler
+	// returns an error, so an early return here is safe.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	destMbox, err := s.backend.mailboxes.GetMailboxByName(ctx, acctID, mailboxName)
+	if err != nil {
+		return nil, errMailboxNotFound
+	}
+
+	if r.Size() > appendMaxLiteralBytes {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeTooBig,
+			Text: "Message too large",
+		}
+	}
+
+	raw, err := readLiteral(r, appendMaxLiteralBytes)
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap append literal read failed",
+			slog.String("account_id", acctID),
+			slog.String("mailbox", mailboxName),
+			slog.String("err", err.Error()))
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Could not read appended message",
+		}
+	}
+
+	// \Seen in the supplied flags ⇒ the message is already read ⇒ import
+	// as NOT unread. Absent \Seen, import unread (the default for newly-
+	// delivered mail).
+	unread := !appendFlagsHaveSeen(options)
+
+	cli, err := s.protonClient(ctx, acctID)
+	if err != nil {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Cannot reach Proton; try again",
+		}
+	}
+
+	protonID, err := cli.ImportMessage(ctx, raw, destMbox.ProtonLabelID, unread)
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap append proton import failed",
+			slog.String("account_id", acctID),
+			slog.String("mailbox", mailboxName),
+			slog.String("dest_label", destMbox.ProtonLabelID),
+			slog.String("err", err.Error()))
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Proton import failed",
+		}
+	}
+
+	// Materialise locally. Proton is now the source of truth (the message
+	// exists there); a failure to mirror it locally is logged but does
+	// NOT fail the APPEND — the next sync round will materialise the row
+	// and assign a UID. We only lose the APPENDUID optimisation in that
+	// case, which RFC 4315 permits the server to omit.
+	internalDate := time.Now().UTC()
+	if options != nil && !options.Time.IsZero() {
+		internalDate = options.Time.UTC()
+	}
+	mid, err := s.backend.mailboxes.UpsertMessage(ctx, &mailbox.Message{
+		AccountID:       acctID,
+		ProtonMessageID: protonID,
+		RFC822Size:      int64(len(raw)),
+		Flags:           encodeFlags(appendFlags(options)),
+		InternalDate:    internalDate,
+	})
+	if err != nil {
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap append local upsert failed; relying on next sync",
+			slog.String("account_id", acctID),
+			slog.String("proton_message_id", protonID),
+			slog.String("err", err.Error()))
+		return &imap.AppendData{UIDValidity: destMbox.UIDValidity}, nil
+	}
+	uid, err := s.backend.mailboxes.AssignUID(ctx, acctID, destMbox.ID, mid)
+	if err != nil {
+		// The most common cause here is a DUPLICATE APPEND: the same
+		// message imported (or re-imported, e.g. an idempotent client
+		// retry) is already linked to this mailbox, so the
+		// (mailbox_id, message_id) UNIQUE index refuses a second UID. In
+		// that case the message is already fully materialised at its
+		// existing UID — there is nothing for sync to fix; we simply omit
+		// the APPENDUID (RFC 4315 makes APPENDUID optional) and return a
+		// bare OK. A genuinely transient AssignUID failure (UID exhaustion,
+		// DB hiccup) lands here too and is equally safe: the message row
+		// exists and the next sync round will link it. Either way APPEND
+		// succeeds; only the APPENDUID optimisation is lost.
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap append uid assign skipped; message already present or transient error, omitting APPENDUID",
+			slog.String("account_id", acctID),
+			slog.Int64("dest_mailbox_id", destMbox.ID),
+			slog.Int64("message_id", mid),
+			slog.String("err", err.Error()))
+		return &imap.AppendData{UIDValidity: destMbox.UIDValidity}, nil
+	}
+
+	return &imap.AppendData{
+		UID:         imap.UID(uid),
+		UIDValidity: destMbox.UIDValidity,
+	}, nil
+}
+
+// readLiteral reads up to limit+1 bytes from r and returns an error if
+// the stream exceeds limit. The +1 read lets us distinguish "exactly
+// limit bytes" (accepted) from "more than limit" (rejected) without a
+// second Size() check, since a hostile LiteralReader could under-report
+// Size().
+func readLiteral(r imap.LiteralReader, limit int64) ([]byte, error) {
+	buf := make([]byte, 0, clampCap(r.Size(), limit))
+	tmp := make([]byte, 32*1024)
+	var total int64
+	for {
+		n, err := r.Read(tmp)
+		if n > 0 {
+			total += int64(n)
+			if total > limit {
+				return nil, errors.New("imapserver: append literal exceeds size limit")
+			}
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return buf, nil
+			}
+			return nil, err
+		}
+	}
+}
+
+// clampCap returns a sane initial capacity for the literal buffer:
+// the reported size when it is positive and within the limit, else a
+// small default so an under/over-reported Size() does not let a client
+// trick us into a giant up-front allocation.
+func clampCap(size, limit int64) int {
+	if size <= 0 || size > limit {
+		return 64 * 1024
+	}
+	return int(size)
+}
+
+// appendFlags returns the flags the client supplied with APPEND, or nil.
+func appendFlags(options *imap.AppendOptions) []imap.Flag {
+	if options == nil {
+		return nil
+	}
+	return options.Flags
+}
+
+// appendFlagsHaveSeen reports whether the APPEND flag set includes
+// \Seen.
+func appendFlagsHaveSeen(options *imap.AppendOptions) bool {
+	for _, f := range appendFlags(options) {
+		if f == imap.FlagSeen {
+			return true
+		}
+	}
+	return false
+}
+
+// encodeFlags serialises a flag slice into the comma-separated form the
+// messages.flags column stores. It is the inverse of decodeFlags.
+func encodeFlags(flags []imap.Flag) string {
+	if len(flags) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(flags))
+	for _, f := range flags {
+		s := strings.TrimSpace(string(f))
+		if s == "" {
+			continue
+		}
+		parts = append(parts, s)
+	}
+	return strings.Join(parts, ",")
 }
 
 // idleTimeout is the IDLE session duration before the server emits
@@ -1265,16 +1512,23 @@ type movePair struct {
 // dropped — the client retries the whole operation.
 //
 // Order of operations:
+//  0. If destination == the already-selected source mailbox, no-op: keep
+//     the existing UIDs, touch neither local state nor Proton.
 //  1. Resolve src + dest mailboxes, snapshot the matching message set.
 //  2. AssignUID in the destination for every match. On any failure,
 //     roll back the partial assignments and return NO; Proton state is
 //     untouched.
 //  3. LabelMessages(dest) at Proton. On failure, roll back local UID
 //     assignments and return NO.
-//  4. UnlabelMessages(src) at Proton. Failure here is logged but does
-//     NOT abort: the destination is durably labelled and the client
-//     sees the move from the IMAP side; the next sync round reconciles.
-//  5. Drop the source-mailbox links locally.
+//  4. UnlabelMessages(src) at Proton. On failure, record the pending
+//     unlabel for sync-worker reconciliation and ABORT with NO — we do
+//     NOT drop the local source links, so the client never receives a
+//     COPYUID+EXPUNGE that claims success while Proton still has the
+//     message in the source.
+//  5. Drop the source-mailbox links locally. Any per-message removal
+//     failure excludes that message from the success set and turns the
+//     whole MOVE into a NO so the client re-syncs rather than acting on a
+//     partial COPYUID+EXPUNGE.
 func (s *session) performMove(numSet imap.NumSet, dest string) (*moveResult, error) {
 	if s.backend.mailboxes == nil {
 		return nil, errMailboxNotFound
@@ -1297,6 +1551,24 @@ func (s *session) performMove(numSet imap.NumSet, dest string) (*moveResult, err
 	destMbox, err := s.backend.mailboxes.GetMailboxByName(ctx, acctID, dest)
 	if err != nil {
 		return nil, errMailboxNotFound
+	}
+
+	// Same-source==destination no-op. A client that MOVEs into the
+	// already-selected mailbox (Apple Mail occasionally does this when a
+	// drag lands back on the origin folder) must NOT allocate fresh UIDs
+	// or issue redundant Proton label add/remove pairs — labelling then
+	// unlabelling the same Proton label would race the message out of the
+	// mailbox entirely. We treat it as a successful empty move: the
+	// messages keep their existing UIDs, so we report those as both the
+	// source and destination UID sets and emit no EXPUNGE (the messages
+	// did not leave). RFC 6851 does not forbid a same-mailbox MOVE; the
+	// conservative, side-effect-free interpretation is a no-op.
+	//
+	// Governing: SPEC-0003 REQ "UID Stability" — a UID is assigned once
+	// and never reused; a self-MOVE must not mint a second UID for a
+	// message already in the mailbox.
+	if destMbox.ID == src.ID {
+		return s.selfMoveResult(ctx, acctID, src, numSet)
 	}
 
 	cli, err := s.protonClient(ctx, acctID)
@@ -1375,34 +1647,87 @@ func (s *session) performMove(numSet imap.NumSet, dest string) (*moveResult, err
 	}
 
 	// Phase 3: remove the source label at Proton. If this fails the
-	// message is in BOTH mailboxes — the Proton model treats that as
-	// legitimate (additive labels) so the client sees a stable state,
-	// just not the one it asked for. Log loudly; the sync worker (#46)
-	// will retry the unlabel and reconcile. We do NOT abort here because
-	// Phase 2 already committed Proton state, and the IMAP-visible move
-	// is durable on the destination side.
+	// message is in BOTH mailboxes on PROTON — the additive-label model
+	// treats that as legitimate, so Proton is internally consistent, just
+	// not in the state the client asked for. We record the failed-unlabel
+	// intent so the sync-worker reconciliation pass (reconcileMoves) can
+	// retry the unlabel; that is the only place the "this label should be
+	// gone" intent is durably captured, since the next Proton sync event
+	// would otherwise re-materialise the source link and leave the message
+	// stuck in two mailboxes forever.
+	//
+	// Critically, we do NOT proceed to drop the local source links when
+	// Phase 3 failed: dropping them would tell the client (via EXPUNGE)
+	// that the message left the source, while Proton still has it labelled
+	// there — the exact COPYUID-says-success / source-still-has-it
+	// divergence this issue closes. Instead we abort with NO so the client
+	// re-syncs and sees the true (two-mailbox) state; reconciliation then
+	// converges it to the requested single-mailbox state.
+	//
+	// Governing: SPEC-0003 REQ "Moving between system folders changes
+	// Proton system flag", SPEC-0003 REQ "Moving between Labels/ folders
+	// adjusts labels additively".
 	if err := cli.UnlabelMessages(ctx, protonIDs, src.ProtonLabelID); err != nil {
-		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap move remove label failed",
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "imap move remove label failed; recording for reconciliation",
 			slog.String("account_id", acctID),
 			slog.String("src_label", src.ProtonLabelID),
 			slog.String("err", err.Error()))
+		s.recordPendingUnlabel(ctx, acctID, src.ProtonLabelID, protonIDs)
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Move partially applied; resync to converge",
+		}
 	}
 
 	// Phase 4: drop the source-mailbox links for every successfully-
 	// assigned pair. Pre-allocation in Phase 1 means every match has a
 	// destination UID, so every match's source link should drop.
+	//
+	// A removal that fails here leaves the message linked to BOTH mailboxes
+	// LOCALLY while Proton has already dropped the source label (Phase 3
+	// committed). Telling the client that message was EXPUNGEd from the
+	// source (which a COPYUID + EXPUNGE response asserts) would be a lie:
+	// the local source link is still present, so a re-SELECT would show the
+	// message back in the source. We therefore EXCLUDE any message whose
+	// source-link removal failed from the result set, and if ANY failed we
+	// surface NO so the client re-syncs the whole mailbox and observes the
+	// true state rather than acting on a partial success. The messages that
+	// DID drop are durably moved; the failed ones are reconciled by the
+	// next sync round (Proton already unlabelled them, so the source link
+	// will be cleaned up when the sync worker reconciles local state).
 	srcUIDs := make([]uint32, 0, len(matches))
 	srcSeqs := make([]uint32, 0, len(matches))
+	removeFailed := false
 	for _, m := range matches {
+		// A (false, nil) return — no error, but no row removed — means the
+		// source link was already gone (a concurrent EXPUNGE or a prior
+		// retry). That is still the desired end state, so we count it as a
+		// successful drop and report the message in the EXPUNGE set. Only a
+		// non-nil error (the store could not perform the delete) is a
+		// failure.
 		if _, err := s.backend.mailboxes.RemoveMessageFromMailbox(ctx, acctID, src.ID, m.messageID); err != nil {
+			removeFailed = true
 			s.logger.LogAttrs(ctx, slog.LevelWarn, "imap move source remove failed",
 				slog.String("account_id", acctID),
 				slog.Int64("src_mailbox_id", src.ID),
 				slog.Int64("message_id", m.messageID),
 				slog.String("err", err.Error()))
+			continue
 		}
 		srcUIDs = append(srcUIDs, m.uid)
 		srcSeqs = append(srcSeqs, m.seqNum)
+	}
+
+	if removeFailed {
+		// Proton state is correct (dest labelled, src unlabelled) but the
+		// local mirror could not fully drop the source links. Refusing
+		// with NO is the only coherent answer: a COPYUID + EXPUNGE here
+		// would claim every message left the source, which is false for
+		// the ones whose link survived. The client re-syncs and converges.
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Move partially applied; resync to converge",
+		}
 	}
 
 	return &moveResult{
@@ -1411,6 +1736,62 @@ func (s *session) performMove(numSet imap.NumSet, dest string) (*moveResult, err
 		destUIDs:        destUIDs,
 		srcSeqNums:      srcSeqs,
 	}, nil
+}
+
+// selfMoveResult is the no-op path for a MOVE whose destination is the
+// already-selected mailbox. It returns the existing UIDs of the matched
+// messages as both the source and destination UID sets (the UIDs do not
+// change) and an empty srcSeqNums slice so the Move wire layer emits a
+// COPYUID with no EXPUNGE — the messages never left the mailbox.
+//
+// Governing: SPEC-0003 REQ "UID Stability".
+func (s *session) selfMoveResult(ctx context.Context, acctID string, src *mailbox.Mailbox, numSet imap.NumSet) (*moveResult, error) {
+	srcMsgs, err := s.backend.mailboxes.ListMessagesInMailbox(ctx, acctID, src.ID)
+	if err != nil {
+		return nil, errMailboxNotFound
+	}
+	uids := make([]uint32, 0)
+	for i, m := range srcMsgs {
+		seqNum := uint32(i + 1)
+		if !numSetContains(numSet, seqNum, m.UID) {
+			continue
+		}
+		uids = append(uids, m.UID)
+	}
+	return &moveResult{
+		destUIDValidity: src.UIDValidity,
+		srcUIDs:         uids,
+		destUIDs:        uids,
+		// srcSeqNums intentionally empty: nothing is expunged from the
+		// source because the message never left it.
+		srcSeqNums: nil,
+	}, nil
+}
+
+// recordPendingUnlabel durably records, for every message in protonIDs,
+// that the MOVE Phase-3 source unlabel of `srcLabelID` failed at Proton.
+// The sync-worker reconciliation pass (internal/sync) drains these and
+// retries the unlabel so the message does not stay stuck in two
+// mailboxes. Each record is best-effort: a failure to record is logged
+// but does not change the (already-decided) NO response to the client —
+// the worst case if recording fails is that the next Proton sync event
+// re-materialises the source link and the message stays in two mailboxes
+// until a later MOVE attempt, which is no worse than the pre-issue
+// behaviour.
+//
+// Governing: SPEC-0003 REQ "Moving between system folders changes Proton
+// system flag", SPEC-0003 REQ "Moving between Labels/ folders adjusts
+// labels additively".
+func (s *session) recordPendingUnlabel(ctx context.Context, accountID, srcLabelID string, protonIDs []string) {
+	for _, pid := range protonIDs {
+		if err := s.backend.mailboxes.RecordPendingUnlabel(ctx, accountID, pid, srcLabelID); err != nil {
+			s.logger.LogAttrs(ctx, slog.LevelWarn, "imap move: failed to record pending unlabel for reconciliation",
+				slog.String("account_id", accountID),
+				slog.String("proton_message_id", pid),
+				slog.String("src_label", srcLabelID),
+				slog.String("err", err.Error()))
+		}
+	}
 }
 
 // rollbackMoveAssignments undoes a partial set of AssignUID inserts

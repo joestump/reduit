@@ -115,7 +115,7 @@ func (w *worker) start() {
 		w.bootstrapFailed()
 		return
 	}
-	proc, err := newEventProcessor(w.ctx, w.id, w.sup.svc, client, w.logger, w.sup.cfg.Publisher)
+	proc, err := newEventProcessor(w.ctx, w.id, w.sup.svc, client, w.logger, w.sup.cfg.Publisher, w.sup.cfg.Reconciler)
 	if err != nil {
 		w.logger.LogAttrs(w.ctx, slog.LevelError,
 			"sync: event processor bootstrap failed; worker will not run",

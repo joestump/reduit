@@ -208,6 +208,9 @@ func (c *stubProtonClient) LabelMessages(context.Context, []string, string) erro
 func (c *stubProtonClient) UnlabelMessages(context.Context, []string, string) error {
 	panic("unexpected")
 }
+func (c *stubProtonClient) ImportMessage(context.Context, []byte, string, bool) (string, error) {
+	panic("unexpected")
+}
 func (c *stubProtonClient) MarkMessagesRead(context.Context, ...string) error {
 	panic("unexpected")
 }

@@ -110,6 +110,9 @@ func (f *fakeProtonClient) LabelMessages(context.Context, []string, string) erro
 func (f *fakeProtonClient) UnlabelMessages(context.Context, []string, string) error {
 	panic("UnlabelMessages: unexpected call")
 }
+func (f *fakeProtonClient) ImportMessage(context.Context, []byte, string, bool) (string, error) {
+	panic("ImportMessage: unexpected call")
+}
 func (f *fakeProtonClient) MarkMessagesRead(context.Context, ...string) error {
 	panic("MarkMessagesRead: unexpected call")
 }
@@ -145,7 +148,7 @@ func TestEventProcessorBootstrapFromLatestOnFirstBoot(t *testing.T) {
 	a := createTestAccount(t, svc, usrSvc, "sub-bootstrap")
 
 	fc := &fakeProtonClient{latest: "evt-current"}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -181,7 +184,7 @@ func TestEventProcessorResumesFromPersistedCursor(t *testing.T) {
 	}
 
 	fc := &fakeProtonClient{latest: "evt-fresh-should-not-be-used"}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -216,7 +219,7 @@ func TestEventProcessorAdvancesCursorAfterBatch(t *testing.T) {
 	a := createTestAccount(t, svc, usrSvc, "sub-advance")
 
 	fc := &fakeProtonClient{latest: "evt-0"}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -279,7 +282,7 @@ func TestEventProcessorEmptyBatchKeepsCursor(t *testing.T) {
 			return nil, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -331,7 +334,7 @@ func TestEventProcessorRestartResumesFromPersistedCursor(t *testing.T) {
 			return []proton.Event{{EventID: "evt-A1"}}, false, nil
 		},
 	}
-	procA, err := newEventProcessor(ctx, a.ID, svc, fcA, nopLogger(), nil)
+	procA, err := newEventProcessor(ctx, a.ID, svc, fcA, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("Process A bootstrap: %v", err)
 	}
@@ -351,7 +354,7 @@ func TestEventProcessorRestartResumesFromPersistedCursor(t *testing.T) {
 			return nil, false, nil
 		},
 	}
-	procB, err := newEventProcessor(ctx, a.ID, svc, fcB, nopLogger(), nil)
+	procB, err := newEventProcessor(ctx, a.ID, svc, fcB, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("Process B bootstrap: %v", err)
 	}
@@ -387,7 +390,7 @@ func TestEventProcessorPropagatesGetEventError(t *testing.T) {
 			return nil, false, wantErr
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -542,7 +545,7 @@ func TestEventProcessorRecoversFromStaleCursor(t *testing.T) {
 			return nil, false, staleErr
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -594,7 +597,7 @@ func TestEventProcessorRejectsEmptyTrailingEventID(t *testing.T) {
 			}, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}

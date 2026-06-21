@@ -102,6 +102,9 @@ func (stubClient) LabelMessages(context.Context, []string, string) error {
 func (stubClient) UnlabelMessages(context.Context, []string, string) error {
 	panic("stubClient.UnlabelMessages: lifecycle tests must not reach Proton")
 }
+func (stubClient) ImportMessage(context.Context, []byte, string, bool) (string, error) {
+	panic("stubClient.ImportMessage: lifecycle tests must not reach Proton")
+}
 func (stubClient) MarkMessagesRead(context.Context, ...string) error {
 	panic("stubClient.MarkMessagesRead: lifecycle tests must not reach Proton")
 }

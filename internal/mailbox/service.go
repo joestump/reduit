@@ -71,6 +71,32 @@ type Service interface {
 	// mailbox that do NOT carry the `\Seen` flag. Used by Session.Status
 	// to report an accurate STATUS NumUnseen.
 	CountUnseenInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error)
+
+	// RecordPendingUnlabel durably records that an IMAP MOVE failed to
+	// remove protonLabelID from protonMessageID at Proton, so the
+	// sync-worker reconciliation pass can retry it. Idempotent on the
+	// (account, message, label) natural key.
+	//
+	// Governing: SPEC-0003 REQ "Moving between system folders changes
+	// Proton system flag".
+	RecordPendingUnlabel(ctx context.Context, accountID, protonMessageID, protonLabelID string) error
+
+	// ListPendingUnlabels returns up to `limit` recorded unlabel intents
+	// for the account, oldest first. limit<=0 returns all. `maxAttempts`,
+	// when positive, excludes "parked" rows whose attempts counter has
+	// reached the ceiling — those are intents the reconciler has given up
+	// retrying, kept only for operator visibility. maxAttempts<=0 returns
+	// rows at any attempt count. Used by the reconciliation pass to drive
+	// its retry loop.
+	ListPendingUnlabels(ctx context.Context, accountID string, limit, maxAttempts int) ([]*PendingUnlabel, error)
+
+	// ResolvePendingUnlabel deletes a pending-unlabel row after a
+	// successful retry. Scoped to the account.
+	ResolvePendingUnlabel(ctx context.Context, accountID string, id int64) error
+
+	// FailPendingUnlabel bumps the attempts counter for a row whose retry
+	// failed, leaving the row for a later pass.
+	FailPendingUnlabel(ctx context.Context, accountID string, id int64) error
 }
 
 type service struct {
@@ -224,4 +250,23 @@ func (s *service) CountMessagesInMailbox(ctx context.Context, accountID string, 
 
 func (s *service) CountUnseenInMailbox(ctx context.Context, accountID string, mailboxID int64) (uint32, error) {
 	return s.repo.countUnseenInMailbox(ctx, accountID, mailboxID)
+}
+
+func (s *service) RecordPendingUnlabel(ctx context.Context, accountID, protonMessageID, protonLabelID string) error {
+	if accountID == "" || protonMessageID == "" || protonLabelID == "" {
+		return errors.New("mailbox: RecordPendingUnlabel requires accountID, protonMessageID, protonLabelID")
+	}
+	return s.repo.recordPendingUnlabel(ctx, accountID, protonMessageID, protonLabelID)
+}
+
+func (s *service) ListPendingUnlabels(ctx context.Context, accountID string, limit, maxAttempts int) ([]*PendingUnlabel, error) {
+	return s.repo.listPendingUnlabels(ctx, accountID, limit, maxAttempts)
+}
+
+func (s *service) ResolvePendingUnlabel(ctx context.Context, accountID string, id int64) error {
+	return s.repo.deletePendingUnlabel(ctx, accountID, id)
+}
+
+func (s *service) FailPendingUnlabel(ctx context.Context, accountID string, id int64) error {
+	return s.repo.incrementPendingUnlabelAttempts(ctx, accountID, id)
 }

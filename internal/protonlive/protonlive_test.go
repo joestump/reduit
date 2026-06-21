@@ -92,7 +92,10 @@ func (f *fakeClient) LabelMessages(context.Context, []string, string) error   { 
 func (f *fakeClient) UnlabelMessages(context.Context, []string, string) error { return nil }
 func (f *fakeClient) MarkMessagesRead(context.Context, ...string) error       { return nil }
 func (f *fakeClient) MarkMessagesUnread(context.Context, ...string) error     { return nil }
-func (f *fakeClient) LatestRefreshToken() string                              { return "" }
+func (f *fakeClient) ImportMessage(context.Context, []byte, string, bool) (string, error) {
+	return "", nil
+}
+func (f *fakeClient) LatestRefreshToken() string { return "" }
 
 var _ proton.Client = (*fakeClient)(nil)
 

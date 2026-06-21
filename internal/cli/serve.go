@@ -396,8 +396,18 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// passed via server.Deps.IMAPSessions so the drop path is live as
 	// soon as any real IMAP sessions register themselves.
 	//
+	// TODO(serve-wiring): when imapserver.New AND the sync Supervisor are
+	// wired here, the sync.Config MUST set Reconciler =
+	// sync.NewMoveReconciler(mailbox.New(st), logger). The IMAP MOVE
+	// handler records `pending_unlabels` rows when a Proton source-unlabel
+	// fails; the MoveReconciler is the ONLY drainer for that table. Wiring
+	// the IMAP server without the reconciler would let those rows
+	// accumulate and leave messages stuck in two mailboxes.
+	//
 	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials",
-	// REQ "Admin Account Management".
+	// REQ "Admin Account Management",
+	// SPEC-0003 REQ "Moving between system folders changes Proton system
+	// flag".
 	imapSessions := imapserver.NewSessions()
 
 	// SMTP session registry — mirrors imapSessions. SPEC-0005 requires

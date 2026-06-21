@@ -20,6 +20,7 @@ package imapserver
 import (
 	"context"
 	"errors"
+	"io"
 	"math"
 	"path/filepath"
 	"strings"
@@ -113,6 +114,21 @@ type fakeProton struct {
 	// GetMessageRFC822 so a test can assert lazy fetch happened exactly
 	// when expected.
 	bodyFetches []string
+
+	// imports records every ImportMessage call so the APPEND tests can
+	// assert the destination label + unread flag. importID is the Proton
+	// message ID ImportMessage returns (default a fixed sentinel);
+	// importErr, when set, is returned instead so a test can exercise the
+	// APPEND Proton-failure branch.
+	imports   []importCall
+	importID  string
+	importErr error
+}
+
+type importCall struct {
+	labelID string
+	unread  bool
+	raw     []byte
 }
 
 type protonCall struct {
@@ -205,6 +221,21 @@ func (c *fakeProtonClient) LabelMessages(_ context.Context, msgIDs []string, lab
 func (c *fakeProtonClient) UnlabelMessages(_ context.Context, msgIDs []string, labelID string) error {
 	c.parent.record("unlabel", labelID, msgIDs)
 	return nil
+}
+func (c *fakeProtonClient) ImportMessage(_ context.Context, raw []byte, labelID string, unread bool) (string, error) {
+	c.parent.mu.Lock()
+	defer c.parent.mu.Unlock()
+	if c.parent.importErr != nil {
+		return "", c.parent.importErr
+	}
+	cp := make([]byte, len(raw))
+	copy(cp, raw)
+	c.parent.imports = append(c.parent.imports, importCall{labelID: labelID, unread: unread, raw: cp})
+	id := c.parent.importID
+	if id == "" {
+		id = "proton-imported-1"
+	}
+	return id, nil
 }
 func (c *fakeProtonClient) MarkMessagesRead(context.Context, ...string) error   { return nil }
 func (c *fakeProtonClient) MarkMessagesUnread(context.Context, ...string) error { return nil }
@@ -841,6 +872,416 @@ func TestMoveIsAtomicOnAssignUIDFailure(t *testing.T) {
 	}
 }
 
+// TestMovePhase3UnlabelFailureAborts exercises the issue's headline
+// fix: when the Proton source-unlabel (Phase 3) fails, performMove MUST
+// abort with NO and MUST NOT drop the local source links, so the client
+// never receives a COPYUID+EXPUNGE that claims success while Proton (and
+// the local mirror) still have the message in the source. The failed
+// unlabel intent is recorded for sync-worker reconciliation.
+//
+// Governing: SPEC-0003 REQ "Moving between system folders changes Proton
+// system flag".
+func TestMovePhase3UnlabelFailureAborts(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+
+	inbox, err := mboxes.EnsureMailbox(ctx, acct, "INBOX", mailbox.ProtonInboxLabelID, mailbox.KindSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, err := mboxes.EnsureMailbox(ctx, acct, "Archive", mailbox.ProtonArchiveLabelID, mailbox.KindSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mid, err := mboxes.UpsertMessage(ctx, &mailbox.Message{
+		AccountID:       acct,
+		ProtonMessageID: "proton-msg-phase3",
+		InternalDate:    time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mboxes.AssignUID(ctx, acct, inbox.ID, mid); err != nil {
+		t.Fatal(err)
+	}
+
+	fp := &fakeProton{}
+	sess := newAuthedSession(t, mboxes, &erroringProton{parent: fp, failOn: "unlabel"}, acct)
+	if _, err := sess.Select("INBOX", nil); err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if _, err := sess.performMove(imap.SeqSet{{Start: 1, Stop: 1}}, "Archive"); err == nil {
+		t.Fatal("performMove succeeded; expected NO after Phase-3 unlabel failure")
+	}
+
+	// Source link MUST still be present — the client must not have been
+	// told the message left the source.
+	srcMsgs, _ := mboxes.ListMessagesInMailbox(ctx, acct, inbox.ID)
+	if len(srcMsgs) != 1 {
+		t.Errorf("source link dropped after Phase-3 failure: have %d, want 1", len(srcMsgs))
+	}
+	// Destination was labelled on Proton (Phase 2 committed) so the local
+	// dest UID assignment stands; that is acceptable — the message is in
+	// two mailboxes and reconciliation converges it.
+	destMsgs, _ := mboxes.ListMessagesInMailbox(ctx, acct, archive.ID)
+	if len(destMsgs) != 1 {
+		t.Errorf("dest link missing after Phase-2 commit: have %d, want 1", len(destMsgs))
+	}
+
+	// The failed-unlabel intent MUST be recorded for reconciliation.
+	pending, err := mboxes.ListPendingUnlabels(ctx, acct, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("pending_unlabels rows = %d, want 1", len(pending))
+	}
+	if pending[0].ProtonMessageID != "proton-msg-phase3" || pending[0].ProtonLabelID != mailbox.ProtonInboxLabelID {
+		t.Errorf("pending unlabel = %+v, want (proton-msg-phase3, inbox)", pending[0])
+	}
+}
+
+// TestMoveSameMailboxIsNoOp pins the same-source==destination guard: a
+// MOVE into the already-selected mailbox allocates no fresh UID and
+// issues no Proton calls; the message keeps its existing UID.
+//
+// Governing: SPEC-0003 REQ "UID Stability".
+func TestMoveSameMailboxIsNoOp(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+
+	inbox, err := mboxes.EnsureMailbox(ctx, acct, "INBOX", mailbox.ProtonInboxLabelID, mailbox.KindSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mid, err := mboxes.UpsertMessage(ctx, &mailbox.Message{
+		AccountID:       acct,
+		ProtonMessageID: "proton-msg-selfmove",
+		InternalDate:    time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid0, err := mboxes.AssignUID(ctx, acct, inbox.ID, mid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fp := &fakeProton{}
+	sess := newAuthedSession(t, mboxes, fp, acct)
+	if _, err := sess.Select("INBOX", nil); err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+
+	res, err := sess.performMove(imap.SeqSet{{Start: 1, Stop: 1}}, "INBOX")
+	if err != nil {
+		t.Fatalf("self-MOVE returned error: %v", err)
+	}
+
+	// No Proton calls.
+	if calls := fp.snapshot(); len(calls) != 0 {
+		t.Errorf("self-MOVE issued %d Proton calls, want 0: %+v", len(calls), calls)
+	}
+	// No EXPUNGE (message never left).
+	if len(res.srcSeqNums) != 0 {
+		t.Errorf("self-MOVE produced %d EXPUNGE seqnums, want 0", len(res.srcSeqNums))
+	}
+	// Existing UID preserved and reported as both source + dest.
+	if len(res.srcUIDs) != 1 || res.srcUIDs[0] != uid0 {
+		t.Errorf("self-MOVE srcUIDs = %v, want [%d]", res.srcUIDs, uid0)
+	}
+	if len(res.destUIDs) != 1 || res.destUIDs[0] != uid0 {
+		t.Errorf("self-MOVE destUIDs = %v, want [%d]", res.destUIDs, uid0)
+	}
+	// The mailbox still holds exactly one message at the SAME uid (no
+	// fresh allocation).
+	msgs, _ := mboxes.ListMessagesInMailbox(ctx, acct, inbox.ID)
+	if len(msgs) != 1 || msgs[0].UID != uid0 {
+		t.Errorf("after self-MOVE mailbox has %d msgs (uid %v), want 1 at uid %d",
+			len(msgs), uidsOf(msgs), uid0)
+	}
+}
+
+func uidsOf(msgs []*mailbox.MessageInMailbox) []uint32 {
+	out := make([]uint32, len(msgs))
+	for i, m := range msgs {
+		out[i] = m.UID
+	}
+	return out
+}
+
+// removeFailingMailboxService wraps a real mailbox.Service and forces
+// RemoveMessageFromMailbox to fail, exercising the MOVE Phase-4 abort.
+type removeFailingMailboxService struct {
+	mailbox.Service
+	failRemove bool
+}
+
+func (f *removeFailingMailboxService) RemoveMessageFromMailbox(ctx context.Context, accountID string, mailboxID, messageID int64) (bool, error) {
+	if f.failRemove {
+		return false, errors.New("simulated RemoveMessageFromMailbox failure")
+	}
+	return f.Service.RemoveMessageFromMailbox(ctx, accountID, mailboxID, messageID)
+}
+
+// TestMovePhase4RemoveFailureAborts confirms the Phase-4 coherence fix:
+// when the local source-link removal fails AFTER Proton has been fully
+// updated (dest labelled, src unlabelled), performMove returns NO rather
+// than a COPYUID+EXPUNGE that would falsely tell the client the message
+// left the source. The message that failed to drop is excluded from the
+// result.
+func TestMovePhase4RemoveFailureAborts(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+
+	inbox, err := mboxes.EnsureMailbox(ctx, acct, "INBOX", mailbox.ProtonInboxLabelID, mailbox.KindSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mboxes.EnsureMailbox(ctx, acct, "Archive", mailbox.ProtonArchiveLabelID, mailbox.KindSystem); err != nil {
+		t.Fatal(err)
+	}
+	mid, err := mboxes.UpsertMessage(ctx, &mailbox.Message{
+		AccountID:       acct,
+		ProtonMessageID: "proton-msg-phase4",
+		InternalDate:    time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mboxes.AssignUID(ctx, acct, inbox.ID, mid); err != nil {
+		t.Fatal(err)
+	}
+
+	failer := &removeFailingMailboxService{Service: mboxes, failRemove: true}
+	fp := &fakeProton{}
+	sess := newAuthedSessionWithSvc(t, failer, fp, acct)
+	if _, err := sess.Select("INBOX", nil); err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+
+	if _, err := sess.performMove(imap.SeqSet{{Start: 1, Stop: 1}}, "Archive"); err == nil {
+		t.Fatal("performMove succeeded; expected NO after Phase-4 remove failure")
+	}
+
+	// Proton was fully updated (both label + unlabel ran) BEFORE the
+	// local remove was attempted — verify the call sequence so the test
+	// is pinning the real Phase-4 ordering, not an earlier abort.
+	calls := fp.snapshot()
+	if len(calls) != 2 || calls[0].op != "label" || calls[1].op != "unlabel" {
+		t.Fatalf("expected label then unlabel before Phase-4, got %+v", calls)
+	}
+}
+
+// TestAppendImportsAndMaterialises drives the happy-path APPEND: the
+// literal is imported to Proton under the destination mailbox's label
+// and materialised locally so APPENDUID returns a fresh UID and a
+// subsequent listing shows the message.
+//
+// Governing: SPEC-0003 REQ "Folder Hierarchy and Mapping".
+func TestAppendImportsAndMaterialises(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+
+	drafts, err := mboxes.EnsureMailbox(ctx, acct, "Drafts", mailbox.ProtonDraftsLabelID, mailbox.KindSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fp := &fakeProton{importID: "proton-appended-7"}
+	sess := newAuthedSession(t, mboxes, fp, acct)
+
+	raw := []byte("From: joe@reduit.example\r\nSubject: draft\r\n\r\nbody")
+	data, err := sess.Append("Drafts", literalReader(raw), &imap.AppendOptions{})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	if data == nil || data.UID == 0 {
+		t.Fatalf("Append returned no APPENDUID: %+v", data)
+	}
+	if data.UIDValidity != drafts.UIDValidity {
+		t.Errorf("APPENDUID UIDVALIDITY = %d, want %d", data.UIDValidity, drafts.UIDValidity)
+	}
+
+	// Proton import recorded with the Drafts label and unread=true (no
+	// \Seen in the supplied flags).
+	fp.mu.Lock()
+	imports := append([]importCall(nil), fp.imports...)
+	fp.mu.Unlock()
+	if len(imports) != 1 {
+		t.Fatalf("ImportMessage calls = %d, want 1", len(imports))
+	}
+	if imports[0].labelID != mailbox.ProtonDraftsLabelID {
+		t.Errorf("import label = %q, want Drafts (%q)", imports[0].labelID, mailbox.ProtonDraftsLabelID)
+	}
+	if !imports[0].unread {
+		t.Errorf("import unread = false, want true (no \\Seen supplied)")
+	}
+
+	// Local materialisation: the message is now in Drafts at the returned
+	// UID, linked to the Proton ID the import returned.
+	msgs, err := mboxes.ListMessagesInMailbox(ctx, acct, drafts.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("Drafts has %d msgs after APPEND, want 1", len(msgs))
+	}
+	if msgs[0].UID != uint32(data.UID) {
+		t.Errorf("materialised UID = %d, want APPENDUID %d", msgs[0].UID, data.UID)
+	}
+	if msgs[0].ProtonMessageID != "proton-appended-7" {
+		t.Errorf("materialised proton id = %q, want proton-appended-7", msgs[0].ProtonMessageID)
+	}
+}
+
+// TestAppendSeenFlagImportsRead confirms a \Seen flag in the APPEND flag
+// set imports the message as already-read (unread=false).
+func TestAppendSeenFlagImportsRead(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+	if _, err := mboxes.EnsureMailbox(ctx, acct, "Archive", mailbox.ProtonArchiveLabelID, mailbox.KindSystem); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakeProton{}
+	sess := newAuthedSession(t, mboxes, fp, acct)
+
+	_, err := sess.Append("Archive", literalReader([]byte("Subject: x\r\n\r\ny")),
+		&imap.AppendOptions{Flags: []imap.Flag{imap.FlagSeen}})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	if len(fp.imports) != 1 || fp.imports[0].unread {
+		t.Errorf("with \\Seen supplied, import unread = %v, want false", fp.imports[0].unread)
+	}
+}
+
+// TestAppendUnknownMailboxIsNotFound confirms an APPEND to a non-existent
+// (or non-owned) mailbox returns the byte-identical not-found response
+// and never reaches Proton.
+//
+// Governing: SPEC-0003 REQ "Account Isolation in IMAP Operations".
+func TestAppendUnknownMailboxIsNotFound(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	fp := &fakeProton{}
+	sess := newAuthedSession(t, mboxes, fp, acct)
+
+	_, err := sess.Append("Labels/Nope", literalReader([]byte("x")), &imap.AppendOptions{})
+	if err == nil {
+		t.Fatal("Append to unknown mailbox succeeded; want not-found")
+	}
+	imapErr, ok := err.(*imap.Error)
+	if !ok || imapErr.Type != imap.StatusResponseTypeNo {
+		t.Fatalf("error = %v (%T), want *imap.Error NO", err, err)
+	}
+	if len(fp.imports) != 0 {
+		t.Errorf("APPEND to unknown mailbox reached Proton import: %d calls", len(fp.imports))
+	}
+}
+
+// TestAppendProtonImportFailureSurfacesNo confirms that when Proton
+// import fails, APPEND returns NO and nothing is materialised locally.
+func TestAppendProtonImportFailureSurfacesNo(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+	archive, err := mboxes.EnsureMailbox(ctx, acct, "Archive", mailbox.ProtonArchiveLabelID, mailbox.KindSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakeProton{importErr: errors.New("simulated import failure")}
+	sess := newAuthedSession(t, mboxes, fp, acct)
+
+	if _, err := sess.Append("Archive", literalReader([]byte("x")), &imap.AppendOptions{}); err == nil {
+		t.Fatal("Append succeeded despite import failure; want NO")
+	}
+	msgs, _ := mboxes.ListMessagesInMailbox(ctx, acct, archive.ID)
+	if len(msgs) != 0 {
+		t.Errorf("messages materialised after failed import: %d, want 0", len(msgs))
+	}
+}
+
+// TestAppendLimitMatchesConstant pins the advertised AppendLimit to the
+// same constant the handler enforces, so the APPENDLIMIT the server
+// announces can never drift from the size it actually accepts.
+func TestAppendLimitMatchesConstant(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	sess := newAuthedSession(t, mboxes, &fakeProton{}, acct)
+	if got := sess.AppendLimit(); got != uint32(appendMaxLiteralBytes) {
+		t.Errorf("AppendLimit() = %d, want %d", got, appendMaxLiteralBytes)
+	}
+}
+
+// TestAppendOversizedLiteralRejected confirms the handler's
+// defense-in-depth size guard: a LiteralReader whose Size() exceeds the
+// limit is refused with [TOOBIG] and never reaches Proton — covering the
+// case of a hostile reader that the emersion-level AppendLimit check
+// (which trusts the announced size) cannot catch.
+func TestAppendOversizedLiteralRejected(t *testing.T) {
+	t.Parallel()
+	mboxes, _, acct := newMailboxStack(t)
+	ctx := context.Background()
+	if _, err := mboxes.EnsureMailbox(ctx, acct, "Archive", mailbox.ProtonArchiveLabelID, mailbox.KindSystem); err != nil {
+		t.Fatal(err)
+	}
+	fp := &fakeProton{}
+	sess := newAuthedSession(t, mboxes, fp, acct)
+
+	// Size() over-reports past the limit; the body is tiny so the test
+	// does not actually allocate 50 MiB.
+	oversize := &byteLiteral{b: []byte("x"), sizeOverride: int64(appendMaxLiteralBytes) + 1}
+	_, err := sess.Append("Archive", oversize, &imap.AppendOptions{})
+	if err == nil {
+		t.Fatal("oversized Append succeeded; want [TOOBIG]")
+	}
+	imapErr, ok := err.(*imap.Error)
+	if !ok || imapErr.Code != imap.ResponseCodeTooBig {
+		t.Fatalf("oversized Append error = %v (%T), want *imap.Error TOOBIG", err, err)
+	}
+	if len(fp.imports) != 0 {
+		t.Errorf("oversized Append reached Proton import: %d calls", len(fp.imports))
+	}
+}
+
+// literalReader adapts a byte slice to imap.LiteralReader for the APPEND
+// tests (Append reads via the LiteralReader interface, not a raw slice).
+func literalReader(b []byte) imap.LiteralReader {
+	return &byteLiteral{b: b}
+}
+
+type byteLiteral struct {
+	b   []byte
+	off int
+	// sizeOverride, when non-zero, is returned by Size() instead of the
+	// real byte length — lets a test simulate a LiteralReader that
+	// over-reports its size without allocating the bytes.
+	sizeOverride int64
+}
+
+func (l *byteLiteral) Read(p []byte) (int, error) {
+	if l.off >= len(l.b) {
+		return 0, io.EOF
+	}
+	n := copy(p, l.b[l.off:])
+	l.off += n
+	return n, nil
+}
+func (l *byteLiteral) Size() int64 {
+	if l.sizeOverride != 0 {
+		return l.sizeOverride
+	}
+	return int64(len(l.b))
+}
+
 // newAuthedSessionWithSvc is a variant of newAuthedSession that takes
 // an arbitrary MailboxService (e.g. a failure-injecting wrapper)
 // instead of a concrete mailbox.Service. Used by the atomic-MOVE test.
@@ -949,6 +1390,9 @@ func (c *erroringProtonClient) UnlabelMessages(ctx context.Context, msgIDs []str
 		return errors.New("simulated proton unlabel failure")
 	}
 	return c.wrapped.UnlabelMessages(ctx, msgIDs, labelID)
+}
+func (c *erroringProtonClient) ImportMessage(ctx context.Context, raw []byte, labelID string, unread bool) (string, error) {
+	return c.wrapped.ImportMessage(ctx, raw, labelID, unread)
 }
 func (c *erroringProtonClient) MarkMessagesRead(ctx context.Context, ids ...string) error {
 	return c.wrapped.MarkMessagesRead(ctx, ids...)

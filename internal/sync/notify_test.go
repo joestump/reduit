@@ -75,7 +75,7 @@ func TestEventProcessorPublishesMessageAdded(t *testing.T) {
 			}}, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestEventProcessorPublishesMessageRemoved(t *testing.T) {
 			}}, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestEventProcessorPublishesMessageFlagChanged(t *testing.T) {
 			}}, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestEventProcessorDoesNotPublishOnFailedCommit(t *testing.T) {
 			}}, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -411,7 +411,7 @@ func TestEventProcessorPublishesViaRealBus(t *testing.T) {
 			}}, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), bus)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), bus, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -640,7 +640,7 @@ func TestPermanentTransitionFailureMarksCrashed(t *testing.T) {
 			return nil, false, authErr
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -690,7 +690,7 @@ func TestPermanentTransitionAlreadyLeftActiveSkipsCrash(t *testing.T) {
 			return nil, false, authErr
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -735,7 +735,7 @@ func TestPermanentTransitionAbandonsQuietlyOnShutdown(t *testing.T) {
 			return nil, false, authErr
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}

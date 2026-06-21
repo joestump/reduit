@@ -159,6 +159,27 @@ type Config struct {
 	//
 	// Governing: SPEC-0002 REQ "IMAP Update Notification".
 	Publisher Publisher
+
+	// Reconciler drains MOVE Phase-3 (source unlabel) failures recorded
+	// by the IMAP server: after each successful event batch the worker
+	// retries the stuck unlabels so a message that ended up in two
+	// mailboxes converges to the one the client asked for. nil disables
+	// reconciliation (lifecycle/plumbing tests that never exercise MOVE
+	// leave it unset); production wiring SHOULD pass a *MoveReconciler
+	// built over the mailbox service.
+	//
+	// TODO(serve-wiring): when the sync Supervisor is wired into
+	// internal/cli/serve.go, this MUST be set to
+	// NewMoveReconciler(mailbox.New(store), logger). Without it the
+	// `pending_unlabels` table HAS NO DRAINER: a MOVE whose Proton source
+	// unlabel fails records a row that is never retried, leaving the
+	// message stuck in two IMAP mailboxes indefinitely. The IMAP server
+	// and this supervisor are both unwired today (see serve.go), so this
+	// is harmless now — but the two MUST be wired together.
+	//
+	// Governing: SPEC-0003 REQ "Moving between system folders changes
+	// Proton system flag".
+	Reconciler *MoveReconciler
 }
 
 // resolved fills in defaults for every zero-valued field. Returned by

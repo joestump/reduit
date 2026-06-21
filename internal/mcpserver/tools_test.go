@@ -79,6 +79,10 @@ func (f *fakeClient) UnlabelMessages(_ context.Context, ids []string, labelID st
 	return nil
 }
 
+func (f *fakeClient) ImportMessage(context.Context, []byte, string, bool) (string, error) {
+	return "", nil
+}
+
 func (f *fakeClient) MarkMessagesRead(_ context.Context, ids ...string) error {
 	f.readCalls = append(f.readCalls, ids)
 	return nil
