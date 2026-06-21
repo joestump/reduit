@@ -456,6 +456,15 @@ func (s *Server) handleWizardAuth(w http.ResponseWriter, r *http.Request) {
 	sess.Client = client
 	sess.RefreshToken = auth.RefreshToken
 	sess.ProtonUserID = auth.UserID
+	// Capture the ephemeral session UID alongside the refresh token so
+	// commitWizard can seal it. /auth/v4/refresh needs the UID to re-auth
+	// on daemon restart; auth.UID is the only place it is exposed (it is
+	// discarded after this handler otherwise). Distinct from auth.UserID
+	// above (the persistent proton_user_id).
+	//
+	// Governing: ADR-0001, SPEC-0002 REQ "One Worker Per Active
+	// Account"; #28, #34.
+	sess.SessionUID = auth.UID
 
 	// FIDO2-only accounts: the spec calls for FIDO2 support but this
 	// PR's scope is TOTP only. Surface a clear "not yet supported"
@@ -915,6 +924,21 @@ func (s *Server) commitWizard(r *http.Request, sess *WizardSession, passphrase s
 	}
 	if err := s.deps.AccountService.SealRefreshToken(r.Context(), sess.AccountID, []byte(refresh)); err != nil {
 		return fmt.Errorf("seal refresh token: %w", err)
+	}
+	// Seal the session UID captured at login (sess.SessionUID = auth.UID).
+	// The UID does not rotate across the GetUser/KeySalts/.../Unlock
+	// sequence the way the refresh token can, so we use the captured
+	// value directly. This is the persistence #28 needed for boot
+	// re-unlock: protonlive.Lifecycle re-auths from {UID, refresh token}
+	// and re-unlocks with the mailbox passphrase on the next daemon
+	// start. A non-empty UID is expected here (the login always returns
+	// one); seal whatever we have and let OpenSessionUID's not-present
+	// path handle the (unexpected) empty case as the missing-UID gap.
+	//
+	// Governing: ADR-0003, ADR-0001, SPEC-0001 REQ "Encrypted Secret
+	// Storage", SPEC-0002 REQ "One Worker Per Active Account"; #28, #34.
+	if err := s.deps.AccountService.SealSessionUID(r.Context(), sess.AccountID, []byte(sess.SessionUID)); err != nil {
+		return fmt.Errorf("seal session uid: %w", err)
 	}
 	if err := s.deps.AccountService.SealMailboxPassphrase(r.Context(), sess.AccountID, []byte(passphrase)); err != nil {
 		return fmt.Errorf("seal mailbox passphrase: %w", err)

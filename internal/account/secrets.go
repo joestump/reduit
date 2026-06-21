@@ -57,6 +57,7 @@ const bcryptMaxPasswordBytes = 72
 const (
 	aadRefreshToken      = "refresh_token_ciphertext"
 	aadMailboxPassphrase = "mailbox_passphrase_ciphertext"
+	aadSessionUID        = "session_uid_ciphertext"
 	aadIMAPPassword      = "imap_password_ciphertext"
 )
 
@@ -123,6 +124,69 @@ func (s *service) OpenRefreshToken(ctx context.Context, accountID string) ([]byt
 		return nil, fmt.Errorf("account: open refresh token: %w", err)
 	}
 	return pt, nil
+}
+
+// SealSessionUID seals the Proton *session* UID under the account's
+// data key and persists the ciphertext. The session UID is ephemeral
+// (minted per login) but credential-adjacent: it is one of the three
+// inputs /auth/v4/refresh needs to re-establish a session on restart
+// (alongside the sealed refresh token + mailbox passphrase). It is
+// sealed — never stored in plaintext, never logged — and carries its
+// own column-name AAD so a ciphertext cannot be moved between columns
+// sealed under the same data key.
+//
+// Governing: ADR-0003 (envelope encryption), ADR-0001 (the UID is
+// required by go-proton-api's refresh path), SPEC-0001 REQ "Encrypted
+// Secret Storage"; #28 (closes its boot-re-unlock blocker), #34.
+func (s *service) SealSessionUID(ctx context.Context, accountID string, plaintext []byte) error {
+	dk, _, err := s.loadDataKey(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	defer zeroDataKey(&dk)
+
+	sealed, err := cryptenv.Seal(dk[:], plaintext, []byte(aadSessionUID))
+	if err != nil {
+		return fmt.Errorf("account: seal session uid: %w", err)
+	}
+	return s.repo.updateSessionUID(ctx, accountID, sealed, s.now().UTC())
+}
+
+// OpenSessionUID returns the plaintext Proton session UID as a string,
+// or ErrSecretNotPresent when no UID has been sealed (a NULL/empty
+// column — every account created or last set up before #34's migration).
+// The string return shape mirrors what protonlive.UIDSource consumes
+// (ReUnlock takes the UID as a string), and an empty/not-present UID is
+// the signal Lifecycle.sessionUID treats as the missing-UID gap: it
+// SKIPS boot re-unlock for that account with a WARN rather than failing
+// it, preserving backward compatibility for pre-migration accounts.
+//
+// Unlike the refresh token (a long-lived []byte we can defer-zero), the
+// UID must cross the package boundary as a string for the
+// /auth/v4/refresh entry point; we still zero the unsealed []byte source
+// before returning so the longer-lived buffer we control does not linger.
+//
+// Governing: ADR-0003, SPEC-0001 REQ "Encrypted Secret Storage",
+// SPEC-0002 REQ "One Worker Per Active Account"; #34.
+func (s *service) OpenSessionUID(ctx context.Context, accountID string) (string, error) {
+	dk, row, err := s.loadDataKey(ctx, accountID)
+	if err != nil {
+		return "", err
+	}
+	defer zeroDataKey(&dk)
+
+	if len(row.SessionUIDCiphertext) == 0 {
+		return "", ErrSecretNotPresent
+	}
+	pt, err := cryptenv.Open(dk[:], row.SessionUIDCiphertext, []byte(aadSessionUID))
+	if err != nil {
+		return "", fmt.Errorf("account: open session uid: %w", err)
+	}
+	uid := string(pt)
+	for i := range pt {
+		pt[i] = 0
+	}
+	return uid, nil
 }
 
 func (s *service) SealMailboxPassphrase(ctx context.Context, accountID string, plaintext []byte) error {

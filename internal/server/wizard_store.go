@@ -114,6 +114,15 @@ type WizardSession struct {
 	// dashboard renders show "this Reduit account is bound to that
 	// Proton user".
 	ProtonUserID string
+	// SessionUID is the ephemeral Proton *session* UID from the initial
+	// Auth response (auth.UID), distinct from the persistent
+	// ProtonUserID. Captured at login and sealed at unlock-commit time
+	// (account.SealSessionUID) so the daemon can re-auth + re-unlock the
+	// account on restart via protonlive.ReUnlock. Never logged.
+	//
+	// Governing: ADR-0003, ADR-0001, SPEC-0002 REQ "One Worker Per
+	// Active Account"; #28, #34.
+	SessionUID string
 	// Stage tracks where the wizard is in its lifecycle.
 	Stage WizardStage
 	// TOTPAttempts counts failed TOTP submissions for the abort-

@@ -38,13 +38,22 @@ type accountRow struct {
 	KeyEnvelope                 []byte         `db:"key_envelope"`
 	RefreshTokenCiphertext      []byte         `db:"refresh_token_ciphertext"`
 	MailboxPassphraseCiphertext []byte         `db:"mailbox_passphrase_ciphertext"`
-	IMAPPasswordCiphertext      []byte         `db:"imap_password_ciphertext"`
-	IMAPPasswordHash            sql.NullString `db:"imap_password_hash"`
-	PrimaryAlias                sql.NullString `db:"primary_alias"`
-	LastEventID                 sql.NullString `db:"last_event_id"`
-	Crashed                     int64          `db:"crashed"`
-	CreatedAt                   time.Time      `db:"created_at"`
-	UpdatedAt                   time.Time      `db:"updated_at"`
+	// SessionUIDCiphertext is the sealed Proton *session* UID, added in
+	// migration 20260505000001 (#34). NULL on every account created
+	// before that migration (and on any account whose wizard ran before
+	// #34 landed); OpenSessionUID surfaces a NULL column as
+	// ErrSecretNotPresent so protonlive.Lifecycle falls into its
+	// existing missing-UID "skip boot re-unlock" path.
+	//
+	// Governing: ADR-0003, SPEC-0001 REQ "Encrypted Secret Storage".
+	SessionUIDCiphertext   []byte         `db:"session_uid_ciphertext"`
+	IMAPPasswordCiphertext []byte         `db:"imap_password_ciphertext"`
+	IMAPPasswordHash       sql.NullString `db:"imap_password_hash"`
+	PrimaryAlias           sql.NullString `db:"primary_alias"`
+	LastEventID            sql.NullString `db:"last_event_id"`
+	Crashed                int64          `db:"crashed"`
+	CreatedAt              time.Time      `db:"created_at"`
+	UpdatedAt              time.Time      `db:"updated_at"`
 	// LastSyncAt mirrors the nullable `last_sync_at` column added in
 	// migration 20260503000001. NULL on every row until the sync
 	// worker (#19) starts populating it via SetSyncState.
@@ -65,6 +74,7 @@ func (r accountRow) toAccount() *Account {
 		KeyEnvelope:          append([]byte(nil), r.KeyEnvelope...),
 		HasRefreshToken:      len(r.RefreshTokenCiphertext) > 0,
 		HasMailboxPassphrase: len(r.MailboxPassphraseCiphertext) > 0,
+		HasSessionUID:        len(r.SessionUIDCiphertext) > 0,
 		HasIMAPPassword:      len(r.IMAPPasswordCiphertext) > 0,
 		IMAPPasswordHash:     r.IMAPPasswordHash.String,
 		PrimaryAlias:         r.PrimaryAlias.String,
@@ -87,8 +97,9 @@ func (r accountRow) toAccount() *Account {
 const accountColumns = `
     id, user_id, proton_user_id, email, state,
     key_envelope, refresh_token_ciphertext, mailbox_passphrase_ciphertext,
-    imap_password_ciphertext, imap_password_hash, primary_alias,
-    last_event_id, crashed, created_at, updated_at, last_sync_at, deleted_at
+    session_uid_ciphertext, imap_password_ciphertext, imap_password_hash,
+    primary_alias, last_event_id, crashed, created_at, updated_at,
+    last_sync_at, deleted_at
 `
 
 // insert persists a brand-new account row. The unique constraint on
@@ -104,13 +115,15 @@ func (r *repository) insert(ctx context.Context, row *accountRow) error {
     INSERT INTO accounts (
         id, user_id, proton_user_id, email, state,
         key_envelope, refresh_token_ciphertext, mailbox_passphrase_ciphertext,
-        imap_password_ciphertext, imap_password_hash, primary_alias,
-        last_event_id, crashed, created_at, updated_at, last_sync_at, deleted_at
+        session_uid_ciphertext, imap_password_ciphertext, imap_password_hash,
+        primary_alias, last_event_id, crashed, created_at, updated_at,
+        last_sync_at, deleted_at
     ) VALUES (
         :id, :user_id, :proton_user_id, :email, :state,
         :key_envelope, :refresh_token_ciphertext, :mailbox_passphrase_ciphertext,
-        :imap_password_ciphertext, :imap_password_hash, :primary_alias,
-        :last_event_id, :crashed, :created_at, :updated_at, :last_sync_at, :deleted_at
+        :session_uid_ciphertext, :imap_password_ciphertext, :imap_password_hash,
+        :primary_alias, :last_event_id, :crashed, :created_at, :updated_at,
+        :last_sync_at, :deleted_at
     )`
 	_, err := r.db.NamedExecContext(ctx, q, row)
 	if err != nil {
@@ -443,6 +456,20 @@ func (r *repository) updateRefreshToken(ctx context.Context, id string, sealed [
 		return fmt.Errorf("account: update refresh token: %w", err)
 	}
 	return checkOneRow(res, "update refresh token")
+}
+
+// updateSessionUID stores a sealed Proton session-UID blob. Mirrors
+// updateRefreshToken; the UID is sealed under the same per-account data
+// key with its own column-name AAD.
+//
+// Governing: ADR-0003, SPEC-0001 REQ "Encrypted Secret Storage"; #34.
+func (r *repository) updateSessionUID(ctx context.Context, id string, sealed []byte, now time.Time) error {
+	const q = `UPDATE accounts SET session_uid_ciphertext = ?, updated_at = ? WHERE id = ?`
+	res, err := r.db.ExecContext(ctx, q, sealed, now, id)
+	if err != nil {
+		return fmt.Errorf("account: update session uid: %w", err)
+	}
+	return checkOneRow(res, "update session uid")
 }
 
 func (r *repository) updateMailboxPassphrase(ctx context.Context, id string, sealed []byte, now time.Time) error {

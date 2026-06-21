@@ -447,6 +447,12 @@ func (f *fakeAccountsAlwaysActive) SealMailboxPassphrase(context.Context, string
 func (f *fakeAccountsAlwaysActive) OpenMailboxPassphrase(context.Context, string) ([]byte, error) {
 	panic("not implemented")
 }
+func (f *fakeAccountsAlwaysActive) SealSessionUID(context.Context, string, []byte) error {
+	panic("not implemented")
+}
+func (f *fakeAccountsAlwaysActive) OpenSessionUID(context.Context, string) (string, error) {
+	panic("not implemented")
+}
 func (f *fakeAccountsAlwaysActive) SealIMAPPassword(context.Context, string, []byte) error {
 	panic("not implemented")
 }

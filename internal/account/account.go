@@ -63,8 +63,16 @@ type Account struct {
 	KeyEnvelope          []byte
 	HasRefreshToken      bool
 	HasMailboxPassphrase bool
-	HasIMAPPassword      bool
-	IMAPPasswordHash     string
+	// HasSessionUID reports whether a sealed Proton session UID is
+	// stored for the account (#34). False for any account created (or
+	// last set up) before the session-UID column landed; protonlive's
+	// boot re-unlock skips those with a WARN until a wizard re-run
+	// seals the UID.
+	//
+	// Governing: ADR-0003, SPEC-0001 REQ "Encrypted Secret Storage".
+	HasSessionUID    bool
+	HasIMAPPassword  bool
+	IMAPPasswordHash string
 	// PrimaryAlias is the canonical `local@host` form clients use as
 	// the SASL PLAIN identity. NULL/empty means the account has not
 	// yet been provisioned with an alias and SASL lookups will fail.

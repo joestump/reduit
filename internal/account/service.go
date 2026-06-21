@@ -94,6 +94,27 @@ type Service interface {
 	SealMailboxPassphrase(ctx context.Context, accountID string, plaintext []byte) error
 	OpenMailboxPassphrase(ctx context.Context, accountID string) ([]byte, error)
 
+	// SealSessionUID seals the ephemeral Proton session UID under the
+	// account's data key (fresh nonce per call) and persists the
+	// ciphertext. Captured at wizard-commit time from auth.UID so the
+	// daemon can re-auth (/auth/v4/refresh) and re-unlock the account on
+	// restart without an interactive wizard run.
+	//
+	// Governing: ADR-0003, ADR-0001, SPEC-0001 REQ "Encrypted Secret
+	// Storage"; #28, #34.
+	SealSessionUID(ctx context.Context, accountID string, plaintext []byte) error
+
+	// OpenSessionUID returns the plaintext Proton session UID, or
+	// ErrSecretNotPresent when no UID has been sealed (every account
+	// created before #34's migration, and any whose wizard last ran
+	// before #34). account.Service satisfies protonlive.UIDSource via
+	// this method; the not-present case maps to protonlive's existing
+	// "skip boot re-unlock with a WARN" missing-UID path.
+	//
+	// Governing: ADR-0003, SPEC-0002 REQ "One Worker Per Active
+	// Account"; #34.
+	OpenSessionUID(ctx context.Context, accountID string) (string, error)
+
 	SealIMAPPassword(ctx context.Context, accountID string, plaintext []byte) error
 	OpenIMAPPassword(ctx context.Context, accountID string) ([]byte, error)
 

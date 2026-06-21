@@ -352,6 +352,32 @@ func TestSealOpenRoundTrip(t *testing.T) {
 		t.Error("mailbox passphrase round-trip mismatch")
 	}
 
+	// Session UID (#34). Sealed as bytes, opened as a string for the
+	// /auth/v4/refresh boot re-unlock path.
+	uid := "abcdef0123456789abcdef0123456789abcdef01"
+	if err := svc.SealSessionUID(ctx, a.ID, []byte(uid)); err != nil {
+		t.Fatalf("SealSessionUID: %v", err)
+	}
+	gotUID, err := svc.OpenSessionUID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("OpenSessionUID: %v", err)
+	}
+	if gotUID != uid {
+		t.Errorf("session uid round-trip: got %q want %q", gotUID, uid)
+	}
+	// Re-seal overwrites (a wizard re-run mints a fresh session UID).
+	uid2 := "11111111222222223333333344444444aaaabbbb"
+	if err := svc.SealSessionUID(ctx, a.ID, []byte(uid2)); err != nil {
+		t.Fatalf("SealSessionUID (re-seal): %v", err)
+	}
+	gotUID, err = svc.OpenSessionUID(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("OpenSessionUID (after re-seal): %v", err)
+	}
+	if gotUID != uid2 {
+		t.Error("SealSessionUID did not overwrite ciphertext")
+	}
+
 	// IMAP password (Seal explicitly).
 	imap := []byte("user-supplied-imap-password")
 	if err := svc.SealIMAPPassword(ctx, a.ID, imap); err != nil {
@@ -473,6 +499,16 @@ func TestOpenWhenSecretAbsent(t *testing.T) {
 	}
 	if _, err := svc.OpenMailboxPassphrase(ctx, a.ID); !errors.Is(err, ErrSecretNotPresent) {
 		t.Errorf("OpenMailboxPassphrase on empty = %v, want ErrSecretNotPresent", err)
+	}
+	// Backward-compat (#34): an account created before the session-UID
+	// migration (or whose wizard ran before #34) has a NULL
+	// session_uid_ciphertext. OpenSessionUID MUST report ErrSecretNotPresent
+	// (an empty UID, not a decrypt error) so protonlive.Lifecycle takes its
+	// existing "skip boot re-unlock with a WARN" missing-UID path instead of
+	// kicking the account to pending. A fresh createTestAccount row models
+	// exactly that NULL-column state.
+	if uid, err := svc.OpenSessionUID(ctx, a.ID); !errors.Is(err, ErrSecretNotPresent) || uid != "" {
+		t.Errorf("OpenSessionUID on empty = (%q, %v), want (\"\", ErrSecretNotPresent)", uid, err)
 	}
 	if _, err := svc.OpenIMAPPassword(ctx, a.ID); !errors.Is(err, ErrSecretNotPresent) {
 		t.Errorf("OpenIMAPPassword on empty = %v, want ErrSecretNotPresent", err)

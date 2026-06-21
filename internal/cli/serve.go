@@ -309,26 +309,29 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// keyring dropped (and its upstream session revoked), mirroring where
 	// the sync supervisor stops the worker.
 	//
-	// NOTE: boot-time re-unlock of already-active accounts is NOT wired
-	// here yet. ReUnlock needs the Proton *session UID*, which Reduit
-	// does not persist today (only the refresh token + mailbox passphrase
-	// are sealed). Until a session-UID column + accessor land, a daemon
-	// restart leaves already-active accounts without an unlocked keyring
-	// until the operator re-runs the wizard; body fetches return a
-	// transient IMAP NO / MCP auth_required in the meantime. The
-	// Lifecycle is constructed with a nil UIDSource so the gap is
-	// explicit and logged per-account at WARN if a boot re-unlock is ever
-	// attempted.
+	// Boot-time re-unlock of already-active accounts is wired here (#34).
+	// ReUnlock needs the Proton *session UID*, which Reduit now persists
+	// (sealed, alongside the refresh token + mailbox passphrase) — the
+	// wizard seals auth.UID at commit time, and account.Service exposes
+	// the unsealed value via OpenSessionUID, satisfying
+	// protonlive.UIDSource. We pass accountService as BOTH the
+	// SecretSource and the UIDSource so RegisterActiveAccounts (called
+	// below, after the HTTP server starts) re-auths + re-unlocks each
+	// active account on restart. Accounts created before #34's migration
+	// have no sealed UID; OpenSessionUID returns ErrSecretNotPresent for
+	// those and Lifecycle SKIPS them with a WARN (the missing-UID gap),
+	// leaving them active — their sync worker still runs; only boot body
+	// decryption is degraded until the operator re-runs the wizard.
 	//
 	// Governing: ADR-0003, ADR-0001, SPEC-0002 REQ "One Worker Per Active
-	// Account"; issue #28.
+	// Account"; issue #28 (closes its boot-re-unlock blocker), issue #34.
 	liveClients := protonlive.New(logger)
 	defer func() {
 		closeCtx, cancelClose := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancelClose()
 		liveClients.CloseAll(closeCtx)
 	}()
-	liveLifecycle := protonlive.NewLifecycle(liveClients, protonMgr, accountService, nil, accountService, logger)
+	liveLifecycle := protonlive.NewLifecycle(liveClients, protonMgr, accountService, accountService, accountService, logger)
 	unsubscribeLive := accountService.OnTransition(func(cbCtx context.Context, prev, next account.State, a *account.Account) {
 		if a == nil {
 			return
@@ -450,6 +453,38 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Start() }()
+
+	// Boot re-unlock (#34): re-auth + re-unlock every already-active
+	// account so FETCH BODY[] / MCP get_message decrypt bodies straight
+	// away on a daemon restart, instead of failing until the operator
+	// re-runs the wizard. Each account makes upstream Proton calls
+	// (/auth/v4/refresh + the GetUser/KeySalts/.../Unlock sequence), so
+	// this runs in its own goroutine off the boot path — the HTTP/mail
+	// listeners are already serving above. Per-account failure handling
+	// is independent and lives in Lifecycle.registerOne: a credential
+	// failure kicks that one account to pending_proton_setup; a transient
+	// failure or a missing (pre-#34) UID leaves it active with a WARN. We
+	// list ALL accounts and let RegisterActiveAccounts filter to
+	// StateActive (it skips nil / non-active entries).
+	//
+	// ctx (the SIGINT/SIGTERM-cancelled root) bounds the work so a
+	// shutdown mid-boot-unlock cancels the in-flight Proton calls rather
+	// than blocking drain.
+	//
+	// Governing: ADR-0003, ADR-0001, SPEC-0002 REQ "One Worker Per Active
+	// Account"; issue #28, issue #34.
+	go func() {
+		actives, err := accountService.List(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
+			logger.Warn("boot re-unlock skipped; could not list accounts",
+				slog.String("error", err.Error()))
+			return
+		}
+		liveLifecycle.RegisterActiveAccounts(ctx, actives)
+	}()
 
 	select {
 	case <-ctx.Done():
