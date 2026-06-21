@@ -36,6 +36,7 @@ FROM alpine:3.23
 # self-hosters often use.
 RUN addgroup -S -g 10000 reduit \
  && adduser  -S -u 10000 -G reduit reduit \
+ && apk upgrade --no-cache \
  && apk add --no-cache ca-certificates tzdata \
  && mkdir -p /var/lib/reduit /etc/reduit/tls \
  && chown -R reduit:reduit /var/lib/reduit \
