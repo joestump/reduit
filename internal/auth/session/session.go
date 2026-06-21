@@ -17,7 +17,10 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -100,6 +103,7 @@ const (
 	keyIsAdmin  = "auth.is_admin"
 	keyEmail    = "auth.email"
 	keyReturnTo = "auth.return_to"
+	keyCSRF     = "auth.csrf"
 )
 
 // Identity is the subset of authenticated-user state Reduit caches in
@@ -422,6 +426,71 @@ func Clear(ctx context.Context, mgr *scs.SessionManager) {
 	mgr.Remove(ctx, keyEmail)
 	mgr.Remove(ctx, keyIsAdmin)
 	mgr.Remove(ctx, keyReturnTo)
+	mgr.Remove(ctx, keyCSRF)
+}
+
+// CSRFToken returns the session's per-session CSRF token, minting and
+// persisting a fresh one on first call. The token is a 256-bit random
+// value, base64url-encoded, stored on the SCS session payload so it
+// rides the same HttpOnly cookie as the rest of the identity and is
+// renewed (via PutIdentity's RenewToken) on each login.
+//
+// State-changing form handlers (currently only POST /auth/logout) embed
+// this value as a hidden field and validate it with ValidCSRF on
+// submission. Because the token lives in the SCS session and not in a
+// readable cookie, a cross-site attacker cannot read it to forge a
+// matching field.
+//
+// Pattern choice: SPEC-0005 design "Content security and CSRF"
+// illustrates the double-submit-cookie pattern. We use the
+// synchronizer-token pattern instead -- the token is stored server-side
+// on the SCS session rather than mirrored into a readable cookie. The
+// two are equivalent in defence; synchronizer is marginally stronger
+// (the secret never leaves the server in a JS-readable form, sidestepping
+// the cookie-tossing / subdomain-injection edge cases double-submit
+// must reason about) and it fits naturally because Reduit already keeps
+// an SCS session. The design section's intent (an unforgeable per-
+// session token on every state-changing form) is satisfied.
+//
+// Callers MUST be inside an scs.LoadAndSave scope (the session
+// middleware) before calling this -- outside that scope, scs panics.
+//
+// Governing: SPEC-0005 design "Content security and CSRF".
+func CSRFToken(ctx context.Context, mgr *scs.SessionManager) string {
+	if mgr == nil {
+		return ""
+	}
+	if tok := mgr.GetString(ctx, keyCSRF); tok != "" {
+		return tok
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		// crypto/rand failure is catastrophic and effectively never
+		// happens on a healthy host; returning "" yields a form whose
+		// token never validates (fails closed) rather than a guessable
+		// constant.
+		return ""
+	}
+	tok := base64.RawURLEncoding.EncodeToString(buf)
+	mgr.Put(ctx, keyCSRF, tok)
+	return tok
+}
+
+// ValidCSRF reports whether the supplied token matches the session's
+// stored CSRF token. Comparison is constant-time. An empty stored
+// token (CSRFToken never minted, or a rand failure) never validates --
+// fail closed.
+//
+// Governing: SPEC-0005 design "Content security and CSRF".
+func ValidCSRF(ctx context.Context, mgr *scs.SessionManager, token string) bool {
+	if mgr == nil || token == "" {
+		return false
+	}
+	stored := mgr.GetString(ctx, keyCSRF)
+	if stored == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(stored), []byte(token)) == 1
 }
 
 // PutReturnTo stashes the post-login redirect target. Login init

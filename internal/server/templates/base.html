@@ -81,7 +81,13 @@
       <a href="#" class="px-4 py-3 rounded-lg flex items-center gap-3 text-slate-400 cursor-not-allowed">
         {{template "icon_settings" .}}<span>Settings</span>
       </a>
+      <!-- Logout is POST-only and CSRF-protected: the hidden
+           csrf_token field carries the per-session token the handler
+           validates against the SCS session. A GET logout would be a
+           SameSite=Lax CSRF vector. Governing: SPEC-0005 REQ "Content
+           security and CSRF". -->
       <form method="POST" action="/auth/logout" class="mt-auto">
+        <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
         <button type="submit" class="w-full px-4 py-3 rounded-lg flex items-center gap-3 hover:bg-slate-800 text-left">
           {{template "icon_logout" .}}<span>Logout</span>
         </button>

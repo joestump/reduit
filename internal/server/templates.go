@@ -163,7 +163,32 @@ type pageData struct {
 	Title    string
 	Identity identityView
 	IsAdmin  bool
+	// CSRFToken is the per-session CSRF token. Today it protects exactly
+	// one form: base.html's navbar logout POST. It is made available on
+	// every base-layout page (populated centrally in renderPage so no
+	// construction site has to remember it) so any base-layout form that
+	// later needs CSRF can opt in by embedding the same hidden field --
+	// but only logout validates it at present. Extending CSRF validation
+	// to the other state-changing POSTs (wizard, account actions,
+	// rotation) is tracked as a separate issue, NOT done here. Empty on
+	// fragments (which render outside the base layout).
+	//
+	// Governing: SPEC-0005 design "Content security and CSRF".
+	CSRFToken string
 }
+
+// csrfSetter is implemented by every page-data value that embeds
+// pageData by pointer-receiver promotion. renderPage uses it to inject
+// the per-session CSRF token centrally rather than threading the token
+// through each handler's data-construction site.
+type csrfSetter interface {
+	setCSRFToken(string)
+}
+
+// setCSRFToken satisfies csrfSetter for any struct embedding pageData
+// (the method promotes to the embedder). Pointer receiver so the write
+// lands on the addressable value renderPage holds.
+func (p *pageData) setCSRFToken(tok string) { p.CSRFToken = tok }
 
 // identityView renders the top-bar identity badge. Computed from the
 // session.Identity at handler time so templates don't need to reach
@@ -229,6 +254,14 @@ func initialsFor(s string) string {
 // renderPage executes the named page template wrapped in the base
 // layout. Errors flow as 500s with the operator detail in the log;
 // the user sees an opaque "internal error".
+//
+// data SHOULD be a pointer to a value embedding pageData so renderPage
+// can inject the per-session CSRF token centrally (the base layout's
+// logout form needs it). A non-pointer or non-pageData value still
+// renders -- it just won't carry a CSRF token, which is correct for
+// any future page that has no state-changing form.
+//
+// Governing: SPEC-0005 design "Content security and CSRF".
 func (s *Server) renderPage(w http.ResponseWriter, r *http.Request, page string, data any) {
 	if s.tmpl == nil {
 		http.Error(w, "templates not loaded", http.StatusInternalServerError)
@@ -239,6 +272,13 @@ func (s *Server) renderPage(w http.ResponseWriter, r *http.Request, page string,
 		s.deps.Logger.Error("template not found", "page", page)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+	// Inject the per-session CSRF token so base.html's logout form
+	// carries it. Done here (not at each handler's data-construction
+	// site) so a new page can't forget it. Requires a session manager
+	// (always wired in production; nil only in narrow template tests).
+	if setter, ok := data.(csrfSetter); ok && s.deps.SessionManager != nil {
+		setter.setCSRFToken(session.CSRFToken(r.Context(), s.deps.SessionManager))
 	}
 	var buf bytes.Buffer
 	if err := t.ExecuteTemplate(&buf, "base", data); err != nil {

@@ -262,11 +262,15 @@ func TestAuthGating_UnauthenticatedPostReturns401(t *testing.T) {
 			}
 			defer resp.Body.Close()
 
-			// /auth/logout is allowlisted, so it should NOT 401 — it always
-			// redirects. All other POST targets are gated.
+			// /auth/logout is allowlisted (so it does NOT 401 through the
+			// session gate), but it is CSRF-protected: an unauthenticated
+			// POST carries no valid CSRF token, so the handler fails
+			// closed with 403 rather than redirecting. (A GET would 405 at
+			// the mux; this probe is a POST.)
+			// Governing: SPEC-0005 design "Content security and CSRF".
 			if path == "/auth/logout" {
-				if resp.StatusCode != http.StatusFound {
-					t.Errorf("POST %s status = %d, want 302 (logout always redirects)", path, resp.StatusCode)
+				if resp.StatusCode != http.StatusForbidden {
+					t.Errorf("POST %s status = %d, want 403 (CSRF fail-closed for token-less logout)", path, resp.StatusCode)
 				}
 				return
 			}

@@ -274,6 +274,7 @@ func newWizardFixture(t *testing.T, ttl time.Duration) *wizardFixture {
 		AccountService:  accSvc,
 		ProtonManager:   stub,
 		WizardSessions:  wizardSessions,
+		AutoCreate:      true, // production default; admit fresh test subjects
 		InsecureCookies: true,
 	}
 	_, handler := server.NewForTest(deps)

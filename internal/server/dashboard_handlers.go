@@ -160,7 +160,7 @@ func (s *Server) handleAccountsDashboard(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	s.renderPage(w, r, "accounts", data)
+	s.renderPage(w, r, "accounts", &data)
 }
 
 // adminAllAccountsGrouped returns every account in the system,

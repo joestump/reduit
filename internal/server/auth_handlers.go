@@ -30,7 +30,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -39,7 +41,17 @@ import (
 
 	"github.com/joestump/reduit/internal/auth"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
+	"github.com/joestump/reduit/internal/auth/session"
+	"github.com/joestump/reduit/internal/users"
 )
+
+// csrfFieldName is the hidden-form-field / template key carrying the
+// per-session CSRF token on state-changing POST forms (currently the
+// navbar logout form). Defined once so the handler and the templates
+// agree on the spelling.
+//
+// Governing: SPEC-0005 design "Content security and CSRF".
+const csrfFieldName = "csrf_token"
 
 // defaultPostLoginPath is where /auth/callback sends the browser when
 // the pre-session has no return_to (or the return_to was rejected as
@@ -151,6 +163,38 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Login-policy gate. The OIDC subject is now validated, but being a
+	// valid IdP identity does not by itself entitle the subject to a
+	// Reduit user. Per SPEC-0005 REQ "OIDC Login Flow" / "First-time
+	// login establishes user identity only" and ADR-0010, OIDC_AUTO_CREATE
+	// governs USER ADMITTANCE (not account creation): a subject with no
+	// existing users row is admitted only when AutoCreate is true (or it
+	// is an admin -- so a fresh deployment's operator can always
+	// bootstrap). A denied subject gets 403 + the contact-admin page,
+	// and BindFromOIDC (which would upsert the users row) is never
+	// reached.
+	//
+	// Governing: ADR-0004 (OIDC_AUTO_CREATE), ADR-0010 (users/accounts
+	// split), SPEC-0005 REQ "OIDC Login Flow"; issue #11.
+	permitted, err := s.loginPermitted(r.Context(), exchange.Subject)
+	if err != nil {
+		// A policy-lookup failure (DB outage on the existing-user check)
+		// fails closed: surface a 500 rather than silently admitting or
+		// denying. The detail goes to the log only.
+		s.deps.Logger.Error("auth/callback: login policy check",
+			slog.String("error", err.Error()),
+			slog.String("subject", exchange.Subject))
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if !permitted {
+		s.deps.Logger.Warn("auth/callback: login denied by policy",
+			slog.String("subject", exchange.Subject),
+			slog.String("remote", s.clientIP(r)))
+		s.renderDenied(w, r)
+		return
+	}
+
 	id, err := auth.BindFromOIDC(r.Context(), s.deps.SessionManager, s.deps.Store.DB.DB, s.deps.UsersService, auth.OIDCClaims{
 		Subject:     exchange.Subject,
 		Email:       exchange.Email,
@@ -193,11 +237,16 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 // bind cookie, and redirects to the IdP's end_session_endpoint when
 // one is advertised, otherwise to "/".
 //
-// Accepts both POST (the SPEC-0005 canonical method) and GET (so a
-// plain anchor in the navbar works without HTMX). GET-based logout
-// is normally a CSRF risk -- here it is bounded by the SCS session
-// cookie itself: an unauthenticated visit to /auth/logout is a
-// no-op. The destroy path is idempotent.
+// POST-only (the route registers only the POST method, so a GET 405s
+// at the mux). SPEC-0005 REQ "Logout clears local session" specifies
+// `POST /auth/logout`; a GET logout is a genuine CSRF vector under
+// SameSite=Lax cookies -- a cross-site top-level navigation to
+// /auth/logout is a same-site-Lax-permitted GET that carries the
+// session cookie and would log the user out. The POST is therefore
+// gated on a per-session CSRF token: the navbar logout form embeds the
+// token (see base.html / the templates' csrf field) and this handler
+// rejects any POST whose token does not match the session's stored
+// token with 403. A logged-out / token-less request fails closed.
 //
 // If the user has an in-flight wizard, the in-memory wizard session
 // is dropped before the SCS session is destroyed -- otherwise the
@@ -205,9 +254,24 @@ func (s *Server) handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 // process memory until the wizard's 30-min idle TTL fired, in
 // violation of SPEC-0005's "WHEN ... session invalidated THEN
 // partial credentials discarded from memory" requirement.
+//
+// Governing: SPEC-0005 REQ "OIDC Login Flow" (Scenario "Logout clears
+// local session"), SPEC-0005 design "Content security and CSRF";
+// issue #11.
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	if s.deps.SessionManager == nil {
 		http.Error(w, "session subsystem not configured", http.StatusInternalServerError)
+		return
+	}
+	// CSRF gate: validate the submitted token against the session's
+	// stored token before any state change. Fails closed for a
+	// token-less or unauthenticated request.
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if !session.ValidCSRF(r.Context(), s.deps.SessionManager, r.PostFormValue(csrfFieldName)) {
+		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 	s.dropInFlightWizard(r.Context())
@@ -310,6 +374,90 @@ func sanitizeReturnTo(s string) string {
 // this -- handlers call sanitizeReturnTo directly.
 func SanitizeReturnToForTest(s string) string { return sanitizeReturnTo(s) }
 
+// loginPermitted reports whether the validated OIDC subject may be
+// admitted to Reduit per the configured login policy.
+//
+// Policy (per ADR-0010 / SPEC-0005 REQ "OIDC Login Flow"): a subject
+// is permitted when ANY of:
+//
+//   - it already has a users row (a returning user is always admitted;
+//     OIDC_AUTO_CREATE only gates the FIRST sighting of a subject);
+//   - it is in the admin allowlist (OIDC_ADMIN_SUBS) -- admins are
+//     always admitted so a fresh deployment's operator can bootstrap
+//     even with auto_create=false and an empty users table;
+//   - OIDC_AUTO_CREATE is true (open enrolment: any validated subject
+//     becomes a user on first login).
+//
+// Returns an error only when the existing-user lookup itself fails (DB
+// outage); the caller fails closed (500) in that case.
+//
+// Governing: ADR-0004 (OIDC_AUTO_CREATE), ADR-0010, SPEC-0005 REQ
+// "OIDC Login Flow", SPEC-0005 REQ "First-time login establishes user
+// identity only".
+func (s *Server) loginPermitted(ctx context.Context, subject string) (bool, error) {
+	// Admin allowlist short-circuit -- always admit a configured admin.
+	for _, sub := range s.deps.AdminSubjects {
+		if sub != "" && sub == subject {
+			return true, nil
+		}
+	}
+	// Open enrolment -- any validated subject is admitted.
+	if s.deps.AutoCreate {
+		return true, nil
+	}
+	// Closed enrolment: admit only subjects that already have a users
+	// row. A returning user predates the auto_create=false tightening
+	// and keeps access.
+	_, err := s.deps.UsersService.GetByOIDCSubject(ctx, subject)
+	if err != nil {
+		if errors.Is(err, users.ErrUserNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// renderDenied writes the 403 contact-administrator page for a subject
+// rejected by the login policy. The visitor authenticated to the IdP
+// but was not admitted, so there is no Reduit session and the page is a
+// standalone document (no base layout / Identity badge).
+//
+// Governing: SPEC-0005 REQ "OIDC Login Flow" ("403 Forbidden — contact
+// your administrator").
+func (s *Server) renderDenied(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Render into a buffer first (matching renderPage) so a mid-execute
+	// template error does not leave a partially-written body after the
+	// 403 status line; on failure we fall back to the plain-text body.
+	if s.tmpl != nil {
+		if t, ok := s.tmpl.getFragment("denied"); ok {
+			var buf bytes.Buffer
+			if err := t.ExecuteTemplate(&buf, "denied", nil); err == nil {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = w.Write(buf.Bytes())
+				return
+			}
+			s.deps.Logger.Error("auth/callback: render denied page")
+		}
+	}
+	// Template missing/unparsed -- fall back to plain text so the 403
+	// still carries the contact-admin message.
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte("Access denied — contact your administrator.\n"))
+}
+
+// clientIP returns the real client IP for the request, honouring
+// X-Forwarded-For / X-Real-IP only when the immediate peer is a
+// configured trusted proxy (see clientIP in security.go). Used for the
+// auth audit log so a reverse-proxy-fronted deployment logs the real
+// browser IP, not the proxy's.
+//
+// Governing: ADR-0011 (reverse-proxy fronting), ADR-0009.
+func (s *Server) clientIP(r *http.Request) string {
+	return clientIP(r, s.trustedProxies)
+}
+
 // callbackUnauthorized renders the uniform 401 used for every
 // callback-validation failure. The reason flows to the log only --
 // not to the response -- so an attacker cannot use the response body
@@ -317,7 +465,11 @@ func SanitizeReturnToForTest(s string) string { return sanitizeReturnTo(s) }
 func (s *Server) callbackUnauthorized(w http.ResponseWriter, r *http.Request, reason string, err error) {
 	attrs := []slog.Attr{
 		slog.String("reason", reason),
-		slog.String("remote", r.RemoteAddr),
+		// Real client IP via the trusted-proxy helper: behind the
+		// tls.disabled reverse proxy r.RemoteAddr is the proxy, so a
+		// raw RemoteAddr would log the proxy on every rejected callback.
+		// Governing: ADR-0011 (reverse-proxy fronting), ADR-0009.
+		slog.String("remote", s.clientIP(r)),
 	}
 	if err != nil {
 		attrs = append(attrs, slog.String("error", err.Error()))

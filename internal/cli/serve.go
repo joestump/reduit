@@ -345,6 +345,8 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		ProtonManager:  protonMgr,
 		WizardSessions: wizardSessions,
 		AdminSubjects:  cfg.OIDC.AdminSubjects,
+		AutoCreate:     cfg.OIDC.AutoCreate,
+		TrustedProxies: cfg.Server.TrustedProxies,
 		MCPHandler:     mcpHandler,
 		IMAPSessions:   imapSessions,
 		SMTPSessions:   smtpSessions,

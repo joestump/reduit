@@ -254,7 +254,7 @@ func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 	if pg.hasNext {
 		data.NextURL = "/admin/accounts?page=" + itoa(pg.page+1)
 	}
-	s.renderPage(w, r, "admin_accounts", data)
+	s.renderPage(w, r, "admin_accounts", &data)
 }
 
 // adminAccountsPageData backs the admin accounts page template.

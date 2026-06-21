@@ -299,7 +299,7 @@ func (s *Server) renderWizard(w http.ResponseWriter, r *http.Request, sess *Wiza
 		IMAPPort:      993,
 		SMTPPort:      465,
 	}
-	s.renderPage(w, r, "wizard", data)
+	s.renderPage(w, r, "wizard", &data)
 }
 
 // renderWizardError renders a terminal error page (e.g. 3 TOTP
@@ -321,7 +321,7 @@ func (s *Server) renderWizardError(w http.ResponseWriter, r *http.Request, messa
 		ErrorMessage:  message,
 		StepIndicator: stepIndicatorFor(WizardStageCredentials),
 	}
-	s.renderPage(w, r, "wizard", data)
+	s.renderPage(w, r, "wizard", &data)
 }
 
 // handleWizardStart renders the wizard. If no in-flight session

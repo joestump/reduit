@@ -72,7 +72,7 @@ func (s *Server) handleAccountCredentials(w http.ResponseWriter, r *http.Request
 		HasPassword:  acct.HasIMAPPassword,
 	}
 
-	s.renderPage(w, r, "credentials", data)
+	s.renderPage(w, r, "credentials", &data)
 }
 
 // handleAccountCredentialsRotate is a route alias for the existing

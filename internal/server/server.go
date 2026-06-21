@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -112,6 +113,25 @@ type Deps struct {
 	SMTPSessions interface {
 		DropForAccount(accountID, reason string) int
 	}
+	// AutoCreate mirrors config.OIDC.AutoCreate. When false, a
+	// validated OIDC subject that has no existing users row is denied
+	// (403 contact-admin) instead of being auto-provisioned, UNLESS the
+	// subject is an admin (admins are always admitted so a fresh
+	// deployment's operator can bootstrap). Per ADR-0010 the flag
+	// governs USER admittance, not account creation.
+	//
+	// Governing: ADR-0004 (OIDC_AUTO_CREATE), ADR-0010 (users/accounts
+	// split), SPEC-0005 REQ "OIDC Login Flow" / "First-time login
+	// establishes user identity only".
+	AutoCreate bool
+	// TrustedProxies is the operator-supplied list of trusted reverse-
+	// proxy addresses (bare IPs or CIDR ranges). The auth-callback
+	// audit log derives the real client IP from X-Forwarded-For /
+	// X-Real-IP only when the immediate peer matches one of these.
+	// Empty (the default) trusts no proxy and logs r.RemoteAddr.
+	//
+	// Governing: ADR-0011 (reverse-proxy fronting), ADR-0009.
+	TrustedProxies []string
 }
 
 // Server holds an http.Server pre-configured with TLS and the
@@ -125,6 +145,10 @@ type Server struct {
 	// handler. Nil when templates fail to load -- handlers degrade to
 	// 500 rather than panic.
 	tmpl *templateSet
+	// trustedProxies is the parsed form of deps.TrustedProxies, used by
+	// the auth-callback audit log's client-IP derivation. Parsed once
+	// at construction so the request path is a cheap range check.
+	trustedProxies []*net.IPNet
 }
 
 // New constructs a *Server bound to addr. Routes are mounted via the
@@ -184,15 +208,27 @@ func NewForTest(deps Deps) (*Server, http.Handler) {
 //	  ↓
 //	scs.LoadAndSave (loads/saves the cookie-bound session row)
 //
-// LoadAndSave wraps the OUTERMOST so RequireSession can read the
-// session via scs.GetString from the request context.
+// securityHeaders wraps the OUTERMOST so the baseline browser-hardening
+// headers ride on every response -- including allowlisted routes,
+// gate-issued 302s, and SCS-managed responses. LoadAndSave wraps
+// inside it so RequireSession can read the session via scs.GetString
+// from the request context.
 //
-// Governing: SPEC-0005 REQ "Authentication Gating".
+// Governing: SPEC-0005 REQ "Authentication Gating", SPEC-0005 design
+// "Content security and CSRF".
 func newWithHandler(deps Deps) (*Server, http.Handler) {
 	mux := http.NewServeMux()
 	s := &Server{
 		deps:    deps,
 		stopped: make(chan struct{}),
+	}
+	// Parse the trusted-proxy list once. Invalid entries are logged
+	// loudly so an operator typo doesn't silently disable XFF handling.
+	nets, invalid := parseTrustedProxies(deps.TrustedProxies)
+	s.trustedProxies = nets
+	if len(invalid) > 0 {
+		deps.Logger.Warn("server: ignoring unparseable trusted_proxies entries",
+			slog.Any("invalid", invalid))
 	}
 	if tmpl, err := loadTemplates(); err != nil {
 		// A template-parse failure at boot is fatal-class -- the
@@ -218,6 +254,9 @@ func newWithHandler(deps Deps) (*Server, http.Handler) {
 		}, handler)
 		handler = deps.SessionManager.LoadAndSave(handler)
 	}
+	// Security headers wrap everything so they ride on every response,
+	// including allowlisted routes and gate-issued 302s.
+	handler = securityHeaders(handler)
 	return s, handler
 }
 
@@ -285,10 +324,21 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// OIDC login flow per SPEC-0005 REQ "OIDC Login Flow".
 	// All three paths are allowlisted (auth.Allowlist) so the
 	// RequireSession gate doesn't 302-loop them.
+	//
+	// Logout is POST-only: SPEC-0005 REQ "Logout clears local session"
+	// specifies `POST /auth/logout`, and a GET logout is a CSRF vector
+	// under SameSite=Lax (a cross-site top-level navigation to
+	// /auth/logout would log the user out). The POST is protected by a
+	// per-session CSRF token validated in the handler. Registering only
+	// the POST pattern makes the mux return 405 for a GET automatically
+	// (Go 1.22+ method-aware routing).
+	//
+	// Governing: SPEC-0005 REQ "OIDC Login Flow" (Scenario "Logout
+	// clears local session"), SPEC-0005 design "Content security and
+	// CSRF"; issue #11.
 	mux.HandleFunc("GET /auth/login", s.handleAuthLogin)
 	mux.HandleFunc("GET /auth/callback", s.handleAuthCallback)
 	mux.HandleFunc("POST /auth/logout", s.handleAuthLogout)
-	mux.HandleFunc("GET /auth/logout", s.handleAuthLogout)
 
 	// Account dashboard per SPEC-0005 REQ "Account Dashboard".
 	// Sits behind RequireSession; authenticated users see their own

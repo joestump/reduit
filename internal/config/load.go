@@ -142,6 +142,7 @@ func bindDefaults(v *viper.Viper, cfg Config) error {
 		"server.imap_addr":       cfg.Server.IMAPAddr,
 		"server.smtp_addr":       cfg.Server.SMTPAddr,
 		"server.metrics_addr":    cfg.Server.MetricsAddr,
+		"server.trusted_proxies": cfg.Server.TrustedProxies,
 		"tls.cert_path":          cfg.TLS.CertPath,
 		"tls.key_path":           cfg.TLS.KeyPath,
 		"tls.disabled":           cfg.TLS.Disabled,

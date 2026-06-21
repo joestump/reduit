@@ -40,6 +40,17 @@ type ServerConfig struct {
 	// MetricsAddr is the Prometheus metrics listener, intended for an
 	// internal-only interface (e.g. "127.0.0.1:9090"). Empty disables.
 	MetricsAddr string `mapstructure:"metrics_addr"`
+	// TrustedProxies lists the reverse-proxy addresses (bare IPs or CIDR
+	// ranges, e.g. "10.0.0.0/8") whose X-Forwarded-For / X-Real-IP
+	// headers the admin listener trusts when deriving the real client
+	// IP for audit logging. Reduit typically runs behind a TLS-
+	// terminating proxy (tls.disabled = true) per ADR-0011, so without
+	// this the audit log records the proxy's address. Empty (the
+	// default) trusts no proxy and logs the immediate peer -- the safe
+	// default for a directly-exposed listener.
+	//
+	// Governing: ADR-0011 (reverse-proxy fronting), ADR-0009.
+	TrustedProxies []string `mapstructure:"trusted_proxies"`
 }
 
 // TLSConfig holds the cert + key file paths read by the hot-reloading

@@ -261,7 +261,16 @@ func newTestServer(t *testing.T, adminSubs []string) (serverURL string, idp *fak
 // httptest.Server with the production routes + middleware chain.
 // Tests that need a specific account.Service / users.Service can
 // pass them in; pass nil for accSvc to skip the dashboard wiring.
+// AutoCreate defaults to true (the production default) so existing
+// callback tests admit a brand-new subject.
 func mountTestServer(t *testing.T, st *store.Store, idp *fakeIdP, adminSubs []string, accSvc account.Service, usrSvc users.Service) string {
+	return mountTestServerWithAutoCreate(t, st, idp, adminSubs, accSvc, usrSvc, true)
+}
+
+// mountTestServerWithAutoCreate is mountTestServer with an explicit
+// OIDC_AUTO_CREATE value so the login-policy deny-path tests can drive
+// AutoCreate=false and assert a 403 for an unknown subject.
+func mountTestServerWithAutoCreate(t *testing.T, st *store.Store, idp *fakeIdP, adminSubs []string, accSvc account.Service, usrSvc users.Service, autoCreate bool) string {
 	t.Helper()
 	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
 	if err != nil {
@@ -300,6 +309,7 @@ func mountTestServer(t *testing.T, st *store.Store, idp *fakeIdP, adminSubs []st
 		UsersService:    usrSvc,
 		AccountService:  accSvc,
 		AdminSubjects:   adminSubs,
+		AutoCreate:      autoCreate,
 		InsecureCookies: true, // httptest is plain HTTP
 	}
 	// Use the real Server so the routes/middleware match production.
@@ -566,6 +576,91 @@ func TestAuthCallback_ComputesAdminFromAllowlist(t *testing.T) {
 	}
 }
 
+// TestAuthCallback_AutoCreateFalseDeniesNewSubject asserts that with
+// OIDC_AUTO_CREATE=false a validated-but-unknown subject (no users row,
+// not an admin) is denied with 403 and the contact-admin page, and no
+// users row is created. Governing: SPEC-0005 REQ "OIDC Login Flow",
+// ADR-0010.
+func TestAuthCallback_AutoCreateFalseDeniesNewSubject(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	idp := newFakeIdP(t, "reduit-test-client")
+	idp.setSubject("sub-stranger", "stranger@example.com", "Stranger")
+	usrSvc := users.New(st)
+	// AutoCreate=false, empty admin allowlist => closed enrolment.
+	baseURL := mountTestServerWithAutoCreate(t, st, idp, nil, nil, usrSvc, false)
+	c := newClient(t)
+
+	resp := loginThroughIdP(t, c, baseURL, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("denied callback status = %d, want 403", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "contact your administrator") {
+		t.Errorf("403 body missing contact-admin message; got %q", string(body))
+	}
+	// No users row was created.
+	if _, err := usrSvc.GetByOIDCSubject(t.Context(), "sub-stranger"); err == nil {
+		t.Error("denied subject got a users row; want none")
+	}
+}
+
+// TestAuthCallback_AutoCreateFalseAdmitsExistingUser asserts a
+// returning user (already has a users row) is admitted even with
+// AutoCreate=false. Governing: SPEC-0005 REQ "OIDC Login Flow".
+func TestAuthCallback_AutoCreateFalseAdmitsExistingUser(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	idp := newFakeIdP(t, "reduit-test-client")
+	idp.setSubject("sub-returning", "ret@example.com", "Ret")
+	usrSvc := users.New(st)
+	// Seed the users row so the subject is "known" before login.
+	if _, err := usrSvc.Upsert(t.Context(), users.UpsertParams{
+		OIDCSubject: "sub-returning",
+		Email:       "ret@example.com",
+	}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	baseURL := mountTestServerWithAutoCreate(t, st, idp, nil, nil, usrSvc, false)
+	c := newClient(t)
+
+	resp := loginThroughIdP(t, c, baseURL, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("returning-user callback status = %d, want 302; body=%s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Location"); got != "/accounts" {
+		t.Errorf("post-login redirect = %q, want /accounts", got)
+	}
+}
+
+// TestAuthCallback_AutoCreateFalseAdmitsAdmin asserts an admin subject
+// is admitted (and provisioned) even with AutoCreate=false, so a fresh
+// deployment's operator can bootstrap. Governing: SPEC-0005 REQ
+// "First-Run Bootstrap", ADR-0010.
+func TestAuthCallback_AutoCreateFalseAdmitsAdmin(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	idp := newFakeIdP(t, "reduit-test-client")
+	idp.setSubject("sub-admin-boot", "admin@example.com", "Admin")
+	usrSvc := users.New(st)
+	baseURL := mountTestServerWithAutoCreate(t, st, idp, []string{"sub-admin-boot"}, nil, usrSvc, false)
+	c := newClient(t)
+
+	resp := loginThroughIdP(t, c, baseURL, "")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("admin bootstrap status = %d, want 302; body=%s", resp.StatusCode, body)
+	}
+	// The admin was provisioned despite AutoCreate=false.
+	if _, err := usrSvc.GetByOIDCSubject(t.Context(), "sub-admin-boot"); err != nil {
+		t.Errorf("admin not provisioned: %v", err)
+	}
+}
+
 func TestAuthCallback_RejectsMissingState(t *testing.T) {
 	t.Parallel()
 	baseURL, _, _ := newTestServer(t, nil)
@@ -618,7 +713,9 @@ func TestAuthCallback_RejectsMismatchedBindToken(t *testing.T) {
 
 func TestAuthLogout_DestroysSessionAndRedirects(t *testing.T) {
 	t.Parallel()
-	baseURL, idp, _ := newTestServer(t, nil)
+	// A dashboard-capable server is needed so we can read the CSRF token
+	// off a rendered page before POSTing logout.
+	baseURL, idp, _, _ := dashboardTestServer(t, nil)
 	idp.setSubject("sub-logout", "lo@example.com", "LO")
 	c := newClient(t)
 
@@ -629,11 +726,10 @@ func TestAuthLogout_DestroysSessionAndRedirects(t *testing.T) {
 		t.Fatalf("login status = %d", resp.StatusCode)
 	}
 
-	// Now log out.
-	resp, err := c.Get(baseURL + "/auth/logout")
-	if err != nil {
-		t.Fatalf("logout: %v", err)
-	}
+	token := csrfTokenFromDashboard(t, c, baseURL)
+
+	// Now log out with a valid CSRF token.
+	resp = postLogout(t, c, baseURL, token)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusFound {
 		t.Errorf("logout status = %d, want 302", resp.StatusCode)
@@ -645,21 +741,134 @@ func TestAuthLogout_DestroysSessionAndRedirects(t *testing.T) {
 	}
 }
 
+// csrfTokenFromDashboard logs the already-authenticated client onto
+// /accounts and scrapes the hidden csrf_token field from the navbar
+// logout form.
+func csrfTokenFromDashboard(t *testing.T, c *http.Client, baseURL string) string {
+	t.Helper()
+	resp, err := c.Get(baseURL + "/accounts")
+	if err != nil {
+		t.Fatalf("GET /accounts: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read /accounts body: %v", err)
+	}
+	tok := scrapeCSRF(string(body))
+	if tok == "" {
+		t.Fatalf("no csrf_token in /accounts body (status %d)", resp.StatusCode)
+	}
+	return tok
+}
+
+// scrapeCSRF pulls the value of the hidden csrf_token input out of a
+// rendered page. Deliberately a tiny string scan rather than an HTML
+// parser -- the field shape is fixed by base.html.
+func scrapeCSRF(html string) string {
+	const marker = `name="csrf_token" value="`
+	i := strings.Index(html, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := html[i+len(marker):]
+	j := strings.IndexByte(rest, '"')
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+// postLogout submits the CSRF-protected logout form.
+func postLogout(t *testing.T, c *http.Client, baseURL, token string) *http.Response {
+	t.Helper()
+	form := url.Values{}
+	form.Set("csrf_token", token)
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/auth/logout", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("new logout request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("POST /auth/logout: %v", err)
+	}
+	return resp
+}
+
+// TestAuthLogout_GETIsRejected asserts a GET /auth/logout 405s -- the
+// route is POST-only so a SameSite=Lax cross-site GET cannot log a
+// user out. Governing: SPEC-0005 design "Content security and CSRF".
+func TestAuthLogout_GETIsRejected(t *testing.T) {
+	t.Parallel()
+	baseURL, _, _ := newTestServer(t, nil)
+	c := newClient(t)
+
+	resp, err := c.Get(baseURL + "/auth/logout")
+	if err != nil {
+		t.Fatalf("GET /auth/logout: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET /auth/logout status = %d, want 405", resp.StatusCode)
+	}
+}
+
+// TestAuthLogout_POSTWithoutTokenIsForbidden asserts a logged-in POST
+// with no/invalid CSRF token gets 403 and the session survives.
+// Governing: SPEC-0005 design "Content security and CSRF".
+func TestAuthLogout_POSTWithoutTokenIsForbidden(t *testing.T) {
+	t.Parallel()
+	baseURL, idp, _, _ := dashboardTestServer(t, nil)
+	idp.setSubject("sub-csrf", "csrf@example.com", "CSRF")
+	c := newClient(t)
+
+	resp := loginThroughIdP(t, c, baseURL, "")
+	resp.Body.Close()
+
+	// No token at all.
+	resp = postLogout(t, c, baseURL, "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("token-less logout status = %d, want 403", resp.StatusCode)
+	}
+
+	// Wrong token.
+	resp = postLogout(t, c, baseURL, "not-the-real-token")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("bad-token logout status = %d, want 403", resp.StatusCode)
+	}
+
+	// The session must still be alive: /accounts renders (200), not a
+	// gate 302 to /auth/login.
+	resp, err := c.Get(baseURL + "/accounts")
+	if err != nil {
+		t.Fatalf("GET /accounts: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("post-failed-logout /accounts status = %d, want 200 (session intact)", resp.StatusCode)
+	}
+}
+
 func TestAllowlist_BypassesGate(t *testing.T) {
 	t.Parallel()
 	baseURL, _, _ := newTestServer(t, nil)
 	c := newClient(t)
 
-	for _, path := range []string{"/healthz", "/readyz", "/auth/login", "/auth/logout"} {
+	// /auth/logout is omitted here: it is POST-only now (a GET 405s at
+	// the mux), so it can't participate in a GET allowlist probe. Its
+	// allowlist behaviour (the gate doesn't 302-loop it) is covered by
+	// the dedicated logout tests.
+	for _, path := range []string{"/healthz", "/readyz", "/auth/login"} {
 		resp, err := c.Get(baseURL + path)
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}
 		resp.Body.Close()
-		// /auth/login redirects to IdP (302); /auth/logout redirects
-		// to "/" or end_session (302). /healthz and /readyz are 200.
-		// All of them MUST NOT be the gate's "no session" 302 to
-		// /auth/login (recursive).
+		// /auth/login redirects to IdP (302). /healthz and /readyz are
+		// 200. None MUST be the gate's "no session" 302 to /auth/login.
 		if path != "/auth/login" && resp.StatusCode == http.StatusFound {
 			loc := resp.Header.Get("Location")
 			if strings.HasPrefix(loc, "/auth/login") {

@@ -279,6 +279,7 @@ func TestCredentials_Rotate_DropsIMAPAndSMTPSessions(t *testing.T) {
 		UsersService:    usrSvc,
 		AccountService:  accSvc,
 		WizardSessions:  wizardSessions,
+		AutoCreate:      true, // production default; admit fresh test subjects
 		InsecureCookies: true,
 		IMAPSessions:    imapDropper,
 		SMTPSessions:    smtpDropper,
