@@ -3,6 +3,7 @@ package protonlive
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 
@@ -87,7 +88,10 @@ func (f *fakeClient) SendDraft(context.Context, string, proton.SendDraftReq) (pr
 func (f *fakeClient) GetPublicKeys(context.Context, string) (proton.PublicKeys, proton.RecipientType, error) {
 	return nil, proton.RecipientTypeExternal, nil
 }
-func (f *fakeClient) GetAttachment(context.Context, string) ([]byte, error)   { return nil, nil }
+func (f *fakeClient) GetAttachment(context.Context, string) ([]byte, error) { return nil, nil }
+func (f *fakeClient) GetAttachmentInto(context.Context, string, io.ReaderFrom) error {
+	return nil
+}
 func (f *fakeClient) LabelMessages(context.Context, []string, string) error   { return nil }
 func (f *fakeClient) UnlabelMessages(context.Context, []string, string) error { return nil }
 func (f *fakeClient) MarkMessagesRead(context.Context, ...string) error       { return nil }

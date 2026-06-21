@@ -9,6 +9,7 @@ package outbox
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -82,6 +83,9 @@ func (f *fakeProtonClient) SendDraft(context.Context, string, proton.SendDraftRe
 }
 func (f *fakeProtonClient) GetAttachment(context.Context, string) ([]byte, error) {
 	panic("fakeProtonClient: GetAttachment not implemented")
+}
+func (f *fakeProtonClient) GetAttachmentInto(context.Context, string, io.ReaderFrom) error {
+	panic("fakeProtonClient: GetAttachmentInto not implemented")
 }
 func (f *fakeProtonClient) LatestRefreshToken() string {
 	return ""

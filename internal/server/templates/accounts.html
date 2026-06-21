@@ -117,6 +117,13 @@
                       hx-swap="outerHTML">
                 Rotate IMAP password
               </button>
+              <!-- MCP token management per SPEC-0006 REQ "Token Issuance
+                   and Revocation": issue + revoke per-account bearer
+                   tokens for AI agents. -->
+              <a href="/accounts/{{.ID}}/mcp-tokens"
+                 class="px-3 py-1.5 rounded-md text-slate-300 hover:bg-slate-700">
+                MCP tokens
+              </a>
               <button type="button"
                       class="px-3 py-1.5 rounded-md text-slate-300 hover:bg-slate-700"
                       onclick="document.getElementById('suspend-{{.ID}}').showModal()">

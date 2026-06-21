@@ -5,6 +5,7 @@ package sync
 
 import (
 	"context"
+	"io"
 
 	"github.com/joestump/reduit/internal/proton"
 )
@@ -85,6 +86,9 @@ func (stubClient) SendDraft(context.Context, string, proton.SendDraftReq) (proto
 }
 func (stubClient) GetAttachment(context.Context, string) ([]byte, error) {
 	panic("stubClient.GetAttachment: lifecycle tests must not reach Proton")
+}
+func (stubClient) GetAttachmentInto(context.Context, string, io.ReaderFrom) error {
+	panic("stubClient.GetAttachmentInto: lifecycle tests must not reach Proton")
 }
 func (stubClient) Logout(context.Context) error { return nil }
 func (stubClient) LatestRefreshToken() string   { return "" }

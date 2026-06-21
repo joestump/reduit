@@ -368,8 +368,13 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// Governing: ADR-0008, SPEC-0006 REQ "Bearer Authentication
 	// Required", SPEC-0006 REQ "Per-Account Concurrency Limit".
 	var mcpHandler http.Handler
+	// mcpTokens is shared between the MCP bearer validator (below) and the
+	// server's admin token UI (server.Deps.MCPTokens) so issuance/
+	// revocation and validation operate on the same repository.
+	//
+	// Governing: SPEC-0006 REQ "Token Issuance and Revocation".
+	mcpTokens := mcptoken.NewRepository(st.DB)
 	if cfg.Server.HTTPAddr != "" {
-		mcpTokens := mcptoken.NewRepository(st.DB)
 		validator := auth.NewBearerValidator(oidcClient, mcpTokens).
 			WithSubjectResolver(makeSubjectResolver(accountService, usersService))
 		// Wire the read/write/send tool surface (issue #14, SPEC-0006 REQ
@@ -485,6 +490,7 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		AutoCreate:     cfg.OIDC.AutoCreate,
 		TrustedProxies: cfg.Server.TrustedProxies,
 		MCPHandler:     mcpHandler,
+		MCPTokens:      mcpTokens,
 		IMAPSessions:   imapSessions,
 		SMTPSessions:   smtpSessions,
 		StatusBus:      statusBus,

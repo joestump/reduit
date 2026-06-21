@@ -12,6 +12,7 @@ package mcpserver
 
 import (
 	"context"
+	"io"
 	"net/mail"
 	"strings"
 	"testing"
@@ -34,6 +35,9 @@ type fakeClient struct {
 	pages    [][]proton.MessageMetadata
 	counts   []proton.MessageGroupCount
 	labels   []proton.Label
+	// attachments maps attachment ID -> decrypted bytes for the
+	// download_attachment / streaming tests.
+	attachments map[string][]byte
 
 	labeled   []labelCall
 	unlabeled []labelCall
@@ -120,7 +124,20 @@ func (f *fakeClient) SendDraft(context.Context, string, proton.SendDraftReq) (pr
 func (f *fakeClient) GetPublicKeys(context.Context, string) (proton.PublicKeys, proton.RecipientType, error) {
 	panic("unused")
 }
-func (f *fakeClient) GetAttachment(context.Context, string) ([]byte, error) { panic("unused") }
+func (f *fakeClient) GetAttachment(_ context.Context, id string) ([]byte, error) {
+	if b, ok := f.attachments[id]; ok {
+		return b, nil
+	}
+	return nil, &proton.APIError{Status: 404, Message: "not found"}
+}
+func (f *fakeClient) GetAttachmentInto(_ context.Context, id string, dst io.ReaderFrom) error {
+	b, ok := f.attachments[id]
+	if !ok {
+		return &proton.APIError{Status: 404, Message: "not found"}
+	}
+	_, err := dst.ReadFrom(strings.NewReader(string(b)))
+	return err
+}
 func (f *fakeClient) GetMessageRFC822(context.Context, string) ([]byte, error) {
 	panic("unused")
 }
@@ -371,12 +388,23 @@ func TestGetMessage_MetadataAndRaw(t *testing.T) {
 		t.Errorf("folders = %v, want [INBOX]", meta.Message.Folders)
 	}
 
-	_, raw, err := r.getMessage(ctxWithAccount(activeAccount()), nil, GetMessageIn{MessageID: "m1", Format: "raw"})
+	// format=raw now streams the source as content chunks (issue #19) --
+	// the bytes ride in CallToolResult.Content, NOT Message.Raw. The
+	// reassembled chunks must equal the RFC822 source and RawStream must
+	// describe the chunking. Detailed streaming coverage lives in
+	// tools_stream_test.go; here we just pin the new contract.
+	res, raw, err := r.getMessage(ctxWithAccount(activeAccount()), nil, GetMessageIn{MessageID: "m1", Format: "raw"})
 	if err != nil {
 		t.Fatalf("getMessage raw: %v", err)
 	}
-	if raw.Message.Raw == "" || raw.Message.Body != "" {
-		t.Errorf("raw format: raw=%q body=%q", raw.Message.Raw, raw.Message.Body)
+	if raw.Message.Raw != "" || raw.Message.Body != "" {
+		t.Errorf("raw format: Message.Raw/Body must be empty (bytes ride in Content); raw=%q body=%q", raw.Message.Raw, raw.Message.Body)
+	}
+	if raw.RawStream == nil || res == nil {
+		t.Fatalf("raw format: RawStream=%+v res=%v; want streaming envelope + content", raw.RawStream, res)
+	}
+	if got := rawContentString(t, res); got != "Subject: Hi\r\n\r\nthe body" {
+		t.Errorf("reassembled raw = %q, want the RFC822 source", got)
 	}
 }
 

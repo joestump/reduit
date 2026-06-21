@@ -67,6 +67,9 @@ func TestToolsList_ReflectsRequiredSet(t *testing.T) {
 		"move_to_folder",
 		"mark_read",
 		"mark_unread",
+		// download_attachment landed with streaming (issue #19); it is
+		// part of the SPEC-0006 required set.
+		"download_attachment",
 	}
 	for _, name := range required {
 		tool, ok := got[name]
@@ -80,14 +83,5 @@ func TestToolsList_ReflectsRequiredSet(t *testing.T) {
 		if tool.InputSchema == nil {
 			t.Errorf("tool %q has nil input schema", name)
 		}
-	}
-
-	// download_attachment is part of the SPEC-0006 required set but is
-	// explicitly out of scope for issue #14 (streaming, issue #19). Guard
-	// against an accidental partial registration here so the scope is
-	// visible: if a future change adds it, this test should be updated to
-	// move it into `required`.
-	if _, ok := got["download_attachment"]; ok {
-		t.Log("download_attachment is now registered; move it into the required set assertion")
 	}
 }

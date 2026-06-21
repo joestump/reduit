@@ -190,6 +190,115 @@ func (r *Repository) findByHash(ctx context.Context, hash []byte) (*Token, error
 	return t, nil
 }
 
+// ListForAccount returns every mcp_tokens row for the account, newest
+// first, with the token hash and plaintext omitted (the plaintext is
+// never persisted; the hash is not needed by the admin UI and is kept
+// off the listing surface so a list query can't leak it). Revoked and
+// expired tokens are included so the admin UI can show their state and
+// offer revocation of still-live ones.
+//
+// Governing: SPEC-0006 REQ "Token Issuance and Revocation" (the admin UI
+// lists per-account tokens to issue + revoke against).
+func (r *Repository) ListForAccount(ctx context.Context, accountID string) ([]*Token, error) {
+	if accountID == "" {
+		return nil, errors.New("mcptoken: account_id is required")
+	}
+	const q = `
+        SELECT id, account_id, label, created_at, expires_at, revoked_at, last_used_at
+          FROM mcp_tokens
+         WHERE account_id = ?
+         ORDER BY created_at DESC
+    `
+	var rows []struct {
+		ID         string       `db:"id"`
+		AccountID  string       `db:"account_id"`
+		Label      string       `db:"label"`
+		CreatedAt  time.Time    `db:"created_at"`
+		ExpiresAt  sql.NullTime `db:"expires_at"`
+		RevokedAt  sql.NullTime `db:"revoked_at"`
+		LastUsedAt sql.NullTime `db:"last_used_at"`
+	}
+	if err := r.db.SelectContext(ctx, &rows, q, accountID); err != nil {
+		return nil, fmt.Errorf("mcptoken: list for account: %w", err)
+	}
+	out := make([]*Token, 0, len(rows))
+	for _, row := range rows {
+		t := &Token{
+			ID:        row.ID,
+			AccountID: row.AccountID,
+			Label:     row.Label,
+			CreatedAt: row.CreatedAt,
+		}
+		if row.ExpiresAt.Valid {
+			v := row.ExpiresAt.Time
+			t.ExpiresAt = &v
+		}
+		if row.RevokedAt.Valid {
+			v := row.RevokedAt.Time
+			t.RevokedAt = &v
+		}
+		if row.LastUsedAt.Valid {
+			v := row.LastUsedAt.Time
+			t.LastUsedAt = &v
+		}
+		out = append(out, t)
+	}
+	return out, nil
+}
+
+// GetByID returns one mcp_tokens row by its primary key (hash and
+// plaintext omitted). The admin revoke flow uses it to confirm the token
+// belongs to the account being operated on BEFORE revoking -- so a
+// caller cannot revoke a token bound to an account they don't own by
+// guessing a token ID. Returns ErrTokenNotFound when no row matches.
+//
+// Governing: SPEC-0006 REQ "Token Issuance and Revocation" (ownership
+// applies to the target account).
+func (r *Repository) GetByID(ctx context.Context, id string) (*Token, error) {
+	if id == "" {
+		return nil, ErrTokenNotFound
+	}
+	const q = `
+        SELECT id, account_id, label, created_at, expires_at, revoked_at, last_used_at
+          FROM mcp_tokens
+         WHERE id = ?
+    `
+	var row struct {
+		ID         string       `db:"id"`
+		AccountID  string       `db:"account_id"`
+		Label      string       `db:"label"`
+		CreatedAt  time.Time    `db:"created_at"`
+		ExpiresAt  sql.NullTime `db:"expires_at"`
+		RevokedAt  sql.NullTime `db:"revoked_at"`
+		LastUsedAt sql.NullTime `db:"last_used_at"`
+	}
+	if err := r.db.GetContext(ctx, &row, q, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrTokenNotFound
+		}
+		return nil, fmt.Errorf("mcptoken: get by id: %w", err)
+	}
+	t := &Token{
+		ID:        row.ID,
+		AccountID: row.AccountID,
+		Label:     row.Label,
+		CreatedAt: row.CreatedAt,
+	}
+	if row.ExpiresAt.Valid {
+		v := row.ExpiresAt.Time
+		t.ExpiresAt = &v
+	}
+	if row.RevokedAt.Valid {
+		v := row.RevokedAt.Time
+		t.RevokedAt = &v
+	}
+	if row.LastUsedAt.Valid {
+		v := row.LastUsedAt.Time
+		t.LastUsedAt = &v
+	}
+	return t, nil
+}
+
 // Revoke marks an MCP token revoked. Subsequent FindByPlaintext calls
 // still return the row, but Token.IsActive returns false; the bearer
 // middleware MUST therefore check IsActive after a successful lookup.

@@ -202,6 +202,88 @@ func TestRevokeForAccount(t *testing.T) {
 	}
 }
 
+// TestListForAccount returns the account's tokens newest-first, scoped
+// to the account, with the plaintext never present.
+//
+// Governing: SPEC-0006 REQ "Token Issuance and Revocation" (admin UI
+// lists per-account tokens).
+func TestListForAccount(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	defer st.Close()
+	storetest.SeedUserAccountPending(t, st, "acct-1")
+	storetest.SeedUserAccountPending(t, st, "acct-2")
+	repo := mcptoken.NewRepository(st.DB)
+	ctx := context.Background()
+
+	a1, _ := repo.Issue(ctx, mcptoken.IssueParams{AccountID: "acct-1", Label: "first"})
+	a2, _ := repo.Issue(ctx, mcptoken.IssueParams{AccountID: "acct-1", Label: "second"})
+	_, _ = repo.Issue(ctx, mcptoken.IssueParams{AccountID: "acct-2", Label: "other-account"})
+
+	list, err := repo.ListForAccount(ctx, "acct-1")
+	if err != nil {
+		t.Fatalf("ListForAccount: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("ListForAccount returned %d tokens, want 2 (account-scoped)", len(list))
+	}
+	// Both belong to acct-1; neither leaks the plaintext.
+	ids := map[string]bool{a1.ID: false, a2.ID: false}
+	for _, tok := range list {
+		if tok.AccountID != "acct-1" {
+			t.Errorf("token %s has account %s, want acct-1", tok.ID, tok.AccountID)
+		}
+		if tok.Plaintext != "" {
+			t.Errorf("ListForAccount leaked plaintext for %s", tok.ID)
+		}
+		if _, ok := ids[tok.ID]; ok {
+			ids[tok.ID] = true
+		}
+	}
+	if !ids[a1.ID] || !ids[a2.ID] {
+		t.Errorf("ListForAccount missing one of the issued tokens: %v", ids)
+	}
+
+	// Empty account id is a guard.
+	if _, err := repo.ListForAccount(ctx, ""); err == nil {
+		t.Error("ListForAccount(\"\") returned nil error")
+	}
+}
+
+// TestGetByID resolves a token by its primary key, omits the plaintext,
+// and reports ErrTokenNotFound for an unknown id.
+//
+// Governing: SPEC-0006 REQ "Token Issuance and Revocation" (ownership
+// confirmation before revoke).
+func TestGetByID(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	defer st.Close()
+	storetest.SeedUserAccountPending(t, st, "acct-1")
+	repo := mcptoken.NewRepository(st.DB)
+	ctx := context.Background()
+
+	tok, _ := repo.Issue(ctx, mcptoken.IssueParams{AccountID: "acct-1", Label: "lbl"})
+
+	got, err := repo.GetByID(ctx, tok.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.ID != tok.ID || got.AccountID != "acct-1" || got.Label != "lbl" {
+		t.Errorf("GetByID mismatch: %+v", got)
+	}
+	if got.Plaintext != "" {
+		t.Error("GetByID leaked plaintext")
+	}
+
+	if _, err := repo.GetByID(ctx, "no-such-id"); !errors.Is(err, mcptoken.ErrTokenNotFound) {
+		t.Fatalf("GetByID(unknown) err = %v, want ErrTokenNotFound", err)
+	}
+	if _, err := repo.GetByID(ctx, ""); !errors.Is(err, mcptoken.ErrTokenNotFound) {
+		t.Fatalf("GetByID(\"\") err = %v, want ErrTokenNotFound", err)
+	}
+}
+
 // openTempStore mirrors the helper used elsewhere — open + migrate.
 func openTempStore(t *testing.T) *store.Store {
 	t.Helper()

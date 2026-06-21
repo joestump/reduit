@@ -214,6 +214,9 @@ func (c *fakeProtonClient) SendDraft(context.Context, string, proton.SendDraftRe
 func (c *fakeProtonClient) GetAttachment(context.Context, string) ([]byte, error) {
 	return nil, nil
 }
+func (c *fakeProtonClient) GetAttachmentInto(context.Context, string, io.ReaderFrom) error {
+	return nil
+}
 func (c *fakeProtonClient) LabelMessages(_ context.Context, msgIDs []string, labelID string) error {
 	c.parent.record("label", labelID, msgIDs)
 	return nil
@@ -1378,6 +1381,9 @@ func (c *erroringProtonClient) SendDraft(ctx context.Context, id string, r proto
 }
 func (c *erroringProtonClient) GetAttachment(ctx context.Context, id string) ([]byte, error) {
 	return c.wrapped.GetAttachment(ctx, id)
+}
+func (c *erroringProtonClient) GetAttachmentInto(ctx context.Context, id string, dst io.ReaderFrom) error {
+	return c.wrapped.GetAttachmentInto(ctx, id, dst)
 }
 func (c *erroringProtonClient) LabelMessages(ctx context.Context, msgIDs []string, labelID string) error {
 	if c.failOn == "label" {

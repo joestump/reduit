@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -48,6 +49,9 @@ type (
 	Message = gpa.Message
 	// MessageMetadata is the listing-friendly subset of Message.
 	MessageMetadata = gpa.MessageMetadata
+	// Attachment is one message attachment's metadata (id/name/size/
+	// MIME). Surfaced by get_message and consumed by download_attachment.
+	Attachment = gpa.Attachment
 	// MessageFilter is the filter passed to ListMessages.
 	MessageFilter = gpa.MessageFilter
 	// SendDraftReq is the request body for /mail/v4/messages/{id} send.
@@ -277,6 +281,23 @@ type Client interface {
 
 	// GetAttachment downloads the decrypted bytes of one attachment.
 	GetAttachment(ctx context.Context, attachmentID string) ([]byte, error)
+
+	// GetAttachmentInto downloads the decrypted bytes of one attachment
+	// and writes them through `dst` rather than returning a fully-buffered
+	// []byte. The MCP download_attachment tool passes a memory-capped
+	// writer so Reduit never holds more than the documented streaming cap
+	// (16 MiB) of attachment payload in process, regardless of attachment
+	// size.
+	//
+	// NOTE: go-proton-api decrypts the attachment in full internally before
+	// invoking dst.ReadFrom, so this bounds *Reduit's* added buffering and
+	// the bytes it copies onward to the MCP client, not the upstream
+	// library's transient decrypt buffer. True end-to-end streaming from
+	// Proton would require an upstream streaming-decrypt API that does not
+	// exist today.
+	//
+	// Governing: SPEC-0006 REQ "Streaming Bodies and Attachments".
+	GetAttachmentInto(ctx context.Context, attachmentID string, dst io.ReaderFrom) error
 
 	// LabelMessages adds the given Proton label ID to each message in
 	// messageIDs. Used by the IMAP MOVE / COPY handlers to translate
@@ -710,6 +731,22 @@ func (c *clientImpl) GetAttachment(ctx context.Context, attachmentID string) ([]
 	}
 	defer release()
 	return up.GetAttachment(ctx, attachmentID)
+}
+
+// GetAttachmentInto streams the decrypted attachment bytes through dst
+// instead of returning a fully-buffered slice. The upstream
+// GetAttachmentInto decrypts in full before invoking dst.ReadFrom; the
+// caller's dst (a memory-capped writer for the MCP tool) is what bounds
+// Reduit's onward buffering.
+//
+// Governing: SPEC-0006 REQ "Streaming Bodies and Attachments".
+func (c *clientImpl) GetAttachmentInto(ctx context.Context, attachmentID string, dst io.ReaderFrom) error {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return up.GetAttachmentInto(ctx, attachmentID, dst)
 }
 
 // LabelMessages forwards to the upstream client.

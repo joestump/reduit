@@ -40,6 +40,7 @@ import (
 	gpa "github.com/ProtonMail/go-proton-api"
 
 	"github.com/joestump/reduit/internal/account"
+	"github.com/joestump/reduit/internal/auth/mcptoken"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	"github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/cryptenv"
@@ -213,6 +214,9 @@ func (c *stubProtonClient) GetPublicKeys(context.Context, string) (proton.Public
 func (c *stubProtonClient) GetAttachment(context.Context, string) ([]byte, error) {
 	panic("unexpected")
 }
+func (c *stubProtonClient) GetAttachmentInto(context.Context, string, io.ReaderFrom) error {
+	panic("unexpected")
+}
 func (c *stubProtonClient) LabelMessages(context.Context, []string, string) error {
 	panic("unexpected")
 }
@@ -353,6 +357,9 @@ func newWizardFixtureWithWriteTimeout(t *testing.T, ttl, writeTimeout time.Durat
 		AutoCreate:      true, // production default; admit fresh test subjects
 		InsecureCookies: true,
 		StatusBus:       statusBus,
+		// MCP token UI (issue #19): wire the real repository so the
+		// /accounts/{id}/mcp-tokens routes are live in the fixture.
+		MCPTokens: mcptoken.NewRepository(st.DB),
 	}
 	_, handler := server.NewForTest(deps)
 	mux.Handle("/", handler)

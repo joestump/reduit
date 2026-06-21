@@ -181,6 +181,17 @@ type Deps struct {
 	// (HTMX + SSE).
 	StatusBus *pubsub.Bus
 
+	// MCPTokens is the per-account MCP bearer-token repository the admin
+	// token UI issues + revokes against (SPEC-0006 REQ "Token Issuance and
+	// Revocation"). Held as a narrow interface so handler tests can stub it
+	// without a database; *mcptoken.Repository satisfies it. nil disables
+	// the token UI: the GET/POST routes are still registered but 500 with
+	// "mcp tokens not configured" (the mcpTokensReady gate), mirroring how
+	// the dashboard action handlers degrade on a missing service.
+	//
+	// Governing: SPEC-0006 REQ "Token Issuance and Revocation", ADR-0008.
+	MCPTokens MCPTokenStore
+
 	// Notifications is the admin-notification surface (internal/notify).
 	// The admin accounts page renders unacknowledged notifications (sync
 	// worker crashes, permanent-error auto-reverts) as a dismissable
@@ -518,6 +529,25 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// SPEC-0005 design "Content security and CSRF"; issue #26.
 	mux.HandleFunc("GET /accounts/{id}/credentials", s.handleAccountCredentials)
 	mux.Handle("POST /accounts/{id}/credentials/rotate", s.csrfProtectFunc(s.handleAccountCredentialsRotate))
+
+	// Per-account MCP token issuance + revocation per SPEC-0006 REQ "Token
+	// Issuance and Revocation". GET lists the account's tokens + an issue
+	// form; the issue POST returns a one-time-display modal with the
+	// plaintext; the revoke POST marks a token revoked. Gated by
+	// requireOwnedAccount inside each handler (owner or admin).
+	//
+	// Both POSTs are CSRF-protected (csrfProtect): the issue form and each
+	// revoke <form> carry the hidden csrf_token field, and the issue HTMX
+	// post inherits the X-CSRF-Token header via base.html's hx-headers.
+	// Fail-closed: a missing/invalid token 403s before the ownership check
+	// or any token mutation. This matches the credentials-rotate +
+	// dashboard-action POST shape (issue #26).
+	//
+	// Governing: SPEC-0006 REQ "Token Issuance and Revocation", SPEC-0005
+	// design "Content security and CSRF"; issues #19, #26.
+	mux.HandleFunc("GET /accounts/{id}/mcp-tokens", s.handleMCPTokens)
+	mux.Handle("POST /accounts/{id}/mcp-tokens", s.csrfProtectFunc(s.handleMCPTokenIssue))
+	mux.Handle("POST /accounts/{id}/mcp-tokens/{tokenID}/revoke", s.csrfProtectFunc(s.handleMCPTokenRevoke))
 
 	// Admin-only account management routes. All routes below are
 	// wrapped by auth.RequireAdmin so a 403 is returned for any

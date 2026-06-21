@@ -90,7 +90,7 @@ func (r *toolRegistry) registerRead(srv *mcp.Server) {
 
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "get_message",
-		Description: "Fetch one message by Proton message ID. format=metadata (default) returns headers + parsed fields; format=raw returns the full RFC822 source.",
+		Description: "Fetch one message by Proton message ID. format=metadata (default) returns headers + parsed fields; format=raw streams the full RFC822 source as ordered content chunks, capped at 16 MiB (a larger source is truncated and raw_stream.truncated is set true).",
 	}, r.getMessage)
 
 	mcp.AddTool(srv, &mcp.Tool{
@@ -230,7 +230,14 @@ type GetMessageIn struct {
 // GetMessageOut is the output schema for get_message.
 type GetMessageOut struct {
 	Message *FullMessage `json:"message,omitempty"`
-	Error   *ToolError   `json:"error,omitempty"`
+	// RawStream carries the chunk accounting for a format=raw response.
+	// The raw bytes themselves ride in CallToolResult.Content (one text
+	// content block per chunk); this struct is the streaming envelope.
+	// Nil for format=metadata.
+	//
+	// Governing: SPEC-0006 REQ "Streaming Bodies and Attachments".
+	RawStream *rawStreamMeta `json:"raw_stream,omitempty"`
+	Error     *ToolError     `json:"error,omitempty"`
 }
 
 // FullMessage is the get_message projection. Body is populated for
@@ -250,11 +257,32 @@ type FullMessage struct {
 	Raw       string   `json:"raw,omitempty"`
 	Folders   []string `json:"folders"`
 	LabelIDs  []string `json:"label_ids"`
+	// Attachments lists the message's attachments (id/name/size/mime) so
+	// an agent can pick one to pass to download_attachment.
+	//
+	// Governing: SPEC-0006 REQ "Required Tool Set" (download_attachment).
+	Attachments []AttachmentMeta `json:"attachments,omitempty"`
 }
 
-// getMessage implements the get_message tool. Large-body streaming
-// (format=raw on a 50 MiB message) is deferred to issue #19 per the
-// task scope; v0.1 returns the decrypted body inline.
+// AttachmentMeta is the listing-friendly projection of one Proton
+// attachment, surfaced on a get_message response so the agent has the
+// attachment_id download_attachment accepts plus the name/size/MIME to
+// decide whether to fetch it.
+type AttachmentMeta struct {
+	AttachmentID string `json:"attachment_id"`
+	Name         string `json:"name,omitempty"`
+	MIMEType     string `json:"mime_type,omitempty"`
+	Size         int64  `json:"size"`
+}
+
+// getMessage implements the get_message tool. format=metadata returns
+// the decrypted body inline; format=raw streams the RFC822 source as
+// ordered MCP content chunks bounded by the 16 MiB cap (per issue #19 /
+// SPEC-0006 REQ "Streaming Bodies and Attachments") so a large message
+// never buffers in full beyond the cap.
+//
+// Governing: SPEC-0006 REQ "Required Tool Set", REQ "Streaming Bodies and
+// Attachments".
 func (r *toolRegistry) getMessage(ctx context.Context, _ *mcp.CallToolRequest, in GetMessageIn) (*mcp.CallToolResult, GetMessageOut, error) {
 	acct, err := r.accountFor(ctx)
 	if err != nil {
@@ -278,28 +306,42 @@ func (r *toolRegistry) getMessage(ctx context.Context, _ *mcp.CallToolRequest, i
 	}
 
 	full := &FullMessage{
-		MessageID: msg.ID,
-		Subject:   msg.Subject,
-		From:      addrString(msg.Sender),
-		To:        addrStrings(msg.ToList),
-		CC:        addrStrings(msg.CCList),
-		BCC:       addrStrings(msg.BCCList),
-		Date:      msg.Time,
-		Unread:    bool(msg.Unread),
-		MIMEType:  string(msg.MIMEType),
-		Folders:   foldersForLabelIDs(msg.LabelIDs),
-		LabelIDs:  msg.LabelIDs,
+		MessageID:   msg.ID,
+		Subject:     msg.Subject,
+		From:        addrString(msg.Sender),
+		To:          addrStrings(msg.ToList),
+		CC:          addrStrings(msg.CCList),
+		BCC:         addrStrings(msg.BCCList),
+		Date:        msg.Time,
+		Unread:      bool(msg.Unread),
+		MIMEType:    string(msg.MIMEType),
+		Folders:     foldersForLabelIDs(msg.LabelIDs),
+		LabelIDs:    msg.LabelIDs,
+		Attachments: attachmentMetas(msg),
 	}
 
 	switch strings.ToLower(strings.TrimSpace(in.Format)) {
 	case "", "metadata":
 		full.Body = msg.Body
+		return nil, GetMessageOut{Message: full}, nil
 	case "raw":
 		// The decrypted RFC822 source: reconstruct from the stored
 		// header block + decrypted body. go-proton-api exposes Header
 		// (raw) and Body (decrypted); concatenated they form the RFC822
 		// representation an agent expects from format=raw.
-		full.Raw = rawSource(msg)
+		//
+		// Stream the source as ordered content chunks bounded by the
+		// 16 MiB cap rather than packing the whole body into the Raw
+		// struct field. We do NOT also set full.Raw -- that would double
+		// the in-process copy and defeat the cap -- so a raw response's
+		// bytes live ONLY in the content chunks. The structured envelope
+		// (full + RawStream) tells the agent how many chunks to expect.
+		//
+		// Governing: SPEC-0006 REQ "Streaming Bodies and Attachments"
+		// (Scenario "Large message body streamed").
+		contents, meta := streamRawBody(rawSource(msg))
+		return &mcp.CallToolResult{Content: contents},
+			GetMessageOut{Message: full, RawStream: &meta}, nil
 	default:
 		return nil, GetMessageOut{Error: &ToolError{
 			Code:      codeInvalidArgument,
@@ -307,8 +349,25 @@ func (r *toolRegistry) getMessage(ctx context.Context, _ *mcp.CallToolRequest, i
 			Retriable: false,
 		}}, nil
 	}
+}
 
-	return nil, GetMessageOut{Message: full}, nil
+// attachmentMetas projects a message's attachments into the
+// listing-friendly AttachmentMeta slice. Returns nil (omitempty) when
+// the message carries no attachments.
+func attachmentMetas(msg proton.Message) []AttachmentMeta {
+	if len(msg.Attachments) == 0 {
+		return nil
+	}
+	out := make([]AttachmentMeta, 0, len(msg.Attachments))
+	for _, a := range msg.Attachments {
+		out = append(out, AttachmentMeta{
+			AttachmentID: a.ID,
+			Name:         a.Name,
+			MIMEType:     string(a.MIMEType),
+			Size:         a.Size,
+		})
+	}
+	return out
 }
 
 // ----- list_labels -----

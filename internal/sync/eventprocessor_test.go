@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"runtime"
@@ -93,6 +94,9 @@ func (f *fakeProtonClient) SendDraft(context.Context, string, proton.SendDraftRe
 }
 func (f *fakeProtonClient) GetAttachment(context.Context, string) ([]byte, error) {
 	panic("GetAttachment: unexpected call")
+}
+func (f *fakeProtonClient) GetAttachmentInto(context.Context, string, io.ReaderFrom) error {
+	panic("GetAttachmentInto: unexpected call")
 }
 func (f *fakeProtonClient) Logout(context.Context) error { return nil }
 func (f *fakeProtonClient) LatestRefreshToken() string   { return "" }

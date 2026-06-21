@@ -126,6 +126,7 @@ func registerTools(srv *mcp.Server, deps ToolDeps) {
 	}
 	r := &toolRegistry{deps: deps}
 	r.registerRead(srv)
+	r.registerStream(srv)
 	r.registerWrite(srv)
 	r.registerSend(srv)
 }
