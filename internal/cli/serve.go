@@ -372,19 +372,36 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		mcpTokens := mcptoken.NewRepository(st.DB)
 		validator := auth.NewBearerValidator(oidcClient, mcpTokens).
 			WithSubjectResolver(makeSubjectResolver(accountService, usersService))
-		// Tools is intentionally left nil here: the read/write/send tool
-		// surface (issue #14, SPEC-0006 REQ "Required Tool Set") is fully
-		// implemented behind mcpserver.ToolDeps, but its ClientResolver
-		// (account ID -> session-bearing proton.Client) and Outbox
-		// dependencies require the account->Proton-client hydration path
-		// and the SPEC-0004 SMTP outbox, both of which are wired in the
-		// sync/outbox milestone (the same milestone that constructs
-		// imapserver.Backend's ProtonClientLookup and smtpserver). Until
-		// that path exists in this composition root, /mcp serves auth +
-		// concurrency + an empty tools/list. Flip Tools to a populated
-		// *mcpserver.ToolDeps once the resolver + outbox are available.
+		// Wire the read/write/send tool surface (issue #14, SPEC-0006 REQ
+		// "Required Tool Set") onto the live MCP server (issue #30). The
+		// ClientResolver is the same protonlive.Resolver the IMAP backend
+		// and SMTP outbox resolve through: liveClients.Resolver() adapts the
+		// process-wide account-ID -> unlocked proton.Client registry, which
+		// the wizard populates on unlock and boot re-unlock (#28/#34)
+		// re-populates on restart. *protonlive.Resolver satisfies
+		// mcpserver.ClientResolver structurally (ProtonForAccount), so no
+		// shim is needed.
 		//
-		// Governing: SPEC-0006 REQ "Required Tool Set", ADR-0008.
+		// Outbox is left nil: send_message is still registered (so the tool
+		// listing stays complete per the "Required Tool Set" REQ), but a nil
+		// Outbox makes it return a structured `unavailable` error rather than
+		// attempting a send. The outbox.Manager cannot be constructed here
+		// yet because outbox.New requires a production outbox.Builder
+		// (CreateDraft + per-recipient-mode MessagePackage assembly per
+		// SPEC-0004 REQ "Encryption Pipeline"), which does not exist in the
+		// tree -- only the test-only BuilderFunc/Skip escape hatch does. That
+		// Builder, the smtpserver, and the imapserver.Backend
+		// ProtonClientLookup all land together in the deferred SMTP/sync
+		// milestone; wiring a stub Builder here would be the silent-success
+		// footgun outbox.New deliberately forbids. So the READ + WRITE tools
+		// (which need only the ClientResolver) go live now; send_message's
+		// Outbox dependency remains unwired until that milestone. Flip Outbox
+		// to the constructed *outbox.Manager once the production Builder
+		// exists.
+		//
+		// Governing: SPEC-0006 REQ "Required Tool Set", REQ "Send-Message
+		// Encryption" (encryption is the outbox's job, not reimplemented
+		// here), ADR-0008.
 		mcpSrv := mcpserver.New(mcpserver.Deps{
 			Validator: validator,
 			Accounts:  accountService,
@@ -394,7 +411,11 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 				mcpserver.DefaultQueueDepth,
 			),
 			Logger: logger,
-			Tools:  nil,
+			Tools: &mcpserver.ToolDeps{
+				Clients: liveClients.Resolver(),
+				Outbox:  nil,
+				Logger:  logger,
+			},
 		})
 		mcpHandler = mcpSrv.Handler()
 		logger.Info("mcp server ready",
@@ -418,6 +439,12 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// fails; the MoveReconciler is the ONLY drainer for that table. Wiring
 	// the IMAP server without the reconciler would let those rows
 	// accumulate and leave messages stuck in two mailboxes.
+	//
+	// That same wiring MUST pass imapserver.WithProton(liveClients.Resolver())
+	// so the IMAP backend's ProtonClientLookup resolves the SAME live-client
+	// registry the MCP ToolDeps.Clients already use (wired above, #30). The
+	// resolver is constructed and ready; only imapserver.New's call site is
+	// deferred to this milestone.
 	//
 	// Governing: SPEC-0005 REQ "Per-User IMAP/SMTP Credentials",
 	// REQ "Admin Account Management",
