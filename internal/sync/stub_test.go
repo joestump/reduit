@@ -71,6 +71,15 @@ func (stubClient) GetMessageRFC822(context.Context, string) ([]byte, error) {
 func (stubClient) ListMessages(context.Context, proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	panic("stubClient.ListMessages: lifecycle tests must not reach Proton")
 }
+func (stubClient) ListMessagesPage(context.Context, int, int, proton.MessageFilter) ([]proton.MessageMetadata, error) {
+	panic("stubClient.ListMessagesPage: lifecycle tests must not reach Proton")
+}
+func (stubClient) GroupedMessageCount(context.Context) ([]proton.MessageGroupCount, error) {
+	panic("stubClient.GroupedMessageCount: lifecycle tests must not reach Proton")
+}
+func (stubClient) GetLabels(context.Context, ...proton.LabelType) ([]proton.Label, error) {
+	panic("stubClient.GetLabels: lifecycle tests must not reach Proton")
+}
 func (stubClient) SendDraft(context.Context, string, proton.SendDraftReq) (proton.Message, error) {
 	panic("stubClient.SendDraft: lifecycle tests must not reach Proton")
 }
@@ -92,6 +101,12 @@ func (stubClient) LabelMessages(context.Context, []string, string) error {
 }
 func (stubClient) UnlabelMessages(context.Context, []string, string) error {
 	panic("stubClient.UnlabelMessages: lifecycle tests must not reach Proton")
+}
+func (stubClient) MarkMessagesRead(context.Context, ...string) error {
+	panic("stubClient.MarkMessagesRead: lifecycle tests must not reach Proton")
+}
+func (stubClient) MarkMessagesUnread(context.Context, ...string) error {
+	panic("stubClient.MarkMessagesUnread: lifecycle tests must not reach Proton")
 }
 
 // StubClientFactory is a ClientFactory that returns a stubClient for

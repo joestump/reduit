@@ -183,6 +183,15 @@ func (c *fakeProtonClient) GetMessageRFC822(_ context.Context, messageID string)
 func (c *fakeProtonClient) ListMessages(context.Context, proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	return nil, nil
 }
+func (c *fakeProtonClient) ListMessagesPage(context.Context, int, int, proton.MessageFilter) ([]proton.MessageMetadata, error) {
+	return nil, nil
+}
+func (c *fakeProtonClient) GroupedMessageCount(context.Context) ([]proton.MessageGroupCount, error) {
+	return nil, nil
+}
+func (c *fakeProtonClient) GetLabels(context.Context, ...proton.LabelType) ([]proton.Label, error) {
+	return nil, nil
+}
 func (c *fakeProtonClient) SendDraft(context.Context, string, proton.SendDraftReq) (proton.Message, error) {
 	return proton.Message{}, nil
 }
@@ -197,8 +206,10 @@ func (c *fakeProtonClient) UnlabelMessages(_ context.Context, msgIDs []string, l
 	c.parent.record("unlabel", labelID, msgIDs)
 	return nil
 }
-func (c *fakeProtonClient) Logout(context.Context) error { return nil }
-func (c *fakeProtonClient) LatestRefreshToken() string   { return "" }
+func (c *fakeProtonClient) MarkMessagesRead(context.Context, ...string) error   { return nil }
+func (c *fakeProtonClient) MarkMessagesUnread(context.Context, ...string) error { return nil }
+func (c *fakeProtonClient) Logout(context.Context) error                        { return nil }
+func (c *fakeProtonClient) LatestRefreshToken() string                          { return "" }
 
 // Methods added to proton.Client by SPEC-0002 (GetLatestEventID) and
 // SPEC-0004 (GetPublicKeys). IMAP mailbox tests do not exercise these
@@ -912,6 +923,15 @@ func (c *erroringProtonClient) GetMessageRFC822(ctx context.Context, id string) 
 func (c *erroringProtonClient) ListMessages(ctx context.Context, f proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	return c.wrapped.ListMessages(ctx, f)
 }
+func (c *erroringProtonClient) ListMessagesPage(ctx context.Context, page, pageSize int, f proton.MessageFilter) ([]proton.MessageMetadata, error) {
+	return c.wrapped.ListMessagesPage(ctx, page, pageSize, f)
+}
+func (c *erroringProtonClient) GroupedMessageCount(ctx context.Context) ([]proton.MessageGroupCount, error) {
+	return c.wrapped.GroupedMessageCount(ctx)
+}
+func (c *erroringProtonClient) GetLabels(ctx context.Context, lt ...proton.LabelType) ([]proton.Label, error) {
+	return c.wrapped.GetLabels(ctx, lt...)
+}
 func (c *erroringProtonClient) SendDraft(ctx context.Context, id string, r proton.SendDraftReq) (proton.Message, error) {
 	return c.wrapped.SendDraft(ctx, id, r)
 }
@@ -929,6 +949,12 @@ func (c *erroringProtonClient) UnlabelMessages(ctx context.Context, msgIDs []str
 		return errors.New("simulated proton unlabel failure")
 	}
 	return c.wrapped.UnlabelMessages(ctx, msgIDs, labelID)
+}
+func (c *erroringProtonClient) MarkMessagesRead(ctx context.Context, ids ...string) error {
+	return c.wrapped.MarkMessagesRead(ctx, ids...)
+}
+func (c *erroringProtonClient) MarkMessagesUnread(ctx context.Context, ids ...string) error {
+	return c.wrapped.MarkMessagesUnread(ctx, ids...)
 }
 func (c *erroringProtonClient) Logout(ctx context.Context) error { return c.wrapped.Logout(ctx) }
 func (c *erroringProtonClient) LatestRefreshToken() string       { return c.wrapped.LatestRefreshToken() }

@@ -79,6 +79,15 @@ func (f *fakeProtonClient) GetMessageRFC822(context.Context, string) ([]byte, er
 func (f *fakeProtonClient) ListMessages(context.Context, proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	panic("ListMessages: unexpected call")
 }
+func (f *fakeProtonClient) ListMessagesPage(context.Context, int, int, proton.MessageFilter) ([]proton.MessageMetadata, error) {
+	panic("ListMessagesPage: unexpected call")
+}
+func (f *fakeProtonClient) GroupedMessageCount(context.Context) ([]proton.MessageGroupCount, error) {
+	panic("GroupedMessageCount: unexpected call")
+}
+func (f *fakeProtonClient) GetLabels(context.Context, ...proton.LabelType) ([]proton.Label, error) {
+	panic("GetLabels: unexpected call")
+}
 func (f *fakeProtonClient) SendDraft(context.Context, string, proton.SendDraftReq) (proton.Message, error) {
 	panic("SendDraft: unexpected call")
 }
@@ -100,6 +109,12 @@ func (f *fakeProtonClient) LabelMessages(context.Context, []string, string) erro
 }
 func (f *fakeProtonClient) UnlabelMessages(context.Context, []string, string) error {
 	panic("UnlabelMessages: unexpected call")
+}
+func (f *fakeProtonClient) MarkMessagesRead(context.Context, ...string) error {
+	panic("MarkMessagesRead: unexpected call")
+}
+func (f *fakeProtonClient) MarkMessagesUnread(context.Context, ...string) error {
+	panic("MarkMessagesUnread: unexpected call")
 }
 
 func (f *fakeProtonClient) cursorsCalled() []string {

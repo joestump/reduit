@@ -68,6 +68,15 @@ func (f *fakeProtonClient) GetMessageRFC822(context.Context, string) ([]byte, er
 func (f *fakeProtonClient) ListMessages(context.Context, proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	panic("fakeProtonClient: ListMessages not implemented")
 }
+func (f *fakeProtonClient) ListMessagesPage(context.Context, int, int, proton.MessageFilter) ([]proton.MessageMetadata, error) {
+	panic("fakeProtonClient: ListMessagesPage not implemented")
+}
+func (f *fakeProtonClient) GroupedMessageCount(context.Context) ([]proton.MessageGroupCount, error) {
+	panic("fakeProtonClient: GroupedMessageCount not implemented")
+}
+func (f *fakeProtonClient) GetLabels(context.Context, ...proton.LabelType) ([]proton.Label, error) {
+	panic("fakeProtonClient: GetLabels not implemented")
+}
 func (f *fakeProtonClient) SendDraft(context.Context, string, proton.SendDraftReq) (proton.Message, error) {
 	panic("fakeProtonClient: SendDraft not implemented")
 }
@@ -92,6 +101,12 @@ func (f *fakeProtonClient) LabelMessages(context.Context, []string, string) erro
 }
 func (f *fakeProtonClient) UnlabelMessages(context.Context, []string, string) error {
 	panic("fakeProtonClient: UnlabelMessages not implemented")
+}
+func (f *fakeProtonClient) MarkMessagesRead(context.Context, ...string) error {
+	panic("fakeProtonClient: MarkMessagesRead not implemented")
+}
+func (f *fakeProtonClient) MarkMessagesUnread(context.Context, ...string) error {
+	panic("fakeProtonClient: MarkMessagesUnread not implemented")
 }
 
 // TestSelectMode_ProtonInternalGetsE2E covers the SPEC-0004 scenario

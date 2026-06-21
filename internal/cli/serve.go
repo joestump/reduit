@@ -287,6 +287,19 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		mcpTokens := mcptoken.NewRepository(st.DB)
 		validator := auth.NewBearerValidator(oidcClient, mcpTokens).
 			WithSubjectResolver(makeSubjectResolver(accountService, usersService))
+		// Tools is intentionally left nil here: the read/write/send tool
+		// surface (issue #14, SPEC-0006 REQ "Required Tool Set") is fully
+		// implemented behind mcpserver.ToolDeps, but its ClientResolver
+		// (account ID -> session-bearing proton.Client) and Outbox
+		// dependencies require the account->Proton-client hydration path
+		// and the SPEC-0004 SMTP outbox, both of which are wired in the
+		// sync/outbox milestone (the same milestone that constructs
+		// imapserver.Backend's ProtonClientLookup and smtpserver). Until
+		// that path exists in this composition root, /mcp serves auth +
+		// concurrency + an empty tools/list. Flip Tools to a populated
+		// *mcpserver.ToolDeps once the resolver + outbox are available.
+		//
+		// Governing: SPEC-0006 REQ "Required Tool Set", ADR-0008.
 		mcpSrv := mcpserver.New(mcpserver.Deps{
 			Validator: validator,
 			Accounts:  accountService,
@@ -296,6 +309,7 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 				mcpserver.DefaultQueueDepth,
 			),
 			Logger: logger,
+			Tools:  nil,
 		})
 		mcpHandler = mcpSrv.Handler()
 		logger.Info("mcp server ready",

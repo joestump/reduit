@@ -68,6 +68,28 @@ type (
 	// HTTP responses. The outbox uses errors.As to map upstream HTTP
 	// status codes onto SMTP reply codes.
 	APIError = gpa.APIError
+	// Label is one entry from /core/v4/labels. The MCP list_labels tool
+	// surfaces these to AI agents (per SPEC-0006 REQ "Required Tool Set").
+	Label = gpa.Label
+	// LabelType discriminates user labels, folders, contact groups, and
+	// system labels in /core/v4/labels responses.
+	LabelType = gpa.LabelType
+	// MessageGroupCount is one per-label total/unread count from
+	// /mail/v4/messages/count. The MCP list_messages tool reads the entry
+	// whose LabelID matches the requested folder to populate total_count
+	// cheaply (one round-trip, no full-mailbox fetch).
+	MessageGroupCount = gpa.MessageGroupCount
+)
+
+// LabelType constants re-exported so callers (the MCP list_labels tool)
+// do not need to import go-proton-api directly. list_labels requests the
+// user-label and folder types; system labels are surfaced via the IMAP
+// system-folder mapping instead, so they are intentionally not listed.
+const (
+	LabelTypeLabel        = gpa.LabelTypeLabel
+	LabelTypeContactGroup = gpa.LabelTypeContactGroup
+	LabelTypeFolder       = gpa.LabelTypeFolder
+	LabelTypeSystem       = gpa.LabelTypeSystem
 )
 
 // RecipientType constants re-exported so callers do not need to import
@@ -192,6 +214,35 @@ type Client interface {
 	// Wraps the upstream paged GetMessageMetadata.
 	ListMessages(ctx context.Context, filter MessageFilter) ([]MessageMetadata, error)
 
+	// ListMessagesPage returns one server-side page of message metadata
+	// matching `filter`. Unlike ListMessages (which loops until every
+	// page is fetched), this exposes Proton's native page/page_size
+	// pagination so the MCP list_messages / search_messages tools can
+	// honour the caller's page request without buffering an entire
+	// mailbox in memory.
+	//
+	// Governing: SPEC-0006 REQ "Pagination on List and Search".
+	ListMessagesPage(ctx context.Context, page, pageSize int, filter MessageFilter) ([]MessageMetadata, error)
+
+	// GroupedMessageCount returns the per-label total/unread message
+	// counts for the authenticated user. The MCP list_messages tool
+	// reads the entry whose LabelID matches the requested folder to
+	// populate `total_count` cheaply (one round-trip) rather than
+	// fetching every page. Free-text searches have no cheap count and
+	// report `total_count_known: false` instead.
+	//
+	// Governing: SPEC-0006 REQ "Pagination on List and Search"
+	// (Scenario "Pagination metadata included").
+	GroupedMessageCount(ctx context.Context) ([]MessageGroupCount, error)
+
+	// GetLabels returns the labels of the requested types for the
+	// authenticated user. The MCP list_labels tool requests user labels
+	// and folders; the returned Label carries the Proton label ID the
+	// add_label / remove_label tools accept.
+	//
+	// Governing: SPEC-0006 REQ "Required Tool Set" (list_labels).
+	GetLabels(ctx context.Context, labelTypes ...LabelType) ([]Label, error)
+
 	// SendDraft submits a draft for delivery via /mail/v4/messages/{id}.
 	SendDraft(ctx context.Context, draftID string, req SendDraftReq) (Message, error)
 
@@ -225,6 +276,19 @@ type Client interface {
 	// from each message. Paired with LabelMessages by the IMAP MOVE
 	// handler to materialise the additive model.
 	UnlabelMessages(ctx context.Context, messageIDs []string, labelID string) error
+
+	// MarkMessagesRead clears the unread flag on each message. The MCP
+	// mark_read tool calls it only for messages currently unread, so the
+	// mutation is idempotent.
+	//
+	// Governing: SPEC-0006 REQ "Idempotent Mutations".
+	MarkMessagesRead(ctx context.Context, messageIDs ...string) error
+
+	// MarkMessagesUnread sets the unread flag on each message. The MCP
+	// mark_unread tool calls it only for messages currently read.
+	//
+	// Governing: SPEC-0006 REQ "Idempotent Mutations".
+	MarkMessagesUnread(ctx context.Context, messageIDs ...string) error
 
 	// Logout revokes the session via /auth/v4 DELETE and releases
 	// the underlying upstream client. Idempotent; safe to call on a
@@ -551,6 +615,37 @@ func (c *clientImpl) ListMessages(ctx context.Context, filter MessageFilter) ([]
 	return up.GetMessageMetadata(ctx, filter)
 }
 
+// ListMessagesPage forwards to the upstream paged endpoint, exposing
+// one server-side page rather than looping until exhaustion.
+func (c *clientImpl) ListMessagesPage(ctx context.Context, page, pageSize int, filter MessageFilter) ([]MessageMetadata, error) {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return up.GetMessageMetadataPage(ctx, page, pageSize, filter)
+}
+
+// GroupedMessageCount forwards to the upstream per-label count endpoint.
+func (c *clientImpl) GroupedMessageCount(ctx context.Context) ([]MessageGroupCount, error) {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return up.GetGroupedMessageCount(ctx)
+}
+
+// GetLabels forwards to the upstream label-listing endpoint.
+func (c *clientImpl) GetLabels(ctx context.Context, labelTypes ...LabelType) ([]Label, error) {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	return up.GetLabels(ctx, labelTypes...)
+}
+
 // SendDraft submits a draft for delivery.
 func (c *clientImpl) SendDraft(ctx context.Context, draftID string, req SendDraftReq) (Message, error) {
 	up, release, err := c.requireSession()
@@ -601,6 +696,26 @@ func (c *clientImpl) UnlabelMessages(ctx context.Context, messageIDs []string, l
 	}
 	defer release()
 	return up.UnlabelMessages(ctx, messageIDs, labelID)
+}
+
+// MarkMessagesRead forwards to the upstream client.
+func (c *clientImpl) MarkMessagesRead(ctx context.Context, messageIDs ...string) error {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return up.MarkMessagesRead(ctx, messageIDs...)
+}
+
+// MarkMessagesUnread forwards to the upstream client.
+func (c *clientImpl) MarkMessagesUnread(ctx context.Context, messageIDs ...string) error {
+	up, release, err := c.requireSession()
+	if err != nil {
+		return err
+	}
+	defer release()
+	return up.MarkMessagesUnread(ctx, messageIDs...)
 }
 
 // Logout revokes the session and tears down the upstream client.

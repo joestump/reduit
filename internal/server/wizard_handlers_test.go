@@ -182,6 +182,15 @@ func (c *stubProtonClient) GetMessageRFC822(context.Context, string) ([]byte, er
 func (c *stubProtonClient) ListMessages(context.Context, proton.MessageFilter) ([]proton.MessageMetadata, error) {
 	panic("unexpected")
 }
+func (c *stubProtonClient) ListMessagesPage(context.Context, int, int, proton.MessageFilter) ([]proton.MessageMetadata, error) {
+	panic("unexpected")
+}
+func (c *stubProtonClient) GroupedMessageCount(context.Context) ([]proton.MessageGroupCount, error) {
+	panic("unexpected")
+}
+func (c *stubProtonClient) GetLabels(context.Context, ...proton.LabelType) ([]proton.Label, error) {
+	panic("unexpected")
+}
 func (c *stubProtonClient) SendDraft(context.Context, string, proton.SendDraftReq) (proton.Message, error) {
 	panic("unexpected")
 }
@@ -195,6 +204,12 @@ func (c *stubProtonClient) LabelMessages(context.Context, []string, string) erro
 	panic("unexpected")
 }
 func (c *stubProtonClient) UnlabelMessages(context.Context, []string, string) error {
+	panic("unexpected")
+}
+func (c *stubProtonClient) MarkMessagesRead(context.Context, ...string) error {
+	panic("unexpected")
+}
+func (c *stubProtonClient) MarkMessagesUnread(context.Context, ...string) error {
 	panic("unexpected")
 }
 func (c *stubProtonClient) Logout(context.Context) error {

@@ -93,6 +93,15 @@ type Deps struct {
 	// Logger is used for structured authn/authz failures and
 	// concurrency-overflow diagnostics. Required.
 	Logger *slog.Logger
+
+	// Tools, when non-nil, wires the read/write/send tool surface onto
+	// the MCP server (issue #14, SPEC-0006 REQ "Required Tool Set"). When
+	// nil, New registers zero tools and the /mcp endpoint serves an empty
+	// tools/list -- the auth+concurrency-only scaffolding behaviour that
+	// tests of those layers rely on.
+	//
+	// Governing: SPEC-0006 REQ "Required Tool Set".
+	Tools *ToolDeps
 }
 
 // Server wires the MCP HTTP handler with Reduit's auth + concurrency
@@ -132,6 +141,20 @@ func New(deps Deps) *Server {
 		Name:    "reduit",
 		Version: Version,
 	}, nil)
+
+	// Register the read/write/send tool surface (issue #14) when tool
+	// dependencies are supplied. New() callers that only exercise the
+	// auth+concurrency scaffolding pass Tools=nil and get an empty
+	// tools/list.
+	//
+	// Governing: SPEC-0006 REQ "Required Tool Set".
+	if deps.Tools != nil {
+		tools := *deps.Tools
+		if tools.Logger == nil {
+			tools.Logger = deps.Logger
+		}
+		registerTools(mcpSrv, tools)
+	}
 
 	// SDK's streamable-HTTP handler. The `getServer` callback returns
 	// the same server for every session: per ADR-0008 the MCP server
