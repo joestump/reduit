@@ -384,6 +384,84 @@ func TestWorkerBackoffOnFailureThenResetOnSuccess(t *testing.T) {
 	}
 }
 
+// TestWorkerTransientRetryHonoursBackoffEnvelopeNotTickInterval pins the
+// SPEC-0002 envelope fix: a transient failure's realized inter-retry gap
+// is the backoff delay, NOT backoff + the remaining time.Ticker
+// interval. The old code slept the backoff then RETURNED into the 30s
+// ticker, so back-to-back retries were paced by PollInterval, blowing
+// the uniform(0, min(max, base*2^attempt)) envelope by up to a whole
+// tick.
+//
+// Observation strategy: set a deliberately LARGE PollInterval (1s) and a
+// near-zero backoff (1ns). Under the old "return to ticker" behaviour
+// the worker could issue at most ~1 GetEvent per PollInterval, so in a
+// 300ms window it would make on the order of 1 call. Under the fixed
+// "retry in-loop after the backoff sleep" behaviour the worker spins the
+// backoff curve directly and issues MANY calls in the same window. We
+// assert a high call count to prove the ticker interval is no longer on
+// the retry path. The backoff itself (1ns) is the throttle, so this is
+// not a hot busy-loop in production where base=1s.
+//
+// Governing: SPEC-0002 REQ "Backoff on Failure" (envelope honored
+// without tick-interval slack).
+func TestWorkerTransientRetryHonoursBackoffEnvelopeNotTickInterval(t *testing.T) {
+	t.Parallel()
+	svc, usrSvc := newTestAccountService(t)
+	ctx := context.Background()
+
+	a := createTestAccount(t, svc, usrSvc, "sub-backoff-envelope")
+
+	wantErr := errors.New("simulated transient 5xx")
+	var calls int32
+	fc := &fakeProtonClient{
+		latest: "evt-bootstrap",
+		getEventFn: func(string) ([]proton.Event, bool, error) {
+			atomic.AddInt32(&calls, 1)
+			// Always fail transiently so the worker stays on the backoff
+			// retry path for the whole observation window.
+			return nil, false, wantErr
+		},
+	}
+
+	cfg := fastConfig()
+	// Large tick interval: if retries were paced by the ticker, the
+	// worker would manage only ~1 GetEvent per second.
+	cfg.PollInterval = 1 * time.Second
+	// Near-zero backoff: the retry cadence is bounded only by the
+	// backoff sleep, which we make negligible so the in-loop retry path
+	// is observable quickly.
+	cfg.BackoffBase = time.Nanosecond
+	cfg.BackoffMax = time.Nanosecond
+	cfg.BackoffRand = func() float64 { return 1.0 - 1e-15 }
+	cfg.ClientFactory = func(context.Context, string) (proton.Client, error) {
+		return fc, nil
+	}
+	sup := New(svc, cfg)
+	if err := sup.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = sup.Stop() })
+
+	if _, err := svc.Transition(ctx, a.ID, account.StateActive); err != nil {
+		t.Fatalf("Transition: %v", err)
+	}
+
+	// In ~300ms the fixed worker should issue FAR more than the handful
+	// of calls the old ticker-paced path (1s interval) could. We require
+	// at least 20 — comfortably impossible under the old behaviour
+	// (which would manage ~1 in this window) yet a tiny fraction of what
+	// the in-loop retry actually produces, so the bar is not flaky.
+	const wantAtLeast = 20
+	if !waitFor(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&calls) >= wantAtLeast
+	}) {
+		t.Fatalf("GetEvent called %d times; want >= %d within the window. "+
+			"A low count means transient retries are still paced by the "+
+			"time.Ticker (PollInterval) rather than the backoff envelope.",
+			atomic.LoadInt32(&calls), wantAtLeast)
+	}
+}
+
 // TestWorkerProtonSlotDrainDoesNotBumpBackoff pins the
 // "errProtonSlotUnavailable on graceful drain" invariant: when a
 // worker is parked inside AcquireProtonSlot at Stop time, the

@@ -18,6 +18,7 @@ import (
 
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/cryptenv"
+	"github.com/joestump/reduit/internal/notify"
 	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/users"
 )
@@ -615,7 +616,10 @@ func TestSupervisorPanicMarksAccountCrashed(t *testing.T) {
 	svc, usrSvc := newTestAccountService(t)
 	ctx := context.Background()
 
-	sup := New(svc, fastConfig())
+	rn := &recordingNotifier{}
+	cfg := fastConfig()
+	cfg.Notifier = rn
+	sup := New(svc, cfg)
 	if err := sup.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -666,6 +670,25 @@ func TestSupervisorPanicMarksAccountCrashed(t *testing.T) {
 	}
 	if siblingFresh.Crashed {
 		t.Errorf("sibling crashed flag set; isolation violated")
+	}
+
+	// The crash MUST surface an admin notification alongside the flag,
+	// and exactly one (the panicking worker runs its recover once before
+	// exiting -- a double-notify would mean the recover path ran twice).
+	// The notification names the crashed account, not the sibling.
+	// Governing: SPEC-0002 REQ "Panic Isolation".
+	if !waitFor(t, time.Second, func() bool {
+		return rn.countOf(notify.KindWorkerCrashed) >= 1
+	}) {
+		t.Fatal("no worker-crashed admin notification emitted after panic")
+	}
+	if n := rn.countOf(notify.KindWorkerCrashed); n != 1 {
+		t.Errorf("worker-crashed notifications = %d, want exactly 1 (no double-notify)", n)
+	}
+	for _, e := range rn.snapshot() {
+		if e.kind == notify.KindWorkerCrashed && e.accountID != panicAcc.ID {
+			t.Errorf("crash notification account = %q, want %q", e.accountID, panicAcc.ID)
+		}
 	}
 }
 

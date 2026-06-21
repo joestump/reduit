@@ -38,6 +38,7 @@ import (
 	"github.com/joestump/reduit/internal/account"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
 	"github.com/joestump/reduit/internal/auth/session"
+	"github.com/joestump/reduit/internal/notify"
 	"github.com/joestump/reduit/internal/server"
 	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/users"
@@ -308,6 +309,7 @@ func mountTestServerWithAutoCreate(t *testing.T, st *store.Store, idp *fakeIdP, 
 		PreSessions:     preSessions,
 		UsersService:    usrSvc,
 		AccountService:  accSvc,
+		Notifications:   notify.New(st),
 		AdminSubjects:   adminSubs,
 		AutoCreate:      autoCreate,
 		InsecureCookies: true, // httptest is plain HTTP

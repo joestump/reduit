@@ -24,6 +24,7 @@ import (
 	"github.com/joestump/reduit/internal/cryptenv"
 	"github.com/joestump/reduit/internal/imapserver"
 	"github.com/joestump/reduit/internal/mcpserver"
+	"github.com/joestump/reduit/internal/notify"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/protonlive"
 	"github.com/joestump/reduit/internal/pubsub"
@@ -182,6 +183,17 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	// so the underlying *sqlx.DB / master key stay singletons.
 	usersService := users.New(st)
 	accountService := account.New(st, masterKey)
+
+	// Admin-notification surface (internal/notify). Persists the
+	// operator-facing events the sync worker emits -- worker crashes and
+	// permanent-error auto-reverts -- and feeds the admin accounts page's
+	// notification banner. The sync supervisor is wired in a later
+	// milestone (see the serve-wiring TODO below); the notification store
+	// + admin-UI display are wired now so the surface is live the moment
+	// the supervisor starts emitting.
+	//
+	// Governing: SPEC-0002 REQ "Panic Isolation", REQ "Backoff on Failure".
+	notifyService := notify.New(st)
 
 	// Status bus + transition publisher for the admin-UI SSE stream.
 	// The account service fires a post-commit callback on every
@@ -449,6 +461,7 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		IMAPSessions:   imapSessions,
 		SMTPSessions:   smtpSessions,
 		StatusBus:      statusBus,
+		Notifications:  notifyService,
 	})
 
 	errCh := make(chan error, 1)

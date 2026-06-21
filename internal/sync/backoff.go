@@ -16,8 +16,8 @@ import (
 // Config.Backoff* fields on the supervisor.
 const (
 	// DefaultBackoffBase is the lower envelope of the exponential
-	// curve. The first failure draws a delay from `[0, base*2)` =
-	// `[0, 2s)`, the second from `[0, 4s)`, etc.
+	// curve. The first failure (attempt 0) draws a delay from
+	// `[0, base)` = `[0, 1s)`, the second from `[0, 2s)`, etc.
 	DefaultBackoffBase = 1 * time.Second
 
 	// DefaultBackoffMax is the cap. Without a cap, attempt 13 would
@@ -128,15 +128,17 @@ func (b *backoff) reset() {
 // tests; production code does not introspect.
 func (b *backoff) attempts() int { return b.attempt }
 
-// sleep blocks for d, returning early if ctx is cancelled. Returns
+// sleepCtx blocks for d, returning early if ctx is cancelled. Returns
 // ctx.Err() on early exit and nil on a clean wake. A non-positive d
 // returns immediately without consulting ctx — a zero-jitter draw is a
 // valid spec outcome (when rand draws 0) and we don't want to mask it
 // behind a context check that would otherwise burn an extra select.
 //
-// The helper exists so the worker's failure path can be a single line
-// (`if err := bo.sleep(ctx, bo.next()); err != nil { ... }`) rather
-// than open-coding the timer + select on every call site.
+// The helper exists so the worker's transient-failure path can express
+// the backoff sleep as a single cancel-aware line rather than
+// open-coding the timer + select at every call site (worker.tick's
+// retry sleep and the detached permanent-transition retry loop both
+// use it).
 func sleepCtx(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return nil

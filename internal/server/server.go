@@ -22,6 +22,7 @@ import (
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/auth"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
+	"github.com/joestump/reduit/internal/notify"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/pubsub"
 	"github.com/joestump/reduit/internal/store"
@@ -179,6 +180,32 @@ type Deps struct {
 	// Governing: SPEC-0005 REQ "Sync Status via SSE", ADR-0005
 	// (HTMX + SSE).
 	StatusBus *pubsub.Bus
+
+	// Notifications is the admin-notification surface (internal/notify).
+	// The admin accounts page renders unacknowledged notifications (sync
+	// worker crashes, permanent-error auto-reverts) as a dismissable
+	// banner list, and the acknowledge POST route stamps a row dismissed.
+	// nil disables the surface: the page renders without the banner and
+	// the acknowledge route 500s ("not configured"). Held as a narrow
+	// interface (the read + acknowledge verbs) so admin handler tests can
+	// stub it without a database; notify.Service satisfies it.
+	//
+	// Governing: SPEC-0002 REQ "Panic Isolation" (a worker crash must
+	// surface to an operator), SPEC-0002 REQ "Backoff on Failure"
+	// (permanent-error auto-revert emits an admin notification).
+	Notifications AdminNotifier
+}
+
+// AdminNotifier is the read + acknowledge slice of notify.Service the
+// admin UI consumes. Declared here as an interface (rather than taking a
+// concrete *notify.Service) so admin handler tests can inject a stub.
+// notify.Service satisfies it.
+//
+// Governing: SPEC-0002 REQ "Panic Isolation", REQ "Backoff on Failure".
+type AdminNotifier interface {
+	ListUnacknowledged(ctx context.Context, limit int) ([]*notify.Notification, error)
+	CountUnacknowledged(ctx context.Context) (int, error)
+	Acknowledge(ctx context.Context, id string) error
 }
 
 // Server holds an http.Server pre-configured with TLS and the
@@ -475,6 +502,13 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.Handle("POST /admin/accounts/{id}/suspend", adminHandler(s.handleAdminAccountSuspend))
 	mux.Handle("POST /admin/accounts/{id}/unsuspend", adminHandler(s.handleAdminAccountUnsuspend))
 	mux.Handle("POST /admin/accounts/{id}/delete", adminHandler(s.handleAdminAccountDelete))
+
+	// Admin-notification acknowledge route. Dismisses one notification
+	// (worker crash / auto-revert) so it drops off the admin banner.
+	//
+	// Governing: SPEC-0002 REQ "Panic Isolation" (the crash surfaces to
+	// the operator; acknowledging is how they clear it from view).
+	mux.Handle("POST /admin/notifications/{id}/ack", adminHandler(s.handleAdminNotificationAck))
 }
 
 // handleHealthz returns 200 OK if the process is up. It does not

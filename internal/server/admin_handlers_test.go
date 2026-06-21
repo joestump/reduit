@@ -24,6 +24,8 @@ import (
 
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/cryptenv"
+	"github.com/joestump/reduit/internal/notify"
+	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/users"
 )
 
@@ -35,23 +37,40 @@ type adminFixture struct {
 	idp        *fakeIdP
 	accSvc     account.Service
 	usrSvc     users.Service
+	notifySvc  notify.Service
+	st         *store.Store
 	adminSub   string
 	adminEmail string
 }
 
 // newAdminFixture creates a test server with "sub-siteadmin" as the
-// admin OIDC subject.
+// admin OIDC subject. It builds the server stack inline (rather than
+// via dashboardTestServer) so the fixture can hold the *store.Store and
+// a notify.Service for seeding admin notifications -- the server's own
+// notify.Service is built against the SAME store, so a row seeded via
+// the fixture's service is visible to the admin page.
 func newAdminFixture(t *testing.T) *adminFixture {
 	t.Helper()
 	const adminSub = "sub-siteadmin"
 	const adminEmail = "admin@example.com"
 
-	baseURL, idp, accSvc, usrSvc := dashboardTestServer(t, []string{adminSub})
+	st := openTempStore(t)
+	master, err := cryptenv.GenerateMasterKey()
+	if err != nil {
+		t.Fatalf("GenerateMasterKey: %v", err)
+	}
+	accSvc := account.New(st, master)
+	usrSvc := users.New(st)
+
+	idp := newFakeIdP(t, "reduit-test-client")
+	baseURL := mountTestServer(t, st, idp, []string{adminSub}, accSvc, usrSvc)
 	return &adminFixture{
 		baseURL:    baseURL,
 		idp:        idp,
 		accSvc:     accSvc,
 		usrSvc:     usrSvc,
+		notifySvc:  notify.New(st),
+		st:         st,
 		adminSub:   adminSub,
 		adminEmail: adminEmail,
 	}
@@ -277,6 +296,106 @@ func TestAdminSuspend_AlreadySuspended_409(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusConflict {
 		t.Errorf("status = %d, want 409", resp.StatusCode)
+	}
+}
+
+// --- Admin notifications -----------------------------------------
+
+// TestAdminNotifications_BannerRendersUnacknowledged pins that a
+// recorded admin notification surfaces on the admin accounts page.
+//
+// Governing: SPEC-0002 REQ "Panic Isolation" (worker crash surfaces to
+// the operator), SPEC-0002 REQ "Backoff on Failure" (auto-revert).
+func TestAdminNotifications_BannerRendersUnacknowledged(t *testing.T) {
+	t.Parallel()
+	f := newAdminFixture(t)
+	id := f.seedActiveForSubject(t, "sub-notif-user", "notif@example.com")
+
+	if _, err := f.notifySvc.Record(context.Background(), id,
+		notify.KindWorkerCrashed,
+		"Sync worker crashed and was stopped; clear the crashed flag to retry.",
+		"panic: boom"); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	c := f.adminClient(t)
+	status, body := fetch(t, c, f.baseURL+"/admin/accounts")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d", status)
+	}
+	if !strings.Contains(body, "Attention required") {
+		t.Errorf("notification banner heading missing; body excerpt=%s", body[:min(len(body), 800)])
+	}
+	if !strings.Contains(body, "Worker crashed") {
+		t.Errorf("notification kind label missing from banner")
+	}
+	if !strings.Contains(body, "clear the crashed flag to retry") {
+		t.Errorf("notification message missing from banner")
+	}
+}
+
+// TestAdminNotifications_DismissAcknowledges pins the dismiss flow: a
+// POST to the ack route acknowledges the notification (303) and it no
+// longer renders on the page.
+func TestAdminNotifications_DismissAcknowledges(t *testing.T) {
+	t.Parallel()
+	f := newAdminFixture(t)
+	id := f.seedActiveForSubject(t, "sub-notif-dismiss", "dismiss@example.com")
+
+	n, err := f.notifySvc.Record(context.Background(), id,
+		notify.KindAutoReverted, "reverted to setup", "401")
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	c := f.adminClient(t)
+	resp := post(t, c, f.baseURL+"/admin/notifications/"+n.ID+"/ack", url.Values{})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("ack status = %d, want 303", resp.StatusCode)
+	}
+
+	// Acknowledged: gone from the unacknowledged set.
+	count, err := f.notifySvc.CountUnacknowledged(context.Background())
+	if err != nil {
+		t.Fatalf("CountUnacknowledged: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("CountUnacknowledged = %d after ack, want 0", count)
+	}
+
+	// And no longer on the page.
+	status, body := fetch(t, c, f.baseURL+"/admin/accounts")
+	if status != http.StatusOK {
+		t.Fatalf("status = %d", status)
+	}
+	if strings.Contains(body, "Attention required") {
+		t.Errorf("notification banner still present after dismiss")
+	}
+}
+
+// TestAdminNotifications_DismissNonAdminForbidden pins that a non-admin
+// cannot acknowledge a notification (the ack route is RequireAdmin).
+func TestAdminNotifications_DismissNonAdminForbidden(t *testing.T) {
+	t.Parallel()
+	f := newAdminFixture(t)
+	id := f.seedActiveForSubject(t, "sub-notif-victim", "nvictim@example.com")
+	n, err := f.notifySvc.Record(context.Background(), id,
+		notify.KindWorkerCrashed, "crashed", "")
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+
+	c := f.userClient(t, "sub-notif-attacker", "nattacker@example.com")
+	resp := post(t, c, f.baseURL+"/admin/notifications/"+n.ID+"/ack", url.Values{})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+	// Still unacknowledged.
+	count, _ := f.notifySvc.CountUnacknowledged(context.Background())
+	if count != 1 {
+		t.Errorf("CountUnacknowledged = %d after forbidden ack, want 1", count)
 	}
 }
 

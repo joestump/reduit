@@ -180,6 +180,20 @@ type Config struct {
 	// Governing: SPEC-0003 REQ "Moving between system folders changes
 	// Proton system flag".
 	Reconciler *MoveReconciler
+
+	// Notifier records operator-facing admin notifications for the two
+	// SPEC-0002 silent-failure paths: a worker-goroutine panic (which
+	// also sets the account's `crashed` flag) and the permanent-error
+	// auto-revert to pending_proton_setup. nil means notifications are
+	// dropped -- production wiring SHOULD pass a notify.Service so a
+	// crash / auto-revert surfaces in the admin UI; lifecycle/plumbing
+	// tests that don't assert on notifications leave it nil and the
+	// emit sites fall back to nopNotifier.
+	//
+	// Governing: SPEC-0002 REQ "Panic Isolation" (worker crash must
+	// surface to an operator), SPEC-0002 REQ "Backoff on Failure"
+	// (permanent-error auto-revert emits an admin notification).
+	Notifier Notifier
 }
 
 // resolved fills in defaults for every zero-valued field. Returned by

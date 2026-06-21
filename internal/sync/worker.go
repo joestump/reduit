@@ -8,10 +8,13 @@ package sync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/joestump/reduit/internal/notify"
 )
 
 // worker is the per-account goroutine harness. The harness handles
@@ -115,7 +118,7 @@ func (w *worker) start() {
 		w.bootstrapFailed()
 		return
 	}
-	proc, err := newEventProcessor(w.ctx, w.id, w.sup.svc, client, w.logger, w.sup.cfg.Publisher, w.sup.cfg.Reconciler)
+	proc, err := newEventProcessor(w.ctx, w.id, w.sup.svc, client, w.logger, w.sup.cfg.Publisher, w.sup.cfg.Reconciler, w.sup.cfg.Notifier)
 	if err != nil {
 		w.logger.LogAttrs(w.ctx, slog.LevelError,
 			"sync: event processor bootstrap failed; worker will not run",
@@ -160,6 +163,15 @@ func (w *worker) signalStop() {
 // waitDone blocks until the worker goroutine has fully exited.
 func (w *worker) waitDone() { <-w.done }
 
+// notifier returns the supervisor's admin-notification sink, falling
+// back to nopNotifier when none was wired so emit sites never nil-check.
+func (w *worker) notifier() Notifier {
+	if w.sup.cfg.Notifier == nil {
+		return nopNotifier{}
+	}
+	return w.sup.cfg.Notifier
+}
+
 // run is the worker goroutine entry point. It pumps tick() under a
 // time.Ticker, exits on ctx.Done, and recovers any panic so the
 // supervisor and other workers are unaffected.
@@ -194,6 +206,25 @@ func (w *worker) run() {
 					slog.Any("err", mcErr),
 				)
 			}
+			// Emit an admin notification alongside the crashed flag so the
+			// operator is ACTIVELY told (admin-UI list/badge) rather than
+			// having to notice the flag. The flag answers "is it broken?";
+			// the notification answers "what broke?" -- it carries the
+			// panic value so an operator can investigate before clearing
+			// the flag. Best-effort: a failed notification must not mask
+			// the panic-recovery path, so we log and move on.
+			//
+			// Governing: SPEC-0002 REQ "Panic Isolation".
+			if _, nErr := w.notifier().Record(context.Background(), w.id,
+				notify.KindWorkerCrashed,
+				"Sync worker crashed and was stopped; clear the crashed flag to retry.",
+				fmt.Sprintf("panic: %v", r),
+			); nErr != nil {
+				w.logger.LogAttrs(context.Background(), slog.LevelError,
+					"sync: failed to record worker-crash admin notification",
+					slog.Any("err", nErr),
+				)
+			}
 		}
 	}()
 
@@ -220,10 +251,21 @@ func (w *worker) run() {
 }
 
 // tick is one cycle of the worker loop. The body runs the event-stream
-// processor up to MaxConsecutiveTicks times to drain any backlog,
-// acquiring a process-wide Proton concurrency slot AROUND EACH
-// processOnce call (not held across the whole burst) so a contending
-// worker can interleave between iterations.
+// processor up to MaxConsecutiveTicks times to drain any backlog, AND
+// owns the transient-retry cadence: on a transient processOnce failure
+// it sleeps the full-jitter backoff window and retries in-loop rather
+// than yielding to the run loop's time.Ticker, so the realized
+// inter-retry gap is exactly the SPEC-0002 envelope (the ticker's
+// PollInterval is NOT added on top). It acquires a process-wide Proton
+// concurrency slot AROUND EACH processOnce call (not held across the
+// whole burst) so a contending worker can interleave between
+// iterations.
+//
+// Consequence: a sustained transient outage keeps tick() resident,
+// sleeping growing (max-capped) backoff windows, until processOnce
+// succeeds or w.ctx is cancelled. That is the intended envelope
+// behaviour; the cancel-aware backoff sleep and the per-iteration
+// ctx.Err() check keep graceful shutdown immediate throughout.
 //
 // Governing: SPEC-0002 REQ "Concurrency Limits" — the
 // AcquireProtonSlot call is what enforces the global cap. PR #41's
@@ -267,12 +309,40 @@ func (w *worker) tick() {
 		return
 	}
 
-	// Drain the backlog. SPEC-0002's "Tick the loop ASAP after a
-	// non-empty batch" intent is implemented here: if processOnce
-	// reports more=true we immediately call again rather than waiting
-	// for the next ticker fire. The MaxConsecutiveTicks cap and the
-	// ctx.Done check ensure the loop cannot starve graceful shutdown.
-	for i := 0; i < w.sup.cfg.MaxConsecutiveTicks; i++ {
+	// Drain the backlog AND own the transient-retry cadence. Two
+	// distinct loop-continuation reasons share this loop:
+	//
+	//  1. Backlog drain: processOnce reported more=true, so we
+	//     immediately call again rather than waiting for the next ticker
+	//     fire ("Tick the loop ASAP after a non-empty batch"). These
+	//     iterations are bounded by MaxConsecutiveTicks so a runaway
+	//     More-loop cannot starve graceful shutdown.
+	//
+	//  2. Transient-failure retry: processOnce failed transiently, so we
+	//     sleep the full-jitter backoff window and retry IN-LOOP. The
+	//     retry deliberately does NOT yield back to the time.Ticker.
+	//     Yielding would make the realized inter-retry gap
+	//     `backoff_delay + remaining_tick_interval`, which exceeds the
+	//     SPEC-0002 envelope uniform(0, min(max, base*2^attempt)) by up
+	//     to a whole PollInterval. By looping in place after the
+	//     backoff sleep, the realized gap IS the backoff delay, honoring
+	//     the envelope exactly.
+	//
+	// Only the backlog-drain reason (1) consumes the MaxConsecutiveTicks
+	// budget: a sustained outage retried under backoff must not be capped
+	// at MaxConsecutiveTicks attempts and then fall back to the slower
+	// ticker cadence (which would re-introduce the slack this fix
+	// removes). Backoff itself is the throttle there -- its growing,
+	// max-capped delay is what prevents a hot loop -- so transient
+	// retries loop without decrementing the drain budget. ctx.Done is
+	// still honored every iteration (and inside the cancel-aware sleep)
+	// so graceful shutdown wins immediately.
+	//
+	// Governing: SPEC-0002 REQ "Backoff on Failure" (envelope honored
+	// without tick-interval slack), REQ "Graceful Shutdown" (ctx.Done
+	// checked every iteration and during the backoff sleep).
+	drainBudget := w.sup.cfg.MaxConsecutiveTicks
+	for {
 		if w.ctx.Err() != nil {
 			return
 		}
@@ -305,11 +375,11 @@ func (w *worker) tick() {
 				return
 			}
 			// Transient error path: log, then sleep for a
-			// jitter-bounded backoff window before yielding to the
-			// next ticker fire. Per SPEC-0002 REQ "Backoff on
-			// Failure", consecutive failures grow the upper bound
-			// exponentially up to BackoffMax; a successful tick later
-			// resets the curve via bo.reset().
+			// jitter-bounded backoff window and retry IN-LOOP. Per
+			// SPEC-0002 REQ "Backoff on Failure", consecutive failures
+			// grow the upper bound exponentially up to BackoffMax; a
+			// successful processOnce later resets the curve via
+			// bo.reset().
 			//
 			// Permanent failures never reach here: processOnce
 			// classifies refresh-token-revoked and other permanent
@@ -324,17 +394,20 @@ func (w *worker) tick() {
 				slog.Int("attempt", w.bo.attempts()),
 			)
 			// Sleep cancel-aware so a graceful Stop wakes us
-			// immediately, then yield to the next ticker fire
-			// regardless of whether the sleep completed naturally or
-			// was cut short by cancellation. The previous form
-			// branched on sleepCtx's return but both arms returned —
-			// the conditional was dead code. We keep the
-			// "sleep-then-return-to-ticker" semantic (the run loop's
-			// ctx.Done branch logs the drain on the next select); the
-			// effective inter-retry gap is `delay + remaining tick
-			// interval`, which is what production has always shipped.
+			// immediately. On a clean wake we continue the loop to retry
+			// directly: the backoff delay IS the realized inter-retry
+			// gap, which is exactly the SPEC-0002 envelope. We do NOT
+			// yield to the ticker here -- doing so would add the
+			// remaining tick interval on top of the backoff delay and
+			// blow the envelope (the bug this fix removes). On a
+			// cancelled wake sleepCtx returns ctx.Err(); the loop's
+			// top-of-iteration ctx.Err() check then exits, so we don't
+			// retry into a draining worker.
+			//
+			// Governing: SPEC-0002 REQ "Backoff on Failure" (envelope
+			// honored), REQ "Graceful Shutdown" (cancel-aware sleep).
 			_ = sleepCtx(w.ctx, delay)
-			return
+			continue
 		}
 		// Success — reset the backoff curve so the next failure starts
 		// from `base` rather than wherever the prior streak left off.
@@ -349,11 +422,21 @@ func (w *worker) tick() {
 		if !more {
 			return
 		}
+		// Backlog drain: consume one unit of the bounded budget so a
+		// runaway More=true loop cannot starve graceful shutdown or
+		// sibling workers. When the budget is exhausted we yield to the
+		// ticker; the next fire resumes the drain. (Transient retries
+		// above deliberately bypass this budget -- backoff is their
+		// throttle.)
+		drainBudget--
+		if drainBudget <= 0 {
+			w.logger.LogAttrs(w.ctx, slog.LevelDebug,
+				"sync: max consecutive ticks reached; yielding to ticker",
+				slog.Int("limit", w.sup.cfg.MaxConsecutiveTicks),
+			)
+			return
+		}
 	}
-	w.logger.LogAttrs(w.ctx, slog.LevelDebug,
-		"sync: max consecutive ticks reached; yielding to ticker",
-		slog.Int("limit", w.sup.cfg.MaxConsecutiveTicks),
-	)
 }
 
 // errProtonSlotUnavailable is a sentinel returned by runProcessOnce

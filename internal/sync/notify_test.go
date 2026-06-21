@@ -16,9 +16,56 @@ import (
 	gpa "github.com/ProtonMail/go-proton-api"
 
 	"github.com/joestump/reduit/internal/account"
+	"github.com/joestump/reduit/internal/notify"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/pubsub"
 )
+
+// recordingNotifier captures every admin notification a worker emits so
+// tests can assert the (kind, message) pairs the crash / auto-revert
+// paths produce. Satisfies the sync.Notifier interface.
+//
+// Governing: SPEC-0002 REQ "Panic Isolation", REQ "Backoff on Failure".
+type recordingNotifier struct {
+	mu      sync.Mutex
+	entries []recordedNotification
+}
+
+type recordedNotification struct {
+	accountID string
+	kind      notify.Kind
+	message   string
+	detail    string
+}
+
+func (r *recordingNotifier) Record(_ context.Context, accountID string, kind notify.Kind, message, detail string) (*notify.Notification, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.entries = append(r.entries, recordedNotification{
+		accountID: accountID, kind: kind, message: message, detail: detail,
+	})
+	return &notify.Notification{ID: "rec", AccountID: accountID, Kind: kind}, nil
+}
+
+func (r *recordingNotifier) snapshot() []recordedNotification {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]recordedNotification, len(r.entries))
+	copy(out, r.entries)
+	return out
+}
+
+func (r *recordingNotifier) countOf(kind notify.Kind) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, e := range r.entries {
+		if e.kind == kind {
+			n++
+		}
+	}
+	return n
+}
 
 // recordingPublisher captures every Publish call so tests can assert
 // the (key, kind, message_id) triples a batch produced. The order of
@@ -75,7 +122,7 @@ func TestEventProcessorPublishesMessageAdded(t *testing.T) {
 			}}, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -134,7 +181,7 @@ func TestEventProcessorPublishesMessageRemoved(t *testing.T) {
 			}}, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -188,7 +235,7 @@ func TestEventProcessorPublishesMessageFlagChanged(t *testing.T) {
 			}}, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -237,7 +284,7 @@ func TestEventProcessorDoesNotPublishOnFailedCommit(t *testing.T) {
 			}}, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), rec, nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -287,8 +334,10 @@ func TestWorkerExitsOnRefreshTokenRevoked(t *testing.T) {
 		},
 	}
 
+	rn := &recordingNotifier{}
 	cfg := fastConfig()
 	cfg.PollInterval = 5 * time.Millisecond
+	cfg.Notifier = rn
 	cfg.ClientFactory = func(context.Context, string) (proton.Client, error) {
 		return fc, nil
 	}
@@ -327,6 +376,22 @@ func TestWorkerExitsOnRefreshTokenRevoked(t *testing.T) {
 	}
 	if got.Crashed {
 		t.Error("crashed flag set on refresh-token-revoked path; that flag is for panics only")
+	}
+
+	// The auto-revert MUST surface an admin notification (and exactly
+	// one — the worker emits it on the single GetEvent failure that
+	// classifies as permanent, then exits, so a flaky double-tick must
+	// not double-notify). Governing: SPEC-0002 REQ "Backoff on Failure".
+	if !waitFor(t, time.Second, func() bool {
+		return rn.countOf(notify.KindAutoReverted) >= 1
+	}) {
+		t.Fatal("no auto-revert admin notification emitted on refresh-token-revoked")
+	}
+	if n := rn.countOf(notify.KindAutoReverted); n != 1 {
+		t.Errorf("auto-revert notifications = %d, want exactly 1 (no double-notify)", n)
+	}
+	if rn.countOf(notify.KindWorkerCrashed) != 0 {
+		t.Error("worker-crashed notification emitted on a non-panic path")
 	}
 }
 
@@ -411,7 +476,7 @@ func TestEventProcessorPublishesViaRealBus(t *testing.T) {
 			}}, false, nil
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), bus, nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), bus, nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -466,8 +531,10 @@ func TestWorkerRevertsToPendingOnUnrecoverableAuth(t *testing.T) {
 		},
 	}
 
+	rn := &recordingNotifier{}
 	cfg := fastConfig()
 	cfg.PollInterval = 5 * time.Millisecond
+	cfg.Notifier = rn
 	cfg.ClientFactory = func(context.Context, string) (proton.Client, error) {
 		return fc, nil
 	}
@@ -518,6 +585,12 @@ func TestWorkerRevertsToPendingOnUnrecoverableAuth(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if got := atomic.LoadInt32(&calls); got != settled {
 		t.Errorf("GetEvent kept being called after revert (%d -> %d); worker did not stop retrying", settled, got)
+	}
+
+	// The 403 auto-revert MUST surface exactly one admin notification.
+	// Governing: SPEC-0002 REQ "Backoff on Failure".
+	if n := rn.countOf(notify.KindAutoReverted); n != 1 {
+		t.Errorf("auto-revert notifications = %d, want exactly 1", n)
 	}
 }
 
@@ -640,7 +713,7 @@ func TestPermanentTransitionFailureMarksCrashed(t *testing.T) {
 			return nil, false, authErr
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -690,7 +763,7 @@ func TestPermanentTransitionAlreadyLeftActiveSkipsCrash(t *testing.T) {
 			return nil, false, authErr
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
@@ -735,7 +808,7 @@ func TestPermanentTransitionAbandonsQuietlyOnShutdown(t *testing.T) {
 			return nil, false, authErr
 		},
 	}
-	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil)
+	proc, err := newEventProcessor(ctx, a.ID, svc, fc, nopLogger(), nil, nil, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}

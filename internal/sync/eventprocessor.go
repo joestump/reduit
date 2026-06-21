@@ -3,7 +3,8 @@
 //             SPEC-0002 REQ "Concurrency Limits",
 //             SPEC-0002 REQ "Backoff on Failure" (permanent-failure
 //             paths: refresh-token-revoked and other unrecoverable
-//             authorization failures both -> pending_proton_setup),
+//             authorization failures both -> pending_proton_setup, and
+//             each emits an admin notification),
 //             SPEC-0002 REQ "IMAP Update Notification".
 
 package sync
@@ -18,6 +19,7 @@ import (
 	gpa "github.com/ProtonMail/go-proton-api"
 
 	"github.com/joestump/reduit/internal/account"
+	"github.com/joestump/reduit/internal/notify"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/pubsub"
 )
@@ -149,6 +151,15 @@ type eventProcessor struct {
 	// Proton system flag".
 	reconciler *MoveReconciler
 
+	// notifier records the admin notification emitted when a permanent
+	// authorization failure auto-reverts the account to
+	// pending_proton_setup. nil is replaced with nopNotifier at
+	// construction so the permanent-failure path can emit unconditionally.
+	//
+	// Governing: SPEC-0002 REQ "Backoff on Failure" (permanent-error
+	// auto-revert emits an admin notification).
+	notifier Notifier
+
 	// cursor is the cached event ID to pass to the next GetEvent call.
 	// Mutation is single-goroutine (only the worker.run loop calls
 	// processOnce), so no lock is required.
@@ -195,9 +206,12 @@ func (p *eventProcessor) transitionCtx() context.Context {
 //
 // Governing: SPEC-0002 REQ "Event Cursor Persistence" (Resume on
 // startup uses persisted cursor).
-func newEventProcessor(ctx context.Context, accountID string, svc account.Service, client proton.Client, logger *slog.Logger, publisher Publisher, reconciler *MoveReconciler) (*eventProcessor, error) {
+func newEventProcessor(ctx context.Context, accountID string, svc account.Service, client proton.Client, logger *slog.Logger, publisher Publisher, reconciler *MoveReconciler, notifier Notifier) (*eventProcessor, error) {
 	if publisher == nil {
 		publisher = nopPublisher{}
+	}
+	if notifier == nil {
+		notifier = nopNotifier{}
 	}
 	state, err := svc.GetSyncState(ctx, accountID)
 	switch {
@@ -213,6 +227,7 @@ func newEventProcessor(ctx context.Context, accountID string, svc account.Servic
 			logger:     logger,
 			publisher:  publisher,
 			reconciler: reconciler,
+			notifier:   notifier,
 			cursor:     state.LastEventID,
 		}, nil
 	case errors.Is(err, account.ErrNoSyncState):
@@ -236,6 +251,7 @@ func newEventProcessor(ctx context.Context, accountID string, svc account.Servic
 			logger:     logger,
 			publisher:  publisher,
 			reconciler: reconciler,
+			notifier:   notifier,
 			cursor:     latest,
 		}, nil
 	default:
@@ -283,6 +299,9 @@ func (p *eventProcessor) processOnce(ctx context.Context) (bool, error) {
 		// errors do not retry indefinitely".
 		if isRefreshTokenRevokedError(err) {
 			p.dispatchPermanentTransition(account.StatePendingProtonSetup, err)
+			p.notifyAutoRevert(ctx,
+				"Sync stopped: Proton refresh token was revoked. The account was returned to pending setup; re-run the add-account wizard to re-authenticate.",
+				err)
 			p.logger.LogAttrs(ctx, slog.LevelWarn,
 				"sync: refresh token revoked; account returned to pending_proton_setup, worker exiting",
 				slog.Any("err", err),
@@ -303,6 +322,9 @@ func (p *eventProcessor) processOnce(ctx context.Context) (bool, error) {
 		// errors do not retry indefinitely".
 		if isUnrecoverableProtonError(err) {
 			p.dispatchPermanentTransition(account.StatePendingProtonSetup, err)
+			p.notifyAutoRevert(ctx,
+				"Sync stopped: Proton rejected the account's authorization (HTTP 403). The account was returned to pending setup; re-run the add-account wizard to re-authenticate.",
+				err)
 			p.logger.LogAttrs(ctx, slog.LevelWarn,
 				"sync: unrecoverable proton authorization failure; account returned to pending_proton_setup, worker exiting",
 				slog.Any("err", err),
@@ -581,6 +603,36 @@ func isRefreshTokenRevokedError(err error) bool {
 // transition), SPEC-0002 REQ "Panic Isolation" (crashed-flag fallback
 // keeps a failed transition from leaving the account looking active),
 // SPEC-0002 REQ "Graceful Shutdown" (quiet abandonment on stop).
+// notifyAutoRevert records the admin notification that pairs with a
+// permanent-failure auto-revert to pending_proton_setup, so the operator
+// is actively told the account needs re-auth rather than silently
+// noticing it slid out of `active`. Best-effort: a failed notification
+// must not change the permanent-failure control flow (the account has
+// already been dispatched to pending_proton_setup), so we log and move
+// on.
+//
+// We use a fresh background-derived context (not the per-tick ctx, which
+// the caller is about to cancel via the returned sentinel) so the write
+// is not aborted mid-flight by the worker's own shutdown. The notifier
+// is nopNotifier when none was wired, so this is a no-op in
+// lifecycle/plumbing tests.
+//
+// Governing: SPEC-0002 REQ "Backoff on Failure" (permanent-error
+// auto-revert emits an admin notification).
+func (p *eventProcessor) notifyAutoRevert(_ context.Context, message string, cause error) {
+	detail := ""
+	if cause != nil {
+		detail = cause.Error()
+	}
+	if _, err := p.notifier.Record(context.Background(), p.accountID,
+		notify.KindAutoReverted, message, detail); err != nil {
+		p.logger.LogAttrs(context.Background(), slog.LevelError,
+			"sync: failed to record auto-revert admin notification",
+			slog.Any("err", err),
+		)
+	}
+}
+
 func (p *eventProcessor) dispatchPermanentTransition(next account.State, cause error) {
 	go func(svc account.Service, id string, next account.State) {
 		ctx := p.transitionCtx()

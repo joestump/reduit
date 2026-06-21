@@ -271,7 +271,7 @@ func TestProcessOnceRunsReconciler(t *testing.T) {
 	client := &reconcilingProtonClient{fakeProtonClient: fc, unlabelClient: rec}
 
 	reconciler := NewMoveReconciler(store, nopLogger())
-	proc, err := newEventProcessor(ctx, a.ID, svc, client, nopLogger(), nil, reconciler)
+	proc, err := newEventProcessor(ctx, a.ID, svc, client, nopLogger(), nil, reconciler, nil)
 	if err != nil {
 		t.Fatalf("newEventProcessor: %v", err)
 	}
