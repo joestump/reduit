@@ -37,6 +37,19 @@ type ProtonLoginer interface {
 	NewClientWithLogin(ctx context.Context, username, password string) (proton.Client, *proton.Auth, error)
 }
 
+// LiveClientRegistrar is the narrow surface the wizard needs from the
+// process-wide live-client registry (internal/protonlive.Registry): hand
+// off the authenticated+unlocked client for an account. Declared here as
+// a one-method interface so the server package does not import
+// internal/protonlive and wizard tests can assert registration with a
+// stub.
+//
+// Governing: issue #28; SPEC-0002 REQ "One Worker Per Active Account".
+type LiveClientRegistrar interface {
+	// Set installs (or replaces) the live unlocked client for accountID.
+	Set(accountID string, client proton.Client)
+}
+
 // Deps are the dependencies a Server needs to start. Wired by
 // internal/cli/serve at startup.
 type Deps struct {
@@ -75,6 +88,26 @@ type Deps struct {
 	// wizard runs. Required when ProtonManager is wired; constructed
 	// alongside in cli/serve. Tests get an isolated store per server.
 	WizardSessions *WizardSessionStore
+	// LiveClients receives the authenticated+unlocked proton.Client the
+	// wizard produces at commit time, so the IMAP backend / MCP resolver
+	// / SMTP outbox can resolve a live unlocked client for the account
+	// (without which FETCH BODY[] and MCP get_message fail with
+	// proton.ErrNotUnlocked in the daemon). The wizard already runs
+	// Unlock to validate the passphrase; this hands the resulting client
+	// to the process-wide registry instead of discarding it.
+	//
+	// Held as a narrow interface (just Set) so wizard tests can assert
+	// registration without importing internal/protonlive. nil means the
+	// composition root did not wire a registry (e.g. NewForTest fixtures
+	// not exercising live-client retention); the wizard then skips
+	// registration and logs at WARN -- body decryption stays unavailable
+	// until a registry is present.
+	//
+	// Governing: ADR-0003 (the retained keyring is the in-memory form of
+	// the at-rest envelope material), SPEC-0002 REQ "One Worker Per
+	// Active Account" (the live client's lifecycle mirrors the worker's);
+	// issue #28.
+	LiveClients LiveClientRegistrar
 	// AdminSubjects is the OIDC_ADMIN_SUBS allowlist. The callback's
 	// session-bind path checks Principal.Subject against this list at
 	// bind time per SPEC-0005 REQ "Session admin tag is computed at

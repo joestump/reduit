@@ -156,6 +156,46 @@ func (m *Manager) WithAccount(ctx context.Context, snap AccountSnapshot) (Client
 	return m.NewClient(ctx, uid, acc, ref), nil
 }
 
+// NewClientWithRefresh re-authenticates an existing Proton session from
+// its UID + refresh token (no password / SRP round-trip) and returns a
+// Client carrying the rotated access+refresh tokens, plus the upstream
+// Auth bundle so the caller can read the new refresh token / UserID.
+//
+// This is the daemon-restart path: on boot the supervisor unseals an
+// account's stored refresh token and re-establishes the session WITHOUT
+// re-prompting for the mailbox password. It wraps go-proton-api's
+// Manager.NewClientWithRefresh, which POSTs {UID, RefreshToken} to
+// /auth/v4/refresh.
+//
+// IMPORTANT: the Proton session UID is REQUIRED here and is distinct from
+// the persistent Proton UserID (Auth.UserID) that Reduit stores in the
+// `proton_user_id` column. The session UID is ephemeral (minted per
+// login, rotated by Proton) and is NOT persisted by Reduit today — see
+// the re-unlock helper in internal/protonlive for the gap this leaves in
+// the restart path (tracked as #34).
+//
+// On a refresh failure (revoked token, network error) the error is
+// returned verbatim so callers can classify it the same way the sync
+// worker does (isRefreshTokenRevokedError et al.).
+//
+// Governing: ADR-0001 (go-proton-api), SPEC-0002 REQ "One Worker Per
+// Active Account" (restart re-establishes the live session an active
+// account needs rather than forcing a fresh interactive login).
+func (m *Manager) NewClientWithRefresh(ctx context.Context, uid, refreshTok string) (Client, *Auth, error) {
+	if uid == "" || refreshTok == "" {
+		return nil, nil, ErrNotAuthenticated
+	}
+	up, auth, err := m.up.NewClientWithRefresh(ctx, uid, refreshTok)
+	if err != nil {
+		return nil, nil, err
+	}
+	c := &clientImpl{mgr: m}
+	initial := auth.RefreshToken
+	c.latestRefresh.Store(&initial)
+	c.adoptUpstream(up)
+	return c, &auth, nil
+}
+
 // NewClientWithLogin runs the SRP login flow against Proton and returns
 // a Client carrying the new session, the post-Auth bundle (UID, access
 // token, refresh token, the persistent Proton user ID, and the 2FA

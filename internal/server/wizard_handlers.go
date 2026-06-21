@@ -684,6 +684,45 @@ func (s *Server) handleWizardUnlock(w http.ResponseWriter, r *http.Request) {
 		slog.String("account_id", accountID),
 		slog.String("user_id", id.UserID))
 
+	// Retain the now-unlocked client so body decryption works in the
+	// daemon. commitWizard ran Unlock on sess.Client, so its per-address
+	// keyrings are retained in-process (proton.clientImpl.addrKeyRings);
+	// handing it to the registry transfers ownership away from the wizard
+	// session. We do this AFTER the active transition (so a resolver
+	// lookup that races us sees a client only for an active account) and
+	// BEFORE finishWizardSetup (whose failure path drops the session but
+	// must NOT discard the live client).
+	//
+	// OWNERSHIP TRANSFER: immediately after Set we nil sess.Client. The
+	// registry now owns the client's lifecycle (it Logouts on Drop /
+	// CloseAll / replace). Leaving sess.Client pointing at the same
+	// client would create dual ownership: dropInFlightWizard (fired on
+	// admin logout / auth-gate invalidation) Logouts sess.Client WITHOUT
+	// Drop'ing the registry entry or transitioning the account -- so an
+	// operator who finishes the wizard (account active, client registered,
+	// Done screen) then logs out of the admin UI before clicking
+	// "complete" would kill the registry-owned client, leaving the account
+	// `active` but serving a dead, logged-out client (every FETCH BODY[] /
+	// MCP get_message -> ErrNotAuthenticated until daemon restart). All
+	// post-Done teardown paths (handleWizardComplete, finishWizardSetup's
+	// error branch, dropInFlightWizard, handleWizardCancel) guard on
+	// `sess.Client != nil`, so niling here makes every one of them a clean
+	// no-op against the transferred client.
+	//
+	// This runs under sess.Lock() (held for the whole handler), so the
+	// Set + nil pair is atomic against dropInFlightWizard, which takes the
+	// same per-session lock before touching sess.Client.
+	//
+	// Governing: ADR-0003 (retained keyring is the in-memory at-rest
+	// material), SPEC-0002 REQ "One Worker Per Active Account"; issue #28.
+	if s.deps.LiveClients != nil {
+		s.deps.LiveClients.Set(accountID, sess.Client)
+		sess.Client = nil
+	} else {
+		s.deps.Logger.Warn("wizard/unlock: no live-client registry wired; body decryption will be unavailable for this account until the daemon is configured with one",
+			slog.String("account_id", accountID))
+	}
+
 	if err := s.finishWizardSetup(r, sess); err != nil {
 		s.deps.Logger.Error("wizard/unlock: finish setup",
 			slog.String("account_id", accountID),

@@ -44,6 +44,7 @@ import (
 	"github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/cryptenv"
 	"github.com/joestump/reduit/internal/proton"
+	"github.com/joestump/reduit/internal/protonlive"
 	"github.com/joestump/reduit/internal/pubsub"
 	"github.com/joestump/reduit/internal/server"
 	"github.com/joestump/reduit/internal/store"
@@ -236,6 +237,9 @@ type wizardFixture struct {
 	usrSvc    users.Service
 	store     *store.Store
 	statusBus *pubsub.Bus
+	// live is the real live-client registry wired into Deps.LiveClients
+	// so tests can assert the wizard retains the unlocked client (#28).
+	live *protonlive.Registry
 }
 
 // newWizardFixture spins up a real httptest server with the full
@@ -286,6 +290,8 @@ func newWizardFixtureWithWriteTimeout(t *testing.T, ttl, writeTimeout time.Durat
 		})
 	t.Cleanup(unsub)
 
+	live := protonlive.New(slog.Default())
+
 	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
 	if err != nil {
 		t.Fatalf("session.New: %v", err)
@@ -329,6 +335,7 @@ func newWizardFixtureWithWriteTimeout(t *testing.T, ttl, writeTimeout time.Durat
 		AccountService:  accSvc,
 		ProtonManager:   stub,
 		WizardSessions:  wizardSessions,
+		LiveClients:     live,
 		AutoCreate:      true, // production default; admit fresh test subjects
 		InsecureCookies: true,
 		StatusBus:       statusBus,
@@ -345,6 +352,7 @@ func newWizardFixtureWithWriteTimeout(t *testing.T, ttl, writeTimeout time.Durat
 		usrSvc:    usrSvc,
 		store:     st,
 		statusBus: statusBus,
+		live:      live,
 	}
 }
 
@@ -515,6 +523,13 @@ func TestWizard_HappyPath_NoTwoFA(t *testing.T) {
 	if a.State != account.StateActive {
 		t.Errorf("state = %s, want active", a.State)
 	}
+	// #28: the wizard MUST retain the unlocked client in the live
+	// registry so the daemon can decrypt bodies without a re-unlock.
+	if got, ok := f.live.Get(a.ID); !ok {
+		t.Errorf("live registry has no client for active account %s", a.ID)
+	} else if got != stubClient {
+		t.Errorf("live registry holds a different client than the wizard unlocked")
+	}
 	if a.ProtonUserID != "proton-user-joe" {
 		t.Errorf("ProtonUserID = %q, want proton-user-joe", a.ProtonUserID)
 	}
@@ -570,6 +585,72 @@ func TestWizard_HappyPath_NoTwoFA(t *testing.T) {
 	}
 	if _, ok := f.wizards.Get(a.ID); ok {
 		t.Error("wizard session still in store after complete; want dropped")
+	}
+}
+
+// TestWizard_AdminLogoutAfterDone_DoesNotKillRegisteredClient is the
+// regression test for the dual-ownership double-Logout bug the hostile
+// review of PR #35 caught: the wizard handed sess.Client to the registry
+// but never nilled sess.Client, so an admin logout (dropInFlightWizard)
+// after the Done screen Logout'd the registry-owned client without
+// Drop'ing it or transitioning the account -- leaving the account active
+// but serving a dead, logged-out client.
+//
+// With the ownership-transfer fix (sess.Client = nil after Set), the
+// post-Done teardown paths are no-ops against the transferred client.
+func TestWizard_AdminLogoutAfterDone_DoesNotKillRegisteredClient(t *testing.T) {
+	t.Parallel()
+	f := newWizardFixture(t, 0)
+	c, userID := f.makeUser(t, "sub-logout-after-done", "joe@example.com", "Joe")
+
+	stubClient := readyClient()
+	f.stub.push(stubLoginResult{client: stubClient, auth: stubAuth(0)})
+
+	// Drive the wizard to the Done screen (account active + client
+	// registered). We stop BEFORE POSTing /complete so the wizard session
+	// is still in the store -- this is the exact window the bug lives in.
+	c.Get(f.url + "/accounts/setup")
+	post(t, c, f.url+"/accounts/setup/auth", url.Values{
+		"username": {"joe@protonmail.com"}, "password": {"hunter2"},
+	}).Body.Close()
+	post(t, c, f.url+"/accounts/setup/unlock", url.Values{
+		"passphrase": {"my-mailbox-passphrase"},
+	}).Body.Close()
+
+	accts, _ := f.accSvc.ListByUser(t.Context(), userID)
+	if len(accts) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(accts))
+	}
+	a := accts[0]
+	if a.State != account.StateActive {
+		t.Fatalf("precondition: account state = %s, want active", a.State)
+	}
+	if got, ok := f.live.Get(a.ID); !ok || got != stubClient {
+		t.Fatalf("precondition: registry should hold the unlocked client")
+	}
+	logoutsBefore := stubClient.logoutCalls
+
+	// Admin logs out of the UI before clicking "complete". This fires
+	// dropInFlightWizard via handleAuthLogout.
+	token := csrfTokenFromDashboard(t, c, f.url)
+	resp := postLogout(t, c, f.url, token)
+	resp.Body.Close()
+
+	// The registry-owned client MUST still be alive (not logged out) and
+	// still resolvable; the account MUST stay active.
+	if stubClient.logoutCalls != logoutsBefore {
+		t.Errorf("admin logout Logout'd the registry-owned client: logoutCalls went %d -> %d",
+			logoutsBefore, stubClient.logoutCalls)
+	}
+	if got, ok := f.live.Get(a.ID); !ok || got != stubClient {
+		t.Errorf("registry lost the client after admin logout: ok=%v", ok)
+	}
+	reread, err := f.accSvc.GetByID(t.Context(), a.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if reread.State != account.StateActive {
+		t.Errorf("account state after admin logout = %s, want active", reread.State)
 	}
 }
 

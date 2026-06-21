@@ -25,6 +25,7 @@ import (
 	"github.com/joestump/reduit/internal/imapserver"
 	"github.com/joestump/reduit/internal/mcpserver"
 	"github.com/joestump/reduit/internal/proton"
+	"github.com/joestump/reduit/internal/protonlive"
 	"github.com/joestump/reduit/internal/pubsub"
 	"github.com/joestump/reduit/internal/retention"
 	"github.com/joestump/reduit/internal/server"
@@ -297,6 +298,45 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 	defer protonMgr.Close()
 	wizardSessions := server.NewWizardSessionStore(server.DefaultWizardIdleTimeout)
 
+	// Live-client registry: the process-wide account-ID -> unlocked
+	// proton.Client map (#28). The wizard registers an account's client
+	// here on a successful unlock; the IMAP backend, MCP resolver, and
+	// SMTP outbox resolve the same live client out of it so FETCH BODY[]
+	// (#13) and MCP get_message (#14) can decrypt bodies in the daemon.
+	//
+	// The Lifecycle drop callback is registered on the account service's
+	// transition stream so an account leaving `active` has its unlocked
+	// keyring dropped (and its upstream session revoked), mirroring where
+	// the sync supervisor stops the worker.
+	//
+	// NOTE: boot-time re-unlock of already-active accounts is NOT wired
+	// here yet. ReUnlock needs the Proton *session UID*, which Reduit
+	// does not persist today (only the refresh token + mailbox passphrase
+	// are sealed). Until a session-UID column + accessor land, a daemon
+	// restart leaves already-active accounts without an unlocked keyring
+	// until the operator re-runs the wizard; body fetches return a
+	// transient IMAP NO / MCP auth_required in the meantime. The
+	// Lifecycle is constructed with a nil UIDSource so the gap is
+	// explicit and logged per-account at WARN if a boot re-unlock is ever
+	// attempted.
+	//
+	// Governing: ADR-0003, ADR-0001, SPEC-0002 REQ "One Worker Per Active
+	// Account"; issue #28.
+	liveClients := protonlive.New(logger)
+	defer func() {
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelClose()
+		liveClients.CloseAll(closeCtx)
+	}()
+	liveLifecycle := protonlive.NewLifecycle(liveClients, protonMgr, accountService, nil, accountService, logger)
+	unsubscribeLive := accountService.OnTransition(func(cbCtx context.Context, prev, next account.State, a *account.Account) {
+		if a == nil {
+			return
+		}
+		liveLifecycle.OnAccountStateChange(cbCtx, prev, next, a.ID)
+	})
+	defer unsubscribeLive()
+
 	// MCP server (per ADR-0008): mounted at `/mcp` on the same admin
 	// HTTPS listener, behind its own bearer-auth + per-account
 	// concurrency-cap middleware. Constructed only when the HTTP
@@ -388,6 +428,7 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		AccountService: accountService,
 		ProtonManager:  protonMgr,
 		WizardSessions: wizardSessions,
+		LiveClients:    liveClients,
 		AdminSubjects:  cfg.OIDC.AdminSubjects,
 		AutoCreate:     cfg.OIDC.AutoCreate,
 		TrustedProxies: cfg.Server.TrustedProxies,
