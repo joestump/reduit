@@ -22,6 +22,8 @@ import (
 	"time"
 
 	smtp "github.com/emersion/go-smtp"
+
+	"github.com/joestump/reduit/internal/tlsloader"
 )
 
 // DefaultSMTPSAddress is the listen address used when neither
@@ -309,14 +311,12 @@ func (s *Server) LocalAddr() net.Addr {
 //
 // Returns nil on graceful shutdown, an error otherwise.
 func (s *Server) Start() error {
-	tlsCfg := &tls.Config{
-		MinVersion:     tls.VersionTLS12,
-		GetCertificate: s.cfg.GetCertificate,
-		// ALPN tag for SMTPS. Mainstream clients ignore ALPN over 465
-		// so this is harmless additional metadata for any tooling that
-		// does inspect it.
-		NextProtos: []string{"smtp"},
-	}
+	// Centralized hardened TLS posture shared with HTTPS + IMAPS.
+	// ALPN tag for SMTPS. Mainstream clients ignore ALPN over 465 so
+	// this is harmless additional metadata for any tooling that does
+	// inspect it.
+	// Governing: ADR-0009 (TLS via disk with hot-reload).
+	tlsCfg := tlsloader.Config(s.cfg.GetCertificate, []string{"smtp"})
 	addr := s.cfg.resolveAddr()
 	rawLn, err := tls.Listen("tcp", addr, tlsCfg)
 	if err != nil {

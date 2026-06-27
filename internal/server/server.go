@@ -26,6 +26,7 @@ import (
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/pubsub"
 	"github.com/joestump/reduit/internal/store"
+	"github.com/joestump/reduit/internal/tlsloader"
 	"github.com/joestump/reduit/internal/users"
 )
 
@@ -258,10 +259,10 @@ func New(addr string, deps Deps) *Server {
 		ErrorLog:          slog.NewLogLogger(deps.Logger.Handler(), slog.LevelError),
 	}
 	if deps.GetCertificate != nil {
-		s.srv.TLSConfig = &tls.Config{
-			GetCertificate: deps.GetCertificate,
-			MinVersion:     tls.VersionTLS12,
-		}
+		// Centralized hardened TLS posture shared with IMAPS + SMTPS; nil
+		// ALPN lets net/http manage HTTP/1.1 vs h2 negotiation itself.
+		// Governing: ADR-0009 (TLS via disk with hot-reload).
+		s.srv.TLSConfig = tlsloader.Config(deps.GetCertificate, nil)
 	}
 	return s
 }

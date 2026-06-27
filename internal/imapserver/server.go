@@ -22,6 +22,7 @@ import (
 	"github.com/emersion/go-imap/v2/imapserver"
 
 	"github.com/joestump/reduit/internal/pubsub"
+	"github.com/joestump/reduit/internal/tlsloader"
 )
 
 // DefaultIMAPSAddress is the listen address used when neither
@@ -241,15 +242,12 @@ func (s *Server) LocalAddr() net.Addr {
 //
 // Returns nil on graceful shutdown, an error otherwise.
 func (s *Server) Start() error {
-	tlsCfg := &tls.Config{
-		MinVersion:     tls.VersionTLS12,
-		GetCertificate: s.cfg.GetCertificate,
-		// Advertise IMAP as the ALPN protocol. emersion's client also
-		// uses "imap"; mainstream mail clients ignore ALPN over IMAPS
-		// so this is harmless additional metadata for any tooling
-		// that does inspect it.
-		NextProtos: []string{"imap"},
-	}
+	// Centralized hardened TLS posture shared with HTTPS + SMTPS.
+	// Advertise IMAP as the ALPN protocol. emersion's client also uses
+	// "imap"; mainstream mail clients ignore ALPN over IMAPS so this is
+	// harmless additional metadata for any tooling that does inspect it.
+	// Governing: ADR-0009 (TLS via disk with hot-reload).
+	tlsCfg := tlsloader.Config(s.cfg.GetCertificate, []string{"imap"})
 	addr := s.cfg.resolveAddr()
 	rawLn, err := tls.Listen("tcp", addr, tlsCfg)
 	if err != nil {
