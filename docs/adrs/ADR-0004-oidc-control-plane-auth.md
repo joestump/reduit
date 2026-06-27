@@ -9,11 +9,11 @@
 > (1) "every authenticated session maps 1:1 to a Reduit account record
 > via the OIDC `sub` claim" — sessions now bind to a `users` row, and
 > a user MAY own zero or more accounts (1:N); (2) "first login auto-
-> creates the account record (configurable: `OIDC_AUTO_CREATE`)" —
+> creates the account record (configurable: `REDUIT_OIDC_AUTO_CREATE`)" —
 > first login establishes user identity only; account creation is a
 > separate, deliberate action via the add-Proton-account wizard. The
 > rest of this ADR (OIDC as the chosen auth scheme, PKCE auth-code
-> flow, SCS sessions, admin allowlist via `OIDC_ADMIN_SUBS`, no
+> flow, SCS sessions, admin allowlist via `REDUIT_OIDC_ADMIN_SUBS`, no
 > in-Reduit password store) stands. See ADR-0010 for the current
 > users/accounts shape and SPEC-0001 / SPEC-0005 for the current
 > first-login and dashboard contracts.
@@ -61,16 +61,20 @@ Pocket ID.**
 
 - Reduit acts as an OIDC Relying Party. Standard authorization-code
   flow with PKCE.
-- Configured via env: `OIDC_ISSUER_URL`, `OIDC_CLIENT_ID`,
-  `OIDC_CLIENT_SECRET`, `OIDC_REDIRECT_URL`, `OIDC_SCOPES`.
+- Configured via env: `REDUIT_OIDC_ISSUER_URL`,
+  `REDUIT_OIDC_CLIENT_ID`, `REDUIT_OIDC_CLIENT_SECRET`,
+  `REDUIT_OIDC_REDIRECT_URL`, `REDUIT_OIDC_SCOPES`. The client secret
+  also supports `_FILE` indirection — `REDUIT_OIDC_CLIENT_SECRET_FILE`
+  points at a file whose contents are read as the secret, so it need
+  not be passed inline in the environment.
 - Sessions: secure HTTP-only cookie holding an opaque session ID;
   session state in SQLite via `alexedwards/scs`.
 - Authorization model: every authenticated session maps 1:1 to a
   Reduit account record via the OIDC `sub` claim. First login auto-
-  creates the account record (configurable: `OIDC_AUTO_CREATE`).
+  creates the account record (configurable: `REDUIT_OIDC_AUTO_CREATE`).
   *(Refined by ADR-0010: sessions bind to a `users` row; users own
   0..N accounts; first login establishes user identity only and
-  does NOT create an account row — `OIDC_AUTO_CREATE` semantics
+  does NOT create an account row — `REDUIT_OIDC_AUTO_CREATE` semantics
   apply only to user admittance under the current model.)*
 - Admin role: a configurable list of OIDC `sub` claims (or an
   `admin` group claim) gets admin-only routes (manage other users,
@@ -95,7 +99,7 @@ Pocket ID.**
   deployment story. We do NOT bundle an OIDC IdP.
 - First-time bootstrapping requires: (a) IdP up, (b) OIDC client
   registered, (c) Reduit configured with client creds, (d) admin
-  user's `sub` listed in `OIDC_ADMIN_SUBS` env. Documented setup flow.
+  user's `sub` listed in `REDUIT_OIDC_ADMIN_SUBS` env. Documented setup flow.
 - IdP unavailability = no admin login. IMAPS/SMTPS protocol endpoints
   remain functional (they don't use OIDC), so mail flow continues.
 

@@ -54,10 +54,15 @@ mounted by a host with broader access.
 
 Implementation:
 
-- **Master key:** 256-bit random, generated once on first run, stored
-  as `/var/lib/reduit/master.key` (path configurable). File mode 0600,
+- **Master key:** 256-bit random, stored as
+  `/var/lib/reduit/master.key` (path configurable). File mode 0600,
   owner = service user. The path is configured; the file is *not*
-  committed.
+  committed. **Bootstrap is fail-closed:** `serve` does NOT silently
+  auto-generate the key on first run. If the key file is missing at
+  startup, `serve` hard-errors and the operator MUST run
+  `reduit master-key generate` first. This avoids a silently-generated
+  key that the operator never backed up (which would be a latent
+  total-data-loss trap — see Negatives).
 - **Per-account data key:** 256-bit random, generated when an account
   is created. Stored encrypted-under-master-key in the `accounts.key_envelope`
   column.
@@ -87,9 +92,9 @@ Implementation:
 - **Master key loss = total data loss.** Self-hosters MUST back the
   master key up out of band (password manager, 1Password, vault). This
   is documented loudly.
-- Master key rotation is a non-trivial procedure (re-encrypt all data
-  keys). Designed but deferred to v0.5+; v0.1 ships rotation as a
-  manual `reduit migrate-master-key --new-key=...` command.
+- Master key rotation is a non-trivial procedure (re-wrap every
+  account's data-key envelope). Shipped as the `reduit master-key
+  rotate` command — see the **Key rotation** subsection below.
 - The master key being on the same filesystem as the SQLite store is a
   weak boundary. Stronger: master key on a separate volume, mounted
   read-only at startup. Documented as a recommendation, not enforced.
@@ -99,6 +104,38 @@ Implementation:
 - Decrypted secrets live in process memory while sync workers run.
   This is acceptable; the threat model assumes the process can be
   trusted while running.
+
+### Key rotation
+
+Master-key rotation ships as `reduit master-key rotate` (PR #59,
+issues #50 / #53). Rotation re-wraps the *envelope* and nothing else:
+
+- It generates a new 256-bit master key and, in a single DB
+  transaction, re-encrypts every account's `key_envelope` under the
+  new key. The per-account data keys are unchanged, so every secret
+  ciphertext (`refresh_token_ciphertext`,
+  `mailbox_passphrase_ciphertext`, `imap_password_ciphertext`) is
+  left untouched — only the envelope that seals each data key is
+  re-encrypted.
+- Durability ordering is chosen to make an interrupted rotation
+  non-destructive. After the transaction commits, rotation runs
+  `PRAGMA wal_checkpoint(TRUNCATE)` to force the re-wrapped envelopes
+  to the main database file *before* the new master-key file is put
+  in place. The key file is then swapped atomically (write temp +
+  `fsync` + `rename`). If the process dies at any point, either the
+  old key still matches the on-disk envelopes or the new key does;
+  there is no window where the persisted key and the persisted
+  envelopes disagree.
+- The previous key is preserved as a timestamped `.bak` alongside the
+  key file, so a botched rotation is recoverable out of band.
+- Rotation refuses to run against a 0-account database unless
+  `--allow-empty` is passed (a guard against silently "rotating" a
+  store the operator believes is populated).
+- The supplied old key is verified before any re-wrap; a wrong old
+  key is rejected with `ErrMasterKeyMismatch`.
+- Rotation takes the same exclusive file lock that `serve` holds, so
+  rotation and the running daemon are mutually exclusive: the daemon
+  MUST be stopped before rotating.
 
 ## Pros and Cons of the Options
 

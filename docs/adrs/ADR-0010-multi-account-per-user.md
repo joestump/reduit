@@ -1,6 +1,6 @@
 # ADR-0010: Multi-Proton-Account Per User
 
-- **Status:** proposed
+- **Status:** accepted (2026-06-27)
 - **Date:** 2026-05-02
 - **Deciders:** Joe Stump
 
@@ -203,6 +203,20 @@ approach is a **greenfield rewrite of the affected migrations**:
   actions (e.g., "an admin suspended one of my accounts" — only
   sessions bound to that one account need to drop). Both keys can
   coexist on `session_owners` if useful; pick during the refactor.
+
+  **As shipped (#52 / #60):** the control-plane (web) SessionGate
+  enforces *user existence* for user-scoped sessions — a session is
+  admitted while its bound `users` row exists, and revoking a user
+  drops their web sessions. Account-scoped session revocation remains
+  a forward-looking hook: no production code path binds an
+  account-scoped identity today, so the gate never locks out on an
+  account being suspended. Per-account web suspend / soft-delete is
+  instead enforced by handler-level `409` guards (credential rotation
+  and, as of PR #60, MCP-token issuance), not by gate lockout, so an
+  owner retains self-service reactivation of their own account. The
+  admin-imposed-suspend authority work — making a suspend
+  non-owner-reversible and dropping the owner's web session — is
+  tracked in issue #63.
 - The migrations that landed before this ADR will be **rewritten
   in place** rather than supplemented. This is acceptable because
   the project has not shipped.

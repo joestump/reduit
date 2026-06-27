@@ -23,6 +23,14 @@ All routes except a small allowlist MUST require an authenticated
 OIDC session. Unauthenticated requests to protected routes MUST
 redirect to the OIDC login flow.
 
+As shipped, the web SessionGate admits a user-scoped session for as
+long as the bound `users` row exists; per-account suspend / soft-delete
+on the web surface is enforced by handler-level `409` guards
+(credential rotation, MCP-token issuance), not by a gate lockout, so
+that an account owner retains self-service reactivation. Making an
+admin-imposed suspend non-owner-reversible and dropping the owner's
+web session is tracked in issue #63.
+
 #### Scenario: Unauthenticated request redirects to login
 
 - **WHEN** an unauthenticated browser issues `GET /accounts`

@@ -1,8 +1,20 @@
 # ADR-0009: TLS via on-disk cert files with hot-reload
 
-- **Status:** accepted (amended by [ADR-0011](ADR-0011-http-mode-for-reverse-proxy-fronting.md), 2026-05-04 — adds an opt-in HTTP-only mode for the admin/MCP listener; mail listeners still follow this ADR)
+- **Status:** accepted (amended by [ADR-0011](ADR-0011-http-mode-for-reverse-proxy-fronting.md), 2026-05-04 — adds an opt-in HTTP-only mode for the admin/MCP listener; mail listeners still follow this ADR; refined by PR #61 (#54), 2026-06-27 — shared TLS-config builder with a TLS 1.2 floor and an explicit cipher-suite allowlist)
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
+
+> **Refined by PR #61 (issue #54), 2026-06-27.** The three TLS
+> listeners (HTTPS, IMAPS, SMTPS) no longer each hand-roll a
+> `*tls.Config`; they build it through a shared `tlsloader.Config(...)`
+> builder. The builder pins `MinVersion: tls.VersionTLS12` — the TLS
+> 1.2 floor is kept deliberately for interop with older IMAP/SMTP
+> mail clients — and supplies an explicit forward-secret AEAD
+> cipher-suite allowlist for the 1.2 fallback path (ECDHE key
+> exchange with AES-GCM or ChaCha20-Poly1305 only). TLS 1.3 cipher
+> suites are Go-managed and always on; the allowlist constrains only
+> the 1.2 fallback. The on-disk cert loading and hot-reload via the
+> `GetCertificate` callback described below are unchanged.
 
 ## Context and Problem Statement
 
