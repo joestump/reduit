@@ -398,6 +398,147 @@ func TestRequireSession_AccountStateRecheck(t *testing.T) {
 	}
 }
 
+// TestRequireSession_PrincipalActiveRecheck pins issue #52's
+// ADR-0010-correct, user-scoped re-check. Unlike the account-id-keyed
+// AccountActive path, PrincipalActive:
+//
+//   - receives the whole Identity (so it can gate on users.id, the
+//     ADR-0010 binding), and
+//   - does NOT treat an empty AccountID as a malformed shape -- the
+//     plain dashboard session legitimately has no account in scope.
+//
+// Sub-cases: active principal -> 200; suspended principal (e.g. all
+// owned accounts suspended/soft-deleted) -> session destroyed + 302;
+// store error -> 503 fail-closed; and PrincipalActive supersedes
+// AccountActive when both are set.
+//
+// Governing: ADR-0004 (OIDC control-plane auth), ADR-0010 (sessions
+// bind to users.id; AccountID optional), SPEC-0005 REQ "Admin Account
+// Management", SPEC-0005 REQ "Authentication Gating".
+func TestRequireSession_PrincipalActiveRecheck(t *testing.T) {
+	t.Parallel()
+	st := openTempStore(t)
+	defer st.Close()
+	mgr, cleanup, err := session.New(st.DB.DB, session.Options{Insecure: true})
+	if err != nil {
+		t.Fatalf("session.New: %v", err)
+	}
+	defer cleanup()
+
+	type checkResult struct {
+		ok  bool
+		err error
+	}
+	var (
+		checkMu  sync.Mutex
+		checkRet checkResult
+	)
+	setCheck := func(r checkResult) {
+		checkMu.Lock()
+		defer checkMu.Unlock()
+		checkRet = r
+	}
+	principal := func(ctx context.Context, id session.Identity) (bool, error) {
+		checkMu.Lock()
+		defer checkMu.Unlock()
+		// User-scoped: UserID is the binding, AccountID is empty for the
+		// plain dashboard session and MUST NOT be rejected as malformed.
+		if id.UserID != "user-7" {
+			t.Errorf("principal called with UserID=%q, want %q", id.UserID, "user-7")
+		}
+		if id.AccountID != "" {
+			t.Errorf("dashboard session AccountID=%q, want empty (ADR-0010)", id.AccountID)
+		}
+		return checkRet.ok, checkRet.err
+	}
+	// AccountActive must never run when PrincipalActive is wired.
+	accountActive := func(ctx context.Context, accountID string) (bool, error) {
+		t.Errorf("AccountActive MUST NOT be called when PrincipalActive is set; got accountID=%q", accountID)
+		return false, nil
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		// User-scoped session: UserID set, AccountID empty (ADR-0010).
+		_ = session.PutIdentity(r.Context(), mgr, session.Identity{Subject: "joe", UserID: "user-7"})
+		_, _ = w.Write([]byte("logged in"))
+	})
+	mux.HandleFunc("/protected", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("welcome"))
+	})
+	gate := auth.SessionGate{
+		Manager:         mgr,
+		LoginPath:       "/auth/login",
+		PrincipalActive: principal,
+		AccountActive:   accountActive,
+	}
+	handler := mgr.LoadAndSave(auth.RequireSession(gate, mux))
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	jar, _ := cookiejar.New(nil)
+	c := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	if _, err := c.Get(srv.URL + "/auth/login"); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+
+	// Active principal -> 200.
+	setCheck(checkResult{ok: true})
+	resp, err := c.Get(srv.URL + "/protected")
+	if err != nil {
+		t.Fatalf("/protected (active): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("active status = %d, want 200", resp.StatusCode)
+	}
+
+	// Suspended principal -> 302, session destroyed.
+	setCheck(checkResult{ok: false})
+	resp, err = c.Get(srv.URL + "/protected")
+	if err != nil {
+		t.Fatalf("/protected (suspended): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("suspended status = %d, want 302", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "/auth/login") {
+		t.Errorf("Location = %q, want /auth/login...", loc)
+	}
+
+	// Cookie is now dead even if the principal flips back to active.
+	setCheck(checkResult{ok: true})
+	resp, err = c.Get(srv.URL + "/protected")
+	if err != nil {
+		t.Fatalf("/protected (post-destroy): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("post-destroy status = %d, want 302 (cookie destroyed)", resp.StatusCode)
+	}
+
+	// Store-error path -> 503 fail-closed (after fresh login).
+	if _, err := c.Get(srv.URL + "/auth/login"); err != nil {
+		t.Fatalf("re-login: %v", err)
+	}
+	setCheck(checkResult{ok: false, err: errors.New("store down")})
+	resp, err = c.Get(srv.URL + "/protected")
+	if err != nil {
+		t.Fatalf("/protected (store err): %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("store-err status = %d, want 503", resp.StatusCode)
+	}
+}
+
 // TestRequireSession_MalformedSessionFailsClosed pins the C6-N1
 // hostile-R2 fix. When the gate has AccountActive wired and the
 // session ends up with Subject set but AccountID empty (a shape

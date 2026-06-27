@@ -31,6 +31,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/auth/mcptoken"
 )
 
@@ -142,6 +143,84 @@ func TestMCPTokens_Issue_MissingCSRF_Forbidden(t *testing.T) {
 	toks, _ := mcptoken.NewRepository(f.store.DB).ListForAccount(t.Context(), id)
 	if len(toks) != 0 {
 		t.Errorf("token issued despite missing CSRF — gate broken: %+v", toks)
+	}
+}
+
+// TestMCPTokens_Issue_SuspendedAccount_Conflict asserts that
+// POST /accounts/{id}/mcp-tokens returns 409 when the account is
+// suspended. Minting a fresh per-account MCP bearer token for an account
+// whose SASL/MCP access is already halted is incoherent, so the owner of
+// a suspended account must not be able to issue one. Mirrors the
+// credentials-rotation 409 guard.
+//
+// Governing: SPEC-0006 REQ "Token Issuance and Revocation"; SPEC-0005
+// REQ "Per-User IMAP/SMTP Credentials".
+func TestMCPTokens_Issue_SuspendedAccount_Conflict(t *testing.T) {
+	t.Parallel()
+	f := newWizardFixture(t, 0)
+	c, userID := f.makeUser(t, "sub-mcp-susp", "susp@example.com", "Susp")
+	id := f.seedActive(t, userID)
+	if _, err := f.accSvc.Transition(t.Context(), id, account.StateSuspended); err != nil {
+		t.Fatalf("transition suspended: %v", err)
+	}
+
+	resp := post(t, c, f.url+"/accounts/"+id+"/mcp-tokens", url.Values{"label": {"laptop"}})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 for suspended account issuance", resp.StatusCode)
+	}
+	// No token must have been minted.
+	toks, _ := mcptoken.NewRepository(f.store.DB).ListForAccount(t.Context(), id)
+	if len(toks) != 0 {
+		t.Errorf("token issued for suspended account — state guard broken: %+v", toks)
+	}
+}
+
+// TestMCPTokens_Issue_SoftDeletedAccount_Conflict asserts that
+// POST /accounts/{id}/mcp-tokens returns 409 when the account is
+// soft-deleted.
+//
+// Governing: SPEC-0006 REQ "Token Issuance and Revocation"; SPEC-0005
+// REQ "Per-User IMAP/SMTP Credentials".
+func TestMCPTokens_Issue_SoftDeletedAccount_Conflict(t *testing.T) {
+	t.Parallel()
+	f := newWizardFixture(t, 0)
+	c, userID := f.makeUser(t, "sub-mcp-sdel", "sdel@example.com", "SDel")
+	id := f.seedActive(t, userID)
+	if _, err := f.accSvc.Transition(t.Context(), id, account.StateSoftDeleted); err != nil {
+		t.Fatalf("transition soft-deleted: %v", err)
+	}
+
+	resp := post(t, c, f.url+"/accounts/"+id+"/mcp-tokens", url.Values{"label": {"laptop"}})
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 for soft-deleted account issuance", resp.StatusCode)
+	}
+	toks, _ := mcptoken.NewRepository(f.store.DB).ListForAccount(t.Context(), id)
+	if len(toks) != 0 {
+		t.Errorf("token issued for soft-deleted account — state guard broken: %+v", toks)
+	}
+}
+
+// TestMCPTokens_Issue_ActiveAccount_OK is the positive control: an active
+// account still mints a token (200), proving the 409 guard does not block
+// the normal path.
+//
+// Governing: SPEC-0006 REQ "Token Issuance and Revocation".
+func TestMCPTokens_Issue_ActiveAccount_OK(t *testing.T) {
+	t.Parallel()
+	f := newWizardFixture(t, 0)
+	c, userID := f.makeUser(t, "sub-mcp-active", "active@example.com", "Active")
+	id := f.seedActive(t, userID)
+
+	resp := post(t, c, f.url+"/accounts/"+id+"/mcp-tokens", url.Values{"label": {"laptop"}})
+	body := readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for active account issuance; body=%s", resp.StatusCode, body)
+	}
+	toks, _ := mcptoken.NewRepository(f.store.DB).ListForAccount(t.Context(), id)
+	if len(toks) != 1 {
+		t.Errorf("active account issuance did not mint exactly one token: %+v", toks)
 	}
 }
 

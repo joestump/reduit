@@ -22,6 +22,7 @@ import (
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/auth"
 	authoidc "github.com/joestump/reduit/internal/auth/oidc"
+	authsession "github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/notify"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/pubsub"
@@ -332,8 +333,24 @@ func newWithHandler(deps Deps) (*Server, http.Handler) {
 		handler = auth.RequireSession(auth.SessionGate{
 			Manager:   deps.SessionManager,
 			LoginPath: "/auth/login",
+			// PrincipalActive wires issue #52: re-check the bound
+			// principal's account state on every gated request so a
+			// session issued before an admin suspends/soft-deletes the
+			// user's accounts is rejected on the NEXT request rather
+			// than lingering until idle-timeout.
+			//
+			// ADR-0010: control-plane sessions bind to users.id, and the
+			// dashboard session's Identity.AccountID is empty -- so we
+			// gate on the USER, not a single account id (the
+			// account-id-keyed AccountActive closure is the wrong shape
+			// for a user-scoped session; see SessionGate.PrincipalActive).
+			//
+			// Governing: ADR-0004 (OIDC control-plane auth), ADR-0010
+			// (sessions bind to users.id), SPEC-0005 REQ "Admin Account
+			// Management", SPEC-0005 REQ "Authentication Gating".
+			PrincipalActive: principalActiveChecker(deps.UsersService, deps.AccountService),
 			// OnDestroy fires on every gate-initiated session
-			// invalidation (malformed-shape, AccountActive false).
+			// invalidation (malformed-shape, PrincipalActive false).
 			// We use it to tear down any in-flight wizard so partial
 			// credentials don't outlive the session per SPEC-0005.
 			OnDestroy: s.dropInFlightWizard,
@@ -344,6 +361,109 @@ func newWithHandler(deps Deps) (*Server, http.Handler) {
 	// including allowlisted routes and gate-issued 302s.
 	handler = securityHeaders(handler)
 	return s, handler
+}
+
+// principalActiveChecker builds the SessionGate.PrincipalActive closure
+// for issue #52. It re-checks, on every gated request, that the bound
+// principal is still admissible so a session issued before the principal
+// is revoked is rejected on the NEXT request instead of surviving until
+// idle-timeout.
+//
+// ADR-0010 reconciliation -- this is the load-bearing design decision.
+// Control-plane sessions bind to users.id, NOT to a Proton account, and
+// Reduit has no per-user lifecycle state. Only Proton *accounts* carry
+// suspended/soft_deleted states (SPEC-0001), and the dashboard SCS
+// Identity carries an EMPTY AccountID (account scope lives in the
+// wizard's in-flight store, never on the session Identity today). So
+// for the user-scoped session the gate enforces exactly one thing: the
+// bound users row still EXISTS. A hard-deleted user (or a wiring bug
+// that leaves UserID empty) is denied and re-gated to login.
+//
+// The gate deliberately does NOT lock a user out because their accounts
+// are suspended or soft-deleted. That is a hardened, tested contract:
+//   - suspend is owner-recoverable self-service -- the owner reaches
+//     /accounts/{id}/reactivate to un-suspend their own account
+//     (TestDashboardAction_Reactivate_*), and
+//   - rotation/credential handlers return 409 Conflict on a
+//     suspended/soft-deleted account (TestCredentials_Rotate_*Account_
+//     Conflict) -- a gate lockout would turn those 409s into 302/401.
+//
+// Account-state enforcement is the per-handler guard's job; revoking
+// web access at the gate would break self-service reactivation. Issue
+// #52's "suspended/soft-deleted account's sessions are rejected" is
+// therefore enforced for ACCOUNT-SCOPED principals (the branch below,
+// forward-looking until a handler populates Identity.AccountID) and on
+// the MCP-token side (#47, already wired via mcpserver.accountUsable),
+// not for the user-scoped dashboard session.
+//
+// Admins are always admissible (subject to user existence) so suspending
+// one of their accounts never locks them out of the admin surface they
+// need to manage others (SPEC-0005).
+//
+// Returns (false, err) on a store outage so the gate fails closed with
+// 503 rather than silently admitting a possibly-revoked principal.
+//
+// Returns nil when its dependencies are nil so tests and minimal wirings
+// that omit the services keep the pre-#52 (Subject-only) behaviour.
+//
+// Governing: ADR-0004 (OIDC control-plane auth), ADR-0010 (sessions bind
+// to users.id; AccountID optional), SPEC-0001 REQ "Account Lifecycle
+// States", SPEC-0005 REQ "Admin Account Management", SPEC-0005 REQ
+// "Authentication Gating".
+func principalActiveChecker(usersSvc users.Service, acctSvc account.Service) func(context.Context, authsession.Identity) (bool, error) {
+	if usersSvc == nil || acctSvc == nil {
+		return nil
+	}
+	return func(ctx context.Context, id authsession.Identity) (bool, error) {
+		// A session past IsAuthenticated with no UserID is a malformed
+		// shape (BindFromOIDC always sets UserID). Fail closed.
+		if id.UserID == "" {
+			return false, nil
+		}
+
+		// The bound user must still exist. A removed (hard-deleted) user
+		// is the user-scoped revocation the gate enforces. ErrUserNotFound
+		// -> deny; any other error -> fail closed (503).
+		if _, err := usersSvc.GetByID(ctx, id.UserID); err != nil {
+			if errors.Is(err, users.ErrUserNotFound) {
+				return false, nil
+			}
+			return false, fmt.Errorf("server: principal re-check: get user: %w", err)
+		}
+
+		// Admins are admissible regardless of owned-account state.
+		if id.IsAdmin {
+			return true, nil
+		}
+
+		// Account-scoped session (AccountID set): the named account must
+		// not be revoked. This branch is FORWARD-LOOKING and is NOT
+		// exercised by any production path today -- no handler sets
+		// Identity.AccountID, so dashboard/wizard SCS sessions always reach
+		// the user-scoped branch below. It is wired now so that the moment a
+		// handler narrows a session to a single Proton account, a
+		// suspended/soft-deleted account's scoped session is rejected on the
+		// next request without further changes here. The admin-suspend
+		// web-session drop (dropping a non-admin owner's live dashboard
+		// session when their account is suspended) is a separate design
+		// decision tracked in issue #63 -- it is NOT implemented here.
+		if id.AccountID != "" {
+			acct, err := acctSvc.GetByID(ctx, id.AccountID)
+			if err != nil {
+				if errors.Is(err, account.ErrAccountNotFound) {
+					return false, nil
+				}
+				return false, fmt.Errorf("server: principal re-check: get account: %w", err)
+			}
+			revoked := acct.State == account.StateSuspended || acct.State == account.StateSoftDeleted
+			return !revoked, nil
+		}
+
+		// User-scoped dashboard session: the user exists and is not an
+		// admin -> admissible. Per-account suspend/soft-delete is enforced
+		// by the route handlers (409), not here.
+		return true, nil
+	}
 }
 
 // Start begins serving. It returns when the listener exits (typically

@@ -168,6 +168,42 @@ type SessionGate struct {
 	// soft-delete must immediately revoke access).
 	AccountActive func(ctx context.Context, accountID string) (bool, error)
 
+	// PrincipalActive is the ADR-0010-correct, user-scoped re-check.
+	// It supersedes AccountActive when both are set.
+	//
+	// Per ADR-0010 control-plane sessions bind to users.id, and
+	// Identity.AccountID is OPTIONAL -- the plain dashboard session
+	// carries an EMPTY AccountID and only handlers that narrow to a
+	// specific Proton account populate it. The account-id-keyed
+	// AccountActive closure (and its "empty AccountID == malformed,
+	// fail closed" branch) was shaped for an account-scoped session
+	// that Reduit does not actually issue for the dashboard; wiring it
+	// directly would reject every legitimate user-scoped session as
+	// malformed. PrincipalActive takes the whole Identity so the
+	// composition root can implement the correct semantics: for a
+	// user-scoped session it enforces only that the bound user still
+	// exists (per-account suspend/soft-delete is enforced by the route
+	// handlers, not by a gate lockout -- suspend is owner-recoverable
+	// self-service); for an account-scoped session (AccountID set) the
+	// named account must not be suspended/soft-deleted, so a #52-style
+	// scoped session is rejected on the next request. See
+	// server.principalActiveChecker for the full rationale.
+	//
+	// Return contract mirrors AccountActive:
+	//   - (true, nil)  -> request proceeds.
+	//   - (false, nil) -> session destroyed, treated as unauthenticated
+	//     (302 to LoginPath for GETs, 401 otherwise).
+	//   - (false, err) -> fail closed with 503 Service Unavailable.
+	//
+	// May be nil. When nil, the gate falls back to AccountActive (or,
+	// if that is also nil, to the pre-C6 Subject-only behaviour).
+	//
+	// Governing: ADR-0004 (OIDC control-plane auth), ADR-0010 (sessions
+	// bind to users.id; AccountID optional), SPEC-0005 REQ "Admin
+	// Account Management" (suspend / soft-delete must immediately revoke
+	// access), SPEC-0005 REQ "Authentication Gating".
+	PrincipalActive func(ctx context.Context, id session.Identity) (bool, error)
+
 	// OnDestroy, when non-nil, is invoked synchronously just before
 	// every gate-initiated Destroy call (malformed-shape fail-closed,
 	// AccountActive returns false). Lets the composition root attach
@@ -216,7 +252,42 @@ func RequireSession(gate SessionGate, next http.Handler) http.Handler {
 			// account state on each gated request, a session issued
 			// before suspend remains usable until idle-timeout — that
 			// is the gap C6 closes.
-			if gate.AccountActive != nil {
+			if gate.PrincipalActive != nil {
+				// ADR-0010 user-scoped re-check. The plain dashboard
+				// session legitimately has an EMPTY AccountID (sessions
+				// bind to users.id, not to a Proton account), so we do
+				// NOT apply the AccountActive path's "empty AccountID ==
+				// malformed" fail-closed branch here -- that branch is
+				// specific to the account-scoped closure. PrincipalActive
+				// receives the whole Identity and decides admissibility
+				// from the bound user (and the account, when one is in
+				// scope).
+				//
+				// Governing: ADR-0004 (OIDC control-plane auth),
+				// ADR-0010 (sessions bind to users.id; AccountID
+				// optional), SPEC-0005 REQ "Admin Account Management"
+				// (suspend / soft-delete revokes access), SPEC-0005 REQ
+				// "Authentication Gating".
+				id := session.GetIdentity(r.Context(), gate.Manager)
+				ok, err := gate.PrincipalActive(r.Context(), id)
+				if err != nil {
+					// DB outage: fail closed (louder than a silent allow
+					// on a possibly-suspended principal).
+					http.Error(w, "auth-state check unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				if !ok {
+					// Principal no longer authorised. Destroy the session
+					// (best-effort) and force re-login, sharing the same
+					// response shape as a missing session.
+					if gate.OnDestroy != nil {
+						gate.OnDestroy(r.Context())
+					}
+					_ = gate.Manager.Destroy(r.Context())
+					denySessionMissing(w, r, loginPath)
+					return
+				}
+			} else if gate.AccountActive != nil {
 				id := session.GetIdentity(r.Context(), gate.Manager)
 				if id.AccountID == "" {
 					// Subject is set (we are past IsAuthenticated) but

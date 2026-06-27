@@ -234,6 +234,20 @@ func (s *Server) handleMCPTokenIssue(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Guard: only active accounts may mint a fresh per-account MCP bearer
+	// token. Issuing a credential for a suspended or soft-deleted account
+	// is incoherent — MCP requests carrying that token are gated by the
+	// account-state check (mcpserver.accountUsable, #47) and would be
+	// rejected anyway, so an owner of an inactive account must not be able
+	// to mint one. Mirrors the 409-Conflict rotation guard in
+	// handleAccountIMAPRotate (dashboard_actions.go).
+	//
+	// Governing: SPEC-0006 REQ "Token Issuance and Revocation"; SPEC-0005
+	// REQ "Per-User IMAP/SMTP Credentials" (state gates credential issuance).
+	if acct.State != account.StateActive {
+		http.Error(w, "account is not active", http.StatusConflict)
+		return
+	}
 
 	label := strings.TrimSpace(r.PostFormValue("label"))
 	if len(label) > 100 {
