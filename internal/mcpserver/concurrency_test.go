@@ -13,6 +13,7 @@ import (
 	"github.com/joestump/reduit/internal/account"
 	"github.com/joestump/reduit/internal/auth"
 	"github.com/joestump/reduit/internal/auth/mcptoken"
+	"github.com/joestump/reduit/internal/cryptenv"
 	"github.com/joestump/reduit/internal/mcpserver"
 	"github.com/joestump/reduit/internal/store"
 	"github.com/joestump/reduit/internal/storetest"
@@ -487,5 +488,8 @@ func (f *fakeAccountsAlwaysActive) SoftDeleteOldPending(context.Context, time.Du
 	panic("not implemented")
 }
 func (f *fakeAccountsAlwaysActive) MarkCrashed(context.Context, string) error {
+	panic("not implemented")
+}
+func (f *fakeAccountsAlwaysActive) RewrapEnvelopes(context.Context, cryptenv.MasterKey) (int, error) {
 	panic("not implemented")
 }

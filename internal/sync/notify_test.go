@@ -16,6 +16,7 @@ import (
 	gpa "github.com/ProtonMail/go-proton-api"
 
 	"github.com/joestump/reduit/internal/account"
+	"github.com/joestump/reduit/internal/cryptenv"
 	"github.com/joestump/reduit/internal/notify"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/pubsub"
@@ -684,6 +685,10 @@ func (f *failingTransition) MarkCrashed(context.Context, string) error {
 		close(f.marked)
 	}
 	return nil
+}
+
+func (f *failingTransition) RewrapEnvelopes(context.Context, cryptenv.MasterKey) (int, error) {
+	panic("not implemented")
 }
 
 // TestPermanentTransitionFailureMarksCrashed pins the fire-and-forget

@@ -218,6 +218,25 @@ type Service interface {
 	// SPEC-0005 REQ "Add-Proton-Account Wizard"; issue #82.
 	SoftDeleteOldPending(ctx context.Context, olderThan time.Duration) (int64, error)
 
+	// RewrapEnvelopes re-encrypts every account's key_envelope from the
+	// old master key to newMaster, atomically, for `master-key rotate`.
+	// Each account's per-account data key is unsealed with the service's
+	// CURRENT master key and re-sealed under newMaster; the data key and
+	// every secret ciphertext are unchanged — only the envelope wrapping
+	// is replaced. Returns the number of accounts re-wrapped.
+	//
+	// Refuses to proceed (ErrMasterKeyMismatch) if the current master key
+	// cannot unseal an existing envelope, so a wrong/stale key can never
+	// corrupt the column. The entire re-wrap runs in one DB transaction:
+	// it commits all-or-nothing, leaving every account readable under
+	// exactly one of the two keys at all times.
+	//
+	// The caller swaps the master-key FILE only after this returns
+	// successfully (see cli `master-key rotate`).
+	//
+	// Governing: ADR-0003 (envelope encryption); #50.
+	RewrapEnvelopes(ctx context.Context, newMaster cryptenv.MasterKey) (int, error)
+
 	// MarkCrashed sets the `crashed` flag on the account row. The sync
 	// supervisor calls this from the panic-recovery defer after a worker
 	// goroutine crashes so the admin UI can surface "needs manual reset"
@@ -340,6 +359,37 @@ func (s *service) Create(ctx context.Context, params CreateParams) (*Account, er
 		return nil, err
 	}
 	return row.toAccount(), nil
+}
+
+// RewrapEnvelopes implements Service.RewrapEnvelopes. It re-seals every
+// account's data-key envelope from s.master (the current/old key) to
+// newMaster inside a single transaction.
+//
+// Per-account flow: OpenEnvelope(old) -> data key -> SealEnvelope(new).
+// A failure to unseal an existing envelope with the old key is the
+// mismatched-key signal — we surface ErrMasterKeyMismatch and the
+// transaction rolls back untouched. Each unsealed data key is zeroed
+// immediately after re-sealing so it does not linger in memory.
+//
+// Governing: ADR-0003 (envelope encryption); #50.
+func (s *service) RewrapEnvelopes(ctx context.Context, newMaster cryptenv.MasterKey) (int, error) {
+	rewrap := func(id string, envelope []byte) ([]byte, error) {
+		dk, err := cryptenv.OpenEnvelope(s.master, envelope)
+		if err != nil {
+			// The old key cannot unseal this envelope: either the loaded
+			// key is wrong/stale, or the envelope was already rotated.
+			// Either way, refuse — a partial/uncertain rotation is worse
+			// than no rotation.
+			return nil, fmt.Errorf("%w: account %s: %v", ErrMasterKeyMismatch, id, err)
+		}
+		next, err := cryptenv.SealEnvelope(newMaster, dk)
+		zeroDataKey(&dk)
+		if err != nil {
+			return nil, fmt.Errorf("account: reseal envelope %s: %w", id, err)
+		}
+		return next, nil
+	}
+	return s.repo.rewrapEnvelopes(ctx, rewrap, s.now().UTC())
 }
 
 func (s *service) ListByUser(ctx context.Context, userID string) ([]*Account, error) {

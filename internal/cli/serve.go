@@ -22,6 +22,7 @@ import (
 	authsession "github.com/joestump/reduit/internal/auth/session"
 	"github.com/joestump/reduit/internal/config"
 	"github.com/joestump/reduit/internal/cryptenv"
+	"github.com/joestump/reduit/internal/filelock"
 	"github.com/joestump/reduit/internal/imapserver"
 	"github.com/joestump/reduit/internal/mcpserver"
 	"github.com/joestump/reduit/internal/notify"
@@ -68,6 +69,28 @@ func runServe(ctx context.Context, cfgPath *string, verbose *bool) error {
 		return fmt.Errorf("master key not found at %s; run `reduit master-key generate` first",
 			cfg.MasterKey.Path)
 	}
+
+	// Master-key advisory lock: the daemon holds the OLD master key in
+	// memory for its whole lifetime. `master-key rotate` swaps the key
+	// file out from under that in-memory key; if the two overlap, the
+	// daemon keeps sealing/unsealing under a key the rotation is mid-
+	// replacing, corrupting envelopes. serve acquires the SAME lock rotate
+	// does (MasterKeyLockPath) so the two are mutually exclusive: serve
+	// refuses to start while a rotation runs, and rotate refuses while the
+	// daemon runs. The lock is process-associated (flock), so a crashed
+	// daemon releases it automatically and never wedges a later rotation.
+	//
+	// Governing: ADR-0003 (envelope encryption); #50.
+	mkLock, err := filelock.Acquire(MasterKeyLockPath(cfg.MasterKey.Path))
+	if err != nil {
+		if errors.Is(err, filelock.ErrLocked) {
+			return fmt.Errorf("serve: master-key lock at %s is held; a `master-key rotate` (or another reduit instance) is running — wait for it to finish before starting the daemon: %w",
+				MasterKeyLockPath(cfg.MasterKey.Path), err)
+		}
+		return fmt.Errorf("serve: acquire master-key lock: %w", err)
+	}
+	defer func() { _ = mkLock.Release() }()
+
 	masterKey, err := cryptenv.LoadMasterKey(cfg.MasterKey.Path)
 	if err != nil {
 		return fmt.Errorf("load master key: %w", err)

@@ -533,6 +533,75 @@ func (r *repository) markCrashed(ctx context.Context, id string, now time.Time) 
 	return checkOneRow(res, "mark crashed")
 }
 
+// rewrapEnvelopes re-encrypts every account's key_envelope under a new
+// master key inside a single transaction. `rewrap` is invoked once per
+// account with its current envelope bytes; it MUST return the envelope
+// re-sealed under the new master key (or an error, which aborts and
+// rolls back the whole transaction). Returns the number of rows updated.
+//
+// All-or-nothing is the whole point: a partial rotation would leave some
+// accounts' envelopes under the old key and some under the new, and no
+// single master key could then unseal the whole set. The transaction
+// guarantees the accounts table flips to the new key atomically. The
+// caller (Service.RewrapEnvelopes) is responsible for swapping the
+// master-key FILE only after this transaction commits.
+//
+// Soft-deleted rows are included: their ciphertexts are preserved for
+// audit until the retention sweep hard-deletes them, so their envelopes
+// must track the master key too or that audit data becomes unreadable.
+//
+// Governing: ADR-0003 (envelope encryption); #50.
+func (r *repository) rewrapEnvelopes(ctx context.Context, rewrap func(id string, envelope []byte) ([]byte, error), now time.Time) (int, error) {
+	tx, err := r.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("account: begin rewrap tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if rbErr := tx.Rollback(); rbErr != nil && !errors.Is(rbErr, sql.ErrTxDone) {
+			slog.Default().LogAttrs(ctx, slog.LevelWarn,
+				"account: rewrap tx rollback failed",
+				slog.Any("err", rbErr),
+			)
+		}
+	}()
+
+	type idEnvelope struct {
+		ID          string `db:"id"`
+		KeyEnvelope []byte `db:"key_envelope"`
+	}
+	var rows []idEnvelope
+	if err := tx.SelectContext(ctx, &rows, `SELECT id, key_envelope FROM accounts ORDER BY id ASC`); err != nil {
+		return 0, fmt.Errorf("account: select envelopes: %w", err)
+	}
+
+	const updateQ = `UPDATE accounts SET key_envelope = ?, updated_at = ? WHERE id = ?`
+	n := 0
+	for _, row := range rows {
+		next, err := rewrap(row.ID, row.KeyEnvelope)
+		if err != nil {
+			return 0, err
+		}
+		res, err := tx.ExecContext(ctx, updateQ, next, now, row.ID)
+		if err != nil {
+			return 0, fmt.Errorf("account: update envelope %s: %w", row.ID, err)
+		}
+		if err := checkOneRow(res, "rewrap envelope"); err != nil {
+			return 0, err
+		}
+		n++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("account: commit rewrap: %w", err)
+	}
+	committed = true
+	return n, nil
+}
+
 func checkOneRow(res sql.Result, op string) error {
 	n, err := res.RowsAffected()
 	if err != nil {

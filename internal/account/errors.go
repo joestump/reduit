@@ -53,3 +53,13 @@ var ErrInvalidTransition = errors.New("account: invalid state transition")
 //
 // Governing: SPEC-0001 REQ "Account Identity".
 var ErrProtonIdentityMismatch = errors.New("account: proton identity mismatch")
+
+// ErrMasterKeyMismatch is returned by RewrapEnvelopes when the supplied
+// "old" master key fails to unseal an existing account's key_envelope.
+// It is the mismatched-key guard for `master-key rotate`: rotation
+// refuses to proceed (and rolls back) if the key it loaded from disk is
+// not the key the stored envelopes were actually sealed under, so a
+// stale or wrong key file can never corrupt the envelope column.
+//
+// Governing: ADR-0003 (service-master-key envelope encryption); #50.
+var ErrMasterKeyMismatch = errors.New("account: master key does not match stored envelopes")
