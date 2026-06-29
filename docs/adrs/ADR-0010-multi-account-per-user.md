@@ -1,8 +1,17 @@
 # ADR-0010: Multi-Proton-Account Per User
 
-- **Status:** accepted (2026-06-27)
+- **Status:** superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29)
 - **Date:** 2026-05-02
 - **Deciders:** Joe Stump
+
+> **Superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29).**
+> This ADR's *requirement* survives — one human MAY own several Proton mailboxes —
+> but its *mechanism* does not. There is no `users` table sourced from OIDC and no
+> OIDC `subject`: with a single-user local binary, the OS user is the identity and
+> a mailbox is just a local configuration row with its own keychain secret
+> (ADR-0013) and cache namespace (ADR-0006). "Multi-account per OIDC user" becomes
+> "multi-mailbox for the one local user." See SPEC-0001 (rewrite). Retained for
+> historical context.
 
 ## Context and Problem Statement
 

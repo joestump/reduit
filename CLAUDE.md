@@ -1,32 +1,37 @@
 # Reduit
 
-A sovereign, multi-user Proton Mail relay for self-hosters. Headless
-daemon serving standard SMTPS + IMAPS over the network so several
-Proton accounts can be used with any email client. Includes an
-integrated MCP server for Proton-specific operations.
+A sovereign, **single-user, local-first** tool for Proton Mail. A
+per-person Go CLI that authenticates to Proton, incrementally **caches**
+mail into a local SQLite store, embeds messages and attachments locally,
+and serves semantic/hybrid **search + RAG over a stdio MCP** (primary), a
+local send path, and an optional loopback browse UI. Nothing is
+network-exposed; secrets live in the OS keychain. The model is
+"msgbrowse for Proton Mail" (see `~/src/msgbrowse`).
+
+Reduit is **not** an IMAP/SMTP relay — for a standard mail client, run
+[Proton Bridge](https://proton.me/mail/bridge) alongside it.
 
 ## Status
 
-Pre-alpha. Architecture and specs are being written. No functional
-release yet.
+Pre-alpha, **mid-refactor**. As of 2026-06-29 the project pivoted from a
+multi-user OIDC relay to the single-user local-first design above; see
+[docs/design/refactor-to-local.md](docs/design/refactor-to-local.md) and
+ADR-0012. The ADRs and specs reflect the new design; the code is being
+brought in line. No functional release yet.
 
 ## Stack
 
 - **Language:** Go 1.25+
-- **Proton client:** [`github.com/ProtonMail/go-proton-api`](https://github.com/ProtonMail/go-proton-api)
-- **IMAP server:** [`github.com/emersion/go-imap`](https://github.com/emersion/go-imap) (v2)
-- **SMTP submission:** [`github.com/emersion/go-smtp`](https://github.com/emersion/go-smtp)
-- **HTTP control plane:** stdlib `net/http`
-- **OIDC:** [`github.com/zitadel/oidc`](https://github.com/zitadel/oidc) or [`github.com/coreos/go-oidc`](https://github.com/coreos/go-oidc)
-- **Sessions:** [`github.com/alexedwards/scs`](https://github.com/alexedwards/scs)
-- **Persistent store:** SQLite via `github.com/jmoiron/sqlx` + [`github.com/pressly/goose`](https://github.com/pressly/goose)
-- **Encryption-at-rest:** `golang.org/x/crypto/chacha20poly1305` or `filippo.io/age`
-- **MCP:** [`github.com/modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk)
+- **Proton client:** [`github.com/ProtonMail/go-proton-api`](https://github.com/ProtonMail/go-proton-api) — auth, decrypt-on-sync, and send (ADR-0001)
+- **Persistent store:** SQLite via `github.com/jmoiron/sqlx` + [`github.com/pressly/goose`](https://github.com/pressly/goose), pure-Go [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite) (FTS5 built in) (ADR-0006)
+- **Secrets:** OS keychain via a cross-platform wrapper (e.g. [`github.com/zalando/go-keyring`](https://github.com/zalando/go-keyring)) — macOS Keychain / libsecret / Windows CredMan (ADR-0013)
+- **Embeddings / vectors:** brute-force cosine over SQLite BLOBs by default; optional `sqlite-vec` (ADR-0015)
+- **LLM access:** one OpenAI-compatible client (sole egress), local default via LiteLLM → Ollama; two model roles (text/embedding + multimodal) (ADR-0018)
+- **MCP:** [`github.com/modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk) over **stdio** (ADR-0017)
 - **CLI:** Cobra + Viper
-- **Frontend:** HTMX + SSE + Tailwind CSS + DaisyUI + Hero Icons
-- **Logging:** `log/slog`
-- **TLS:** stdlib `crypto/tls`, certs read from disk, hot-reloaded via `fsnotify`
-- **Build:** Make + multi-stage Dockerfile
+- **Frontend:** HTMX + Tailwind CSS + DaisyUI + Hero Icons, loopback-only, no auth (ADR-0005); SSE only where a screen needs it
+- **Logging:** `log/slog` (stderr for the MCP server)
+- **Build:** Make + multi-stage Dockerfile (Docker optional; primary distribution is `go install`)
 
 ## Conventions
 
@@ -42,17 +47,19 @@ release yet.
 
 ## Out of scope
 
+- **The IMAP/SMTP relay** — Reduit no longer serves IMAPS/SMTPS. Run Proton Bridge alongside it for a standard mail client (ADR-0012).
+- **Multi-user / OIDC / a network control plane** — single local user, no auth, no IdP (ADR-0012).
 - Proton Drive
 - Proton Calendar (full surface — basic event read may come later)
 - Bridge-style GUI
-- ACME / autocert in-process (use certbot or Caddy in front; Reduit reads cert files from disk)
+- In-process TLS / ACME — there is no public listener; the optional UI binds to loopback (ADR-0005/0012).
 
 ## Deployment context
 
-- **Target host:** stumpcloud (Joe's self-hosted infrastructure). Specifically `ie01.dub.stump.rocks` or similar; no GPU, see relevant memory.
-- **TLS frontend:** Caddy or Traefik in front of Reduit; certbot handles ACME on whatever host. Reduit reads certs from a mounted volume.
-- **OIDC IdP:** Pocket ID. OIDC clients are provisioned via the `joestump.pocket_id` Ansible collection — never via the Pocket ID UI.
-- **Service DNS:** likely `reduit.ops01.stump.rocks` per the ops01 DNS convention.
+- **Runs locally, per person.** Reduit installs on each user's own machine (`go install`, or the optional Docker image), runs as the local OS user, and holds only that user's Proton mailboxes. There is no shared host, no central deployment, no OIDC IdP, and no public DNS/TLS to provision.
+- **Secrets:** the OS keychain on the machine Reduit runs on (ADR-0013). On a headless host, the operator unlocks the keyring out of band.
+- **LLM endpoint:** a local LiteLLM → Ollama by default, so nothing leaves the machine; pointing a model role at a hosted provider is a deliberate, documented opt-in (ADR-0018).
+- **Mail client:** Proton Bridge (run separately) covers IMAP/SMTP; Reduit covers search, RAG, MCP, and send.
 
 ## Visual Identity
 

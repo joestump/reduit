@@ -1,8 +1,14 @@
 # ADR-0011: HTTP mode for reverse-proxy-fronted deployments
 
-- **Status:** accepted
+- **Status:** superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29)
 - **Date:** 2026-05-04
 - **Deciders:** Joe Stump
+
+> **Superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29).**
+> There is no network listener to front. The admin/MCP HTTP listener is gone; the
+> MCP server is now stdio (ADR-0017) and the optional UI binds to loopback only.
+> The reverse-proxy / `tls.disabled` story no longer applies. Retained for
+> historical context.
 
 ## Context and Problem Statement
 

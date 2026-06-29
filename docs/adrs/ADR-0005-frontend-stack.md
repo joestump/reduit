@@ -1,8 +1,19 @@
 # ADR-0005: Frontend stack — HTMX, SSE, Tailwind 4, DaisyUI, Hero Icons
 
-- **Status:** accepted
+- **Status:** accepted (reframed 2026-06-29 by [ADR-0012](ADR-0012-single-user-local-first.md))
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
+
+> **Reframed 2026-06-29 by the local-first pivot ([ADR-0012](ADR-0012-single-user-local-first.md)).**
+> The stack stands — HTMX + Tailwind 4 + DaisyUI + Hero Icons, server-rendered, no
+> build step at runtime; it matches the sibling `msgbrowse` UI exactly. What
+> changed is the UI's *role and posture*: it is no longer an OIDC-gated admin
+> surface for a relay but an **optional, loopback-only, no-auth browse/search UI**
+> over the local cache, **secondary to the stdio MCP** (ADR-0017). The OIDC-login
+> and add-account-over-the-web flows in the Decision Outcome are gone; onboarding
+> is a local CLI flow (`reduit auth`). SSE is retained only if a screen needs live
+> updates (e.g. sync progress); it is no longer load-bearing. See the rewritten
+> Local UI spec (SPEC-0005).
 
 ## Context and Problem Statement
 

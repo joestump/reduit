@@ -2,237 +2,239 @@
 
 ## Architecture
 
-The MCP server is mounted on the same HTTPS listener as the admin UI,
-at `/mcp`. It uses HTTP+SSE Streamable HTTP transport (the canonical
-modern MCP transport) and authenticates via bearer tokens. Tool
-implementations are thin wrappers around shared services
-(account-scoped Proton client, message store, label store) that the
-sync worker and IMAP/SMTP backends also use.
+`reduit mcp` is a stdio MCP server built on the official
+`github.com/modelcontextprotocol/go-sdk`. The user's MCP client
+(Claude Desktop/Code) launches it as a subprocess using the
+`command`/`args` config it already understands; the two sides speak
+JSON-RPC over the subprocess's stdin/stdout. There is no network
+listener, no OIDC, no account record, and no auth middleware — the
+process inherits the authority of the single local OS user (ADR-0012).
+`log/slog` is wired to **stderr** so stdout carries only the protocol
+stream.
+
+Tools are typed: `AddTool[In, Out]` infers and validates each tool's
+JSON Schema from its Go structs. Every handler is a thin wrapper over
+the same `store` methods the loopback UI uses (ADR-0005), so the MCP
+surface and the UI cannot diverge. Only `send` writes; it reaches
+Proton through go-proton-api (ADR-0020). All other tools read the
+local SQLite cache (ADR-0006 / SPEC-0007).
 
 ```mermaid
 flowchart LR
-    Claude[Claude or other MCP client]
-    Caddy[Caddy / Traefik TLS]
-    Mux[HTTP Mux at /mcp]
-    Auth[Bearer Auth Middleware]
-    Tools[Tool Registry]
-    Pr[go-proton-api per account]
-    DB[(SQLite)]
+    Client[Claude Desktop/Code]
+    subgraph reduit mcp (subprocess)
+      RPC[stdio JSON-RPC<br/>go-sdk server]
+      Reg[Tool Registry<br/>AddTool In,Out]
+      Store[store methods]
+      LLM[internal/llm<br/>embed query]
+    end
+    DB[(SQLite cache)]
+    Proton[go-proton-api]
 
-    Claude -- HTTP+SSE --> Caddy --> Mux --> Auth
-    Auth -- valid --> Tools
-    Tools --> Pr
-    Tools --> DB
+    Client -- stdin/stdout --> RPC --> Reg --> Store
+    Store --> DB
+    Store -- send only --> Proton
+    Reg -- search: embed query --> LLM
+    Reg -. logs .-> Stderr[(stderr)]
 ```
 
-## Auth flow
+The same `store` layer backs the UI; the MCP registry adds no query
+logic of its own. A future `sqlite-vec` backend (ADR-0015) changes
+only `store` internals — the tools are unaffected.
+
+## Transport and lifecycle
+
+- **Launch.** `reduit mcp` (with `--data-dir`) is configured as the
+  client's `command`/`args`. One spawned process serves one client
+  session; concurrent multi-client access is a non-goal.
+- **No auth.** No bearer, no token table, no handshake. The local user
+  is the authority.
+- **stdout discipline.** The go-sdk server owns stdout. `slog` and any
+  panic/recover diagnostics go to stderr. A stray `fmt.Println` to
+  stdout would corrupt JSON-RPC, so the codebase forbids it outside
+  the protocol writer.
+- **Optional loopback HTTP.** A streamable-HTTP mode MAY be added for
+  clients that cannot spawn subprocesses; it is bound to loopback and
+  is not the default.
+
+## Citation contract
+
+Retrieval results are shaped by a shared `Citation` struct embedded in
+every result item. The server never returns a passage without it.
+
+```go
+type Citation struct {
+    MessageID    string    `json:"message_id"`
+    Hash         string    `json:"hash"`        // stable content hash
+    Mailbox      string    `json:"mailbox"`
+    Conversation string    `json:"conversation,omitempty"`
+    Sender       string    `json:"sender"`
+    Source       string    `json:"source"`      // body | attachment | fact | link
+    Timestamp    time.Time `json:"timestamp"`
+}
+```
+
+`hash` is the stable key used across the store (messages, embeddings
+`PK (hash, model)`, attachment extraction, contact facts) so a
+citation survives idempotent re-sync (ADR-0014) and resolves to a
+message a human can open in the UI. The mapping mirrors `msgbrowse`'s
+ADR-0004 contract.
+
+## Hybrid search and rank fusion
+
+`search_messages` calls `store.SearchMessages` (FTS5) and, when
+available, `store.SemanticSearch` (vector), then fuses the two ranked
+lists with reciprocal-rank fusion:
+
+```
+score(doc) = Σ_lists 1 / (60 + rank_in_list(doc))
+```
+
+RRF is chosen because bm25 and cosine scores are not comparable; rank
+fusion is scale-free and robust. The vector pass is **best-effort**:
+the query is embedded once via `internal/llm` (ADR-0018, local by
+default); if the endpoint is unreachable or no vectors exist, the tool
+returns keyword-only results rather than erroring. Filters (`mailbox`,
+`sender`, date range, `has_attachment`, `has_link`) narrow the
+candidate set before fusion, which also keeps the brute-force cosine
+pass (ADR-0015) over a pre-filtered set.
 
 ```mermaid
-sequenceDiagram
-    participant C as MCP Client
-    participant M as Reduit /mcp
-    participant Idp as OIDC IdP
-    participant DB as SQLite
-
-    alt OIDC bearer (JWT) + selector
-        C->>M: POST /accounts/{id}/mcp OR POST /mcp + X-Reduit-Account
-        M->>Idp: Verify JWT signature (cached JWKS)
-        M->>M: Resolve selector (path > header; header ignored if path present)
-        M->>DB: Resolve users.id from jwt.sub
-        M->>DB: Lookup account by id; verify account.user_id == users.id
-        Note right of M: On unowned OR non-existent account:<br/>byte-identical 403
-    else Per-account MCP token
-        C->>M: POST /mcp (Authorization: Bearer <opaque>)
-        M->>DB: SELECT mcp_tokens WHERE token_hash = sha256(opaque)
-        M->>DB: Lookup account by token's account_id
-    end
-    M-->>C: tool result (scoped to account)
+flowchart TD
+    Q[query + filters] --> KW[FTS5 keyword search]
+    Q --> EMB{endpoint &<br/>vectors?}
+    EMB -- yes --> VEC[vector search]
+    EMB -- no --> RET[keyword-only, cited]
+    KW --> RRF[reciprocal-rank fusion<br/>Σ 1/(60+rank)]
+    VEC --> RRF
+    RRF --> OUT[ranked, cited results]
 ```
-
-### Selector precedence and authz indistinguishability
-
-OIDC-bearer requests carry the account selector either as a path
-parameter (`/accounts/{id}/mcp` or any `/accounts/{id}/...` route
-that the MCP surface mounts) OR as the `X-Reduit-Account` header on
-the bare `/mcp` route. **Path wins.** When both are present the
-header is silently ignored — not parsed, not validated, not
-error-reported — so an attacker cannot use the header value to
-probe whether it matches the path id and learn ownership of a
-non-owned account.
-
-For authz failures on OIDC-bearer requests, three cases MUST
-produce byte-identical responses: "selector references non-existent
-account", "selector references existing account not owned by the
-JWT subject", and "JWT subject has no `users` row at all" (the MCP
-path does NOT silently upsert from a JWT — the SPEC-0005
-`/auth/callback` login-policy gate is the single seam that admits a
-new subject). UUIDv7 carries a creation timestamp; without this
-discipline, any holder of a valid OIDC ID token could iterate UUIDs
-and learn which exist on the deployment, or probe whether any user
-with a given OIDC subject has ever signed into Reduit. The 400
-("selector required") path is distinct because it carries no
-account identifier and so leaks nothing.
-
-Implementation: a single `accountFromOIDC(ctx, jwt) (*Account,
-error)` helper resolves the JWT subject to a `users.id` (returning
-`errForbidden` if no row exists), then resolves the selector and
-looks up the account, returning either the account or
-`errForbidden` for both "not found" and "not owned" cases. Callers
-that emit the response MUST treat `errForbidden` uniformly. Tests
-assert byte-equal responses across all three cases.
 
 ## Tool registry
 
-Tools are registered statically (compile-time) with the
-`modelcontextprotocol/go-sdk` server. Each tool:
+Tools are registered statically at startup. Each has a stable name, a
+typed input schema, and a handler
+`func(ctx, in In) (Out, error)` that calls one or more `store`
+methods. The registry wraps panics into MCP tool errors. `send` is the
+only handler with a write path.
 
-- Has a stable name (matching SPEC-0006).
-- Has a JSON schema for its input.
-- Has a Go handler with signature
-  `func(ctx context.Context, account *Account, in In) (Out, error)`.
-- Wraps panics into MCP tool errors via a registry-level middleware.
+| Tool | Input | Output | Citations |
+|---|---|---|---|
+| `search_messages` | `query`, `mailbox?`, `sender?`, `date_from?`, `date_to?`, `has_attachment?`, `has_link?`, `limit?` | ranked `results[]` (passage + `Citation`) | yes — per result |
+| `get_message` | `message_id` | message body + headers + `Citation` | yes |
+| `get_transcript` | `conversation`, `mailbox?` | ordered `messages[]` each with `Citation` | yes — per line |
+| `get_context` | `message_id`, `before?`, `after?` | surrounding `messages[]` with `Citation` | yes — per line |
+| `list_attachments` | `message_id` | `attachments[]` (id, name, mime, `Citation`) | yes |
+| `get_attachment_text` | `message_id`, `attachment_id` | extracted text + `(source_message_hash, attachment_id)` | yes (SPEC-0009) |
+| `list_links` | `message_id` | `links[]` (url, anchor, `Citation`) | yes |
+| `get_contact_facts` | `contact` | deduped `facts[]` each with `source_message_hash` | yes (SPEC-0011) |
+| `send` (mutating) | `from_mailbox`, `to[]`, `cc?`, `bcc?`, `subject`, `body`, `attachments?` | `{ message_id, mailbox, recipients[] }` | n/a (write) |
+
+All read tools accept an optional `mailbox`; omitting it spans every
+configured mailbox (ADR-0012).
 
 ### Sample handler shape
 
 ```go
-type ListMessagesIn struct {
-    Folder    string `json:"folder"`
-    Query     string `json:"query,omitempty"`
-    Page      int    `json:"page,omitempty"`
-    PageSize  int    `json:"page_size,omitempty"`
+type SearchIn struct {
+    Query         string  `json:"query"`
+    Mailbox       string  `json:"mailbox,omitempty"`
+    Sender        string  `json:"sender,omitempty"`
+    DateFrom      string  `json:"date_from,omitempty"`
+    DateTo        string  `json:"date_to,omitempty"`
+    HasAttachment *bool   `json:"has_attachment,omitempty"`
+    HasLink       *bool   `json:"has_link,omitempty"`
+    Limit         int     `json:"limit,omitempty"`
 }
 
-type ListMessagesOut struct {
-    Messages    []MessageMeta `json:"messages"`
-    Page        int           `json:"page"`
-    PageSize    int           `json:"page_size"`
-    TotalCount  *int          `json:"total_count,omitempty"`
-    HasMore     bool          `json:"has_more"`
+type SearchHit struct {
+    Passage  string   `json:"passage"`
+    Score    float64  `json:"score"`
+    Citation Citation `json:"citation"`
 }
 
-func ListMessages(ctx context.Context, acct *Account, in ListMessagesIn) (ListMessagesOut, error) { ... }
-```
-
-## Folder-name resolution
-
-Identical to the IMAP backend's mapping (SPEC-0003). The same code
-path that turns `INBOX` / `Labels/Receipts` into Proton system-folder
-flags or label IDs is shared between IMAP and MCP — there is one
-"FolderResolver" service.
-
-## Streaming for large payloads
-
-`get_message(format=raw)` and `download_attachment` return
-`mcp.Resource` results with content URIs that the MCP client can
-fetch incrementally. Each URI is a short-lived per-request handle
-backed by a streaming reader from `go-proton-api`'s
-download/decrypt pipeline.
-
-This avoids buffering full attachments in memory. The cap is enforced
-by an `io.LimitReader` on the underlying reader; exceeding the cap
-errors out cleanly.
-
-## Idempotent mutation pattern
-
-Each mutation tool reads current state first, computes the
-no-op-or-mutate decision locally, performs the Proton call only when
-needed:
-
-```go
-func AddLabel(ctx, acct, in) (Out, error) {
-    msg, err := store.GetMessage(ctx, acct.ID, in.MessageID)
-    if err != nil { return Out{}, err }
-    if msg.HasLabel(in.LabelID) {
-        return Out{Applied: false, AlreadyPresent: true}, nil
-    }
-    if err := proton.AddLabel(ctx, msg.ProtonID, in.LabelID); err != nil {
-        return Out{}, mapError(err)
-    }
-    // Sync worker will materialize the local-state change via event stream.
-    return Out{Applied: true, AlreadyPresent: false}, nil
+func SearchMessages(ctx context.Context, in SearchIn) (SearchOut, error) {
+    kw, err := store.SearchMessages(ctx, in.toFilter())   // FTS5, always works
+    if err != nil { return SearchOut{}, err }
+    vec, verr := store.SemanticSearch(ctx, in.Query, in.toFilter())
+    if verr != nil { return SearchOut{Hits: cite(kw)}, nil } // degrade
+    return SearchOut{Hits: rrf(kw, vec)}, nil                 // fuse
 }
 ```
 
-This pattern keeps Proton API calls minimal and tool semantics
-explicit.
+## The `send` tool (the only write)
+
+`send` is the sole mutating tool. It calls the shared internal send
+routine that the `reduit send` CLI verb also calls (ADR-0020), so CLI
+and MCP behavior cannot diverge. Required fields — `from_mailbox`,
+`to`, `subject`, `body` — are non-optional in the schema; a missing or
+empty required field is a validation error and no mail is submitted.
+Composition and OpenPGP/recipient-key handling are inherited from
+go-proton-api; the mailbox passphrase (keychain, ADR-0013) unlocks the
+signing keys. The sent message is reflected into the local cache so it
+is searchable like received mail, reconciled by ADR-0014's idempotent
+keying.
+
+`send` is structurally incapable of firing implicitly: no read/search
+handler holds a reference to it, and it is invoked only as its own
+explicit tool call. This is the design counterpart to ADR-0020's
+"explicit invocation only" guard.
+
+## Thin adapter / no drift
+
+There is exactly one `store` package. The UI handlers (ADR-0005) and
+the MCP handlers both call its methods — `SearchMessages`,
+`SemanticSearch`, `ConversationTranscript`, `GetContext`,
+`ListAttachments`, `GetAttachmentText`, `ListLinks`, `ContactFacts`,
+and the send routine. No tool issues its own SQL or its own Proton
+call outside these methods, so keyword/semantic/media behavior is
+identical on both surfaces.
 
 ## Error mapping
 
-Proton-side errors are mapped to MCP tool errors with a small set of
-symbolic codes:
+Tool errors are returned as MCP tool errors with a small symbolic set:
 
-| Proton error | MCP code | Retriable |
+| Condition | Code | Retriable |
 |---|---|---|
-| 401 (refresh token revoked) | `auth_required` | false |
-| 9001 (HV required) | `human_verification_required` | true (after HV) |
-| 429 / Retry-After | `rate_limited` | true |
-| 4xx (key lookup failure) | `recipient_key_unavailable` | false |
-| 4xx (other) | `bad_request` | false |
-| 5xx | `proton_unavailable` | true |
-| `not_found` (message ID across accounts) | `not_found` | false |
+| Unknown `message_id`/`conversation`/`contact` | `not_found` | false |
+| Missing required `send` field | `invalid_request` | false |
+| Embedding endpoint unreachable | (no error — degrades to keyword) | n/a |
+| go-proton-api send rejected (HV, key fetch, rate) | `send_failed` | per-cause |
+| go-proton-api transient (5xx, network) | `proton_unavailable` | true |
 
-The error response includes `code`, `message`, `retriable`,
-`details`, and matches MCP's recommended error format.
+Search never hard-fails on a missing LLM endpoint; it degrades. Only
+`send` surfaces Proton write errors.
 
-## Per-account concurrency cap
+## Testing
 
-A `chan struct{}` of capacity `MCP_PER_ACCOUNT_CONCURRENCY` per
-account gates tool invocations. Acquired before the handler runs;
-released on completion. Queue depth is a separate channel with
-capacity 16; overflow returns `503` with `Retry-After: 5`.
-
-## Token issuance
-
-```mermaid
-sequenceDiagram
-    participant U as User Browser
-    participant UI as Admin UI
-    participant DB as SQLite
-    U->>UI: POST /accounts/{id}/mcp-tokens (label="Claude on laptop")
-    UI->>UI: authz: account.user_id == session.user_id || session.is_admin
-    UI->>UI: generate 32 random bytes -> base32 -> token
-    UI->>UI: hash := SHA-256(token)
-    UI->>DB: INSERT mcp_tokens (account_id, hash, label, created_at)
-    UI-->>U: render token once in modal (copy to clipboard)
-```
-
-Issuance authority is "owner of the target account, OR an admin"
-(per SPEC-0006 Token Issuance and Revocation REQ). Same authority
-gate applies to revocation. Subsequent revocation deletes the row
-by ID. Token expiry is optional (column is nullable); a periodic
-sweep removes expired rows.
-
-Authz failures on issuance/revocation paths follow the same
-indistinguishability discipline as the auth-handshake layer — a
-non-admin user must not learn whether a given account UUID exists
-just because they probed `/accounts/{id}/mcp-tokens`.
-
-## Why HTTP+SSE only (no stdio)
-
-Per ADR-0008, Reduit's deployment model is "daemon on a host", not
-"subprocess of Claude Code on a laptop". HTTP+SSE matches that
-model: any MCP client (Claude.ai web, Claude Code with HTTP
-configuration, custom agents) can connect over the same TLS-fronted
-HTTP that the admin UI already serves. Stdio is deferred — adding
-later as a thin wrapper is straightforward if a use case appears.
+`NewInMemoryTransports` wires a client and the real server in-process.
+Round-trip tests call each tool exactly as a client would and assert
+the typed, cited result — including that every retrieval result item
+carries a complete `Citation`, that `search_messages` degrades to
+keyword-only when the embed call is stubbed to fail, and that `send`
+rejects calls missing required fields without touching Proton (a fake
+send routine asserts no submission occurs).
 
 ## Open questions
 
-- **Tool versioning**: when adding new tools, do we bump the MCP
-  protocol version, or just expose them additively? Additively is
-  the standard MCP pattern; protocol version bumps for breaking
-  changes only.
-- **Resources vs tools for message bodies**: large message bodies
-  could be exposed as MCP `resources` (URIs) instead of tool
-  outputs. v0.1 ships as tool outputs with size caps; resource
-  exposure is a v0.2 enhancement.
-- **Calendar/Drive in MCP**: explicitly out of scope; see ADR-0008.
+- **Resource exposure for large bodies/attachments.** Very large
+  message bodies or attachment text could be exposed as MCP
+  `resources` (URIs) rather than inline tool output. v0.1 returns them
+  inline; resource exposure is a later enhancement.
+- **Streamable-HTTP loopback mode.** Whether any real client needs the
+  optional loopback HTTP transport, or stdio suffices indefinitely.
 
 ## References
 
-- ADR-0008 (embedded MCP server)
-- ADR-0001 (go-proton-api)
-- SPEC-0001 (Account Model)
-- SPEC-0003 (IMAP — folder mapping shared)
-- [MCP spec](https://modelcontextprotocol.io/specification/)
+- ADR-0017 (stdio MCP + citation-faithful hybrid RAG)
+- ADR-0012 (single-user local pivot)
+- ADR-0005 (loopback UI / shared store)
+- ADR-0015 (embeddings and vector backend)
+- ADR-0016 (attachment extraction and indexing)
+- ADR-0018 (LLM access and single egress)
+- ADR-0019 (sender/contact facts extraction)
+- ADR-0020 (outbound send via go-proton-api)
+- SPEC-0007 (Local Cache Store), SPEC-0009 (Attachment Extraction),
+  SPEC-0010 (Outbound Send), SPEC-0011 (Contact Facts)
 - [`modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk)
+- `msgbrowse` ADR-0004 (mirrored citation/RRF contract)

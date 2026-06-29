@@ -1,8 +1,16 @@
 # ADR-0002: Multi-tenant from day one
 
-- **Status:** accepted
+- **Status:** superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29)
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
+
+> **Superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29).**
+> Reduit is no longer a shared, multi-tenant daemon. It is a single-user,
+> local-first, per-person binary; "multi-user on one host" is replaced by "one
+> binary per person." The real requirement this ADR served — several people, and
+> each person possibly several Proton mailboxes — is preserved as **multi-mailbox
+> for the one local user** (ADR-0012, SPEC-0001 rewrite), without the shared
+> daemon or central secret vault. Retained for historical context.
 
 ## Context and Problem Statement
 

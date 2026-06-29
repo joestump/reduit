@@ -1,8 +1,16 @@
 # ADR-0008: Embedded MCP server, not a separate process
 
-- **Status:** accepted
+- **Status:** superseded by [ADR-0017](ADR-0017-stdio-mcp-and-hybrid-rag.md) (2026-06-29)
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
+
+> **Superseded by [ADR-0017](ADR-0017-stdio-mcp-and-hybrid-rag.md) (2026-06-29).**
+> The decision to *embed* MCP in the one binary survives — but the transport and
+> auth do not. There is no HTTPS listener to mount `/mcp` on and no OIDC to issue
+> bearer tokens (ADR-0012). MCP is now a **stdio** server launched by the user's
+> own client, with no auth, using the official `modelcontextprotocol/go-sdk`. The
+> hybrid-RAG tool surface and citation contract move to ADR-0017 and the rewritten
+> MCP spec. Retained for historical context.
 
 ## Context and Problem Statement
 
