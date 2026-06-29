@@ -1,8 +1,16 @@
 # ADR-0001: Use go-proton-api as the Proton Mail client
 
-- **Status:** accepted
+- **Status:** accepted (reframed 2026-06-29 by [ADR-0012](ADR-0012-single-user-local-first.md))
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
+
+> **Reframed 2026-06-29 by the local-first pivot ([ADR-0012](ADR-0012-single-user-local-first.md)).**
+> The choice stands: `go-proton-api` remains the Proton client. What changed is
+> its job. It no longer backs a multi-user relay "on behalf of each configured
+> user"; in the single-user, local tool it serves **one local user's N mailboxes**
+> for: SRP/2FA/passphrase auth, OpenPGP **decrypt** during sync-into-cache
+> (ADR-0014), and outbound **send** (ADR-0020). The rationale below (keep Proton
+> API drift upstream, MIT license, Bridge-grade auth) is unchanged.
 
 ## Context and Problem Statement
 

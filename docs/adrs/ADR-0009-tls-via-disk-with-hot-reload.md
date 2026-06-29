@@ -1,9 +1,17 @@
 # ADR-0009: TLS via on-disk cert files with hot-reload
 
-- **Status:** accepted (amended by [ADR-0011](ADR-0011-http-mode-for-reverse-proxy-fronting.md), 2026-05-04 — adds an opt-in HTTP-only mode for the admin/MCP listener; mail listeners still follow this ADR; refined by PR #61 (#54), 2026-06-27 — shared TLS-config builder with a TLS 1.2 floor and an explicit cipher-suite allowlist)
+- **Status:** superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29)
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
 
+> **Superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29).**
+> Reduit has no network TLS listeners anymore. The HTTPS admin/MCP, IMAPS, and
+> SMTPS endpoints are all removed (no relay, stdio MCP, loopback-only UI), so the
+> on-disk cert loading, the `fsnotify` hot-reload, and the shared
+> `tlsloader.Config` builder (PR #61) no longer apply. TLS for the public URL,
+> when needed, belongs to Proton Bridge and to whatever proxy the operator
+> already runs. Retained for historical context.
+>
 > **Refined by PR #61 (issue #54), 2026-06-27.** The three TLS
 > listeners (HTTPS, IMAPS, SMTPS) no longer each hand-roll a
 > `*tls.Config`; they build it through a shared `tlsloader.Config(...)`

@@ -1,40 +1,47 @@
 # ADR-0006: SQLite as the persistent store
 
-- **Status:** accepted (refined by ADR-0010, 2026-05-03)
+- **Status:** accepted (rewritten 2026-06-29 for the local-first pivot, [ADR-0012](ADR-0012-single-user-local-first.md))
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
 
-> **Refined by [ADR-0010](ADR-0010-multi-account-per-user.md) (2026-05-03).**
-> The schema sketch in this ADR's Architecture Diagram predates the
-> users/accounts split. The `accounts` entity in the diagram below
-> shows `oidc_subject UK` and `bool is_admin` columns that the
-> rewritten migrations no longer carry; OIDC subject now lives on a
-> new `users` table and admin status is a session-bind-time computed
-> attribute, never persisted. The diagram in this ADR has been
-> updated in place to reflect the post-ADR-0010 shape; the
-> Decision Outcome (SQLite + WAL + goose, single file, app-layer
-> envelope encryption) is unchanged. See ADR-0010 and SPEC-0001 for
-> the canonical schema contract.
+> **Rewritten 2026-06-29 for the local-first pivot.** The *engine* decision —
+> SQLite + WAL + goose + `sqlx` on the pure-Go `modernc.org/sqlite` driver, one
+> file — is unchanged and was always right. What changed is everything the schema
+> held: there is no `users`/OIDC table, no relay UID/UIDVALIDITY state, no
+> envelope-encrypted secret columns (secrets are in the OS keychain, ADR-0013),
+> and no session/MCP-token tables. The store is now a **local RAG cache** of
+> decrypted mail plus its derived indexes — messages, attachments, links,
+> contacts, FTS5, embeddings, and contact facts — namespaced per mailbox. The
+> superseded ADR-0010 refinement (the `users` split) no longer applies. The
+> Considered Options / Pros-and-Cons below are unchanged; the Context, the
+> encryption/path bullets, and the Architecture Diagram are rewritten.
 
 ## Context and Problem Statement
 
-Reduit needs a persistent store for:
+Reduit needs a single local persistent store (one SQLite file in `data_dir`) for
+the per-person, multi-mailbox tool described in ADR-0012:
 
-- User records (OIDC subject) and account records (Proton user ID,
-  encrypted secrets, FK to users). *(ADR-0010 split — original
-  bullet read "Account records (OIDC subject, Proton user ID,
-  encrypted secrets)".)*
-- IMAP UID assignments and UIDVALIDITY values per (account, mailbox).
-- Local message cache metadata (Proton message ID ↔ IMAP UID, flags,
-  labels, sizes).
-- Sync cursors (Proton event ID per account).
-- Per-user IMAP/SMTP password records.
-- OIDC session state.
+- **Mailbox configs** — one row per configured Proton mailbox (local UUIDv7,
+  Proton user id, address, state). Secrets are **not** here; the row only
+  references the OS-keychain entries (ADR-0013).
+- **Cached messages** — decrypted body + headers, keyed by a stable content
+  identity (Proton message id + content hash) for idempotent re-sync (ADR-0014).
+- **Attachments and links** — structured records per message; attachment-derived
+  extracted text for RAG (ADR-0016).
+- **Contacts and identifiers** — the correspondent identity layer (one person
+  spanning several addresses) that contact facts hang off (ADR-0019).
+- **Embeddings** — per-message / per-chunk vectors, keyed by stable hash + model
+  (ADR-0015).
+- **Contact facts + fact cursors** — cited, deduped per-contact facts and their
+  incremental state (ADR-0019).
+- **Sync state** — per-mailbox Proton event cursor + per-run bookkeeping
+  (ADR-0014).
+- **FTS5** — an external-content full-text index kept in sync by triggers.
 
-The store is read and written constantly by the sync workers, IMAP
-backend, SMTP submission server, and admin UI. It does not need to
-scale to thousands of concurrent users — the target is a family /
-small team (≤50 accounts).
+The store is read and written by the CLI, the sync pipeline, the embed/facts
+passes, the stdio MCP server (ADR-0017), and the optional loopback UI (ADR-0005).
+Scale is one person's mail on one machine — large enough to index well, far from
+needing a server database.
 
 ## Decision Drivers
 
@@ -69,21 +76,25 @@ small team (≤50 accounts).
   `migrations/`. Same pattern Joe's `joe-links` uses.
 - **Access:** `jmoiron/sqlx` for typed scanning. (Not `ent` — overkill
   for the schema size.)
-- **Encryption at rest:** application-layer (per ADR-0003), not
-  SQLCipher. SQLite file itself is unencrypted; sensitive columns are
-  envelope-encrypted before insert.
-- **Path:** `/var/lib/reduit/reduit.db` (configurable). File mode 0600,
-  owner = service user.
+- **Vectors + FTS:** an `embeddings` table (BLOB vectors, brute-force cosine by
+  default; optional `sqlite-vec`, ADR-0015) and an FTS5 external-content index
+  with sync triggers.
+- **Encryption at rest:** **none at the app layer.** Secrets live in the OS
+  keychain (ADR-0013), not in the DB; the cached mail is plaintext and relies on
+  OS full-disk encryption (accepted, ADR-0012). No SQLCipher, no envelope columns.
+- **Path:** under `data_dir` (configurable; e.g. `./data/reduit.db`), owned by the
+  local user. `data_dir` is local state, not a system service directory.
 
 ### Consequences
 
 **Positive**
 
-- Single-file deployment. `docker-compose down && tar -cf backup.tar
-  reduit.db master.key` is a complete backup.
-- No separate database container, no DB credentials to manage.
-- WAL mode supports concurrent readers (sync workers, IMAP backend,
-  HTTP handlers all reading at once).
+- Single-file store. Backing up `data_dir` (the one `reduit.db`) is a complete
+  backup of derived state; the irreplaceable secrets live in the OS keychain, and
+  the source of truth is Proton itself.
+- No separate database service, no DB credentials to manage.
+- WAL mode supports concurrent readers (the sync pipeline, MCP server, and UI
+  reading at once).
 - `goose up` is the only migration step on upgrade.
 - `modernc.org/sqlite` keeps the binary statically linkable.
 
@@ -94,9 +105,11 @@ small team (≤50 accounts).
   deployments (hundreds of accounts) might hit write contention; if
   that ever happens, the migration to PostgreSQL is mechanical
   (sqlx is dialect-agnostic for our query shape).
-- No native row-level encryption; we do envelope encryption in app
-  code per ADR-0003.
-- VACUUM and integrity-checks must be scheduled (cron / systemd timer).
+- The cached mail is plaintext on disk; confidentiality of the cache rests on OS
+  full-disk encryption, not the app (accepted, ADR-0012). Secrets are never in the
+  DB (ADR-0013).
+- VACUUM and integrity-checks should be run periodically (a CLI maintenance verb
+  or a user-scheduled timer).
 
 **Neutral**
 
@@ -139,72 +152,94 @@ small team (≤50 accounts).
 
 ```mermaid
 erDiagram
-    users ||--o{ accounts : "owns"
-    accounts ||--|{ mailboxes : "owns"
-    accounts ||--|{ sync_state : "has"
-    accounts ||--o{ sessions : "has"
-    accounts ||--o{ mcp_tokens : "issues"
-    mailboxes ||--|{ messages : "contains"
-    mailboxes ||--|{ uid_assignments : "stable UIDs"
+    mailboxes ||--|{ messages : "caches"
+    mailboxes ||--|| sync_state : "has cursor"
+    messages ||--o{ attachments : "carries"
+    messages ||--o{ links : "carries"
+    contacts ||--o{ contact_identifiers : "spans addresses"
+    contacts ||--o{ contact_facts : "accrues"
+    messages }o--o{ contacts : "from/to"
 
-    users {
-        text id PK
-        text oidc_subject UK
-        text email
-        text display_name
-        timestamp created_at
-        timestamp last_login_at
-    }
-    accounts {
-        text id PK
-        text user_id FK
-        text proton_user_id
-        text email
-        text state
-        blob key_envelope
-        blob refresh_token_ct
-        blob mailbox_pass_ct
-        blob imap_password_ct
-        text imap_password_hash
-    }
     mailboxes {
         text id PK
-        text account_id FK
-        text name
-        int uidvalidity
-        int uidnext
+        text proton_user_id
+        text address
+        text state
+        timestamp added_at
+        timestamp last_sync_at
     }
     messages {
         text id PK
+        text hash UK
         text mailbox_id FK
         text proton_id
-        int uid
-        int flags
-        timestamp internal_date
+        timestamp ts
+        text sender
+        text subject
+        text body
+    }
+    attachments {
+        text id PK
+        text message_hash FK
+        text filename
+        text mime
+        text extracted_text
+    }
+    contacts {
+        text id PK
+        text display_name
+    }
+    contact_identifiers {
+        text contact_id FK
+        text address
+    }
+    embeddings {
+        text hash PK
+        text model PK
+        int dim
+        blob vec
+    }
+    contact_facts {
+        text contact_id FK
+        text fact
+        text category
+        text fact_hash
+        text source_message_hash
+    }
+    sync_state {
+        text mailbox_id PK
+        text event_cursor
+        timestamp last_run_at
     }
 ```
 
-One SQLite file. WAL mode for concurrent readers. `goose` drives
-migrations. The `users` table is the OIDC-sourced identity root
-(per ADR-0010); `accounts.user_id` is the FK that scopes the 1:N
-ownership relation. Every per-account table carries `account_id` so
-isolation is a `WHERE` clause away; per-user lookups go through
-`accounts.user_id` either directly or transitively. The
-`(user_id, proton_user_id)` UNIQUE on `accounts` enforces "a user
-MUST NOT add the same Proton account twice" (per SPEC-0001). Admin
-status is NOT a column — it is computed at session-bind time from
-`OIDC_ADMIN_SUBS` (per SPEC-0001 "Admin Status"). Sensitive columns
-are envelope-encrypted per ADR-0003 before insert.
+One SQLite file in `data_dir`. WAL mode for concurrent readers; `goose` drives
+migrations. **No `users` table** — the OS user is the identity (ADR-0012); a
+`mailbox` is just a local config row referencing OS-keychain secrets (ADR-0013).
+Cached rows carry `mailbox_id` so per-mailbox scoping is a `WHERE` clause away,
+and a global search simply omits it. Derived data — `embeddings` (ADR-0015),
+`contact_facts` (ADR-0019), attachment `extracted_text` (ADR-0016) — is keyed by
+**stable content hash, not message row id, with no FK to `messages`**, so
+idempotent re-sync (ADR-0014) never wipes or orphans it. `attachments` and
+`links` are keyed to their message by `message_hash` and **upserted** by their
+stable key (`(message_hash, attachment_id)` for attachments) — re-sync replaces
+message *content* in place rather than cascade-deleting, so the expensive
+attachment `extracted_text` survives a re-sync. `messages_fts` is an FTS5
+external-content table kept current by triggers. A `denylist` table —
+`(mailbox_id NULLABLE, kind ∈ {conversation, sender}, value, added_at)`, owned by
+SPEC-0001 and consulted before any LLM call (ADR-0018) — holds the per-thread
+privacy exclusions. No column is encrypted; secrets are in the keychain and the
+cache relies on OS full-disk encryption.
 
 ## References
 
-- ADR-0002 (multi-tenant) — every table carries `account_id`.
-- ADR-0003 (encryption-at-rest) — sensitive columns encrypted before
-  insert.
-- ADR-0010 (multi-Proton-account per user) — refines the schema in
-  this ADR: introduces the `users` table and the `accounts.user_id`
-  FK; drops `oidc_subject` and `is_admin` from `accounts`.
-- SPEC-0001 (Account model) — concrete schema.
+- ADR-0012 (single-user local-first) — no `users`; per-mailbox scoping; the cache is derived.
+- ADR-0013 (secrets in OS keychain) — no secret columns in the DB.
+- ADR-0014 (sync-and-cache) — stable-hash keying for idempotent re-sync.
+- ADR-0015 (embeddings) — `embeddings` table, brute-force default / optional sqlite-vec.
+- ADR-0016 (attachments) — attachment extracted-text for RAG.
+- ADR-0019 (contact facts) — `contacts`/`contact_facts`/`fact_state`.
+- SPEC-0001 (Mailbox model, rewrite) — concrete schema.
 - [`pressly/goose`](https://github.com/pressly/goose)
 - [`jmoiron/sqlx`](https://github.com/jmoiron/sqlx)
 - [`modernc.org/sqlite`](https://gitlab.com/cznic/sqlite)

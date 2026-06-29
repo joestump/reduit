@@ -1,9 +1,16 @@
 # ADR-0004: OIDC for control-plane authentication
 
-- **Status:** accepted (refined by ADR-0010, 2026-05-03)
+- **Status:** superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29)
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
 
+> **Superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29).**
+> Reduit no longer has a network control plane to authenticate. As a single-user
+> local binary the OS user *is* the identity — there is no OIDC Relying Party, no
+> IdP dependency (Pocket ID), no session store (SCS), and no admin allowlist. The
+> ADR-0010 refinement below is also moot (no `users` table sourced from OIDC).
+> Retained for historical context.
+>
 > **Refined by [ADR-0010](ADR-0010-multi-account-per-user.md) (2026-05-03).**
 > Two clauses in this ADR's Decision Outcome are no longer current:
 > (1) "every authenticated session maps 1:1 to a Reduit account record

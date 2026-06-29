@@ -1,8 +1,15 @@
 # ADR-0007: emersion/go-imap (v2) and emersion/go-smtp for protocol servers
 
-- **Status:** accepted
+- **Status:** superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29)
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
+
+> **Superseded by [ADR-0012](ADR-0012-single-user-local-first.md) (2026-06-29).**
+> Reduit no longer serves IMAPS/SMTPS — the relay is dropped in favor of running
+> Proton Bridge alongside Reduit. The `emersion/go-imap` and `emersion/go-smtp`
+> dependencies are removed. Outbound mail now goes through `go-proton-api`
+> directly (ADR-0020), not an SMTP submission server. Retained for historical
+> context.
 
 ## Context and Problem Statement
 

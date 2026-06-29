@@ -2,400 +2,263 @@
 
 ## Overview
 
-Reduit's embedded MCP server (per ADR-0008) exposes Proton-specific
-operations to AI agents. The surface goes beyond standard
-IMAP/SMTP — labels, system folders, encrypted send, Proton search —
-because those are the operations that motivate building a Proton
-relay rather than using a generic IMAP MCP.
+The MCP server is Reduit's **primary** surface (ADR-0017): it is how
+Claude and other agents search, read, and act on the user's Proton
+mail. It is a stdio MCP server built on the official
+`github.com/modelcontextprotocol/go-sdk`, launched as a subprocess by
+the user's own MCP client (`reduit mcp`). There is no network
+listener, no OIDC, no account record, and no auth handshake — the
+process runs with the authority of the single local OS user
+(ADR-0012). Logs go to stderr so they never corrupt the JSON-RPC
+stream on stdout.
 
-Transport: HTTP+SSE (Streamable HTTP per the MCP spec) on the same
-TLS-terminated listener as the admin UI, mounted at `/mcp`. TLS
-termination MAY happen in-process (per ADR-0009) or upstream of a
-fronting reverse proxy (per ADR-0011, `tls.disabled: true`); MCP
-clients see HTTPS regardless of which path the operator chose.
+The retrieval tools are **citation-faithful**: every result a tool
+returns carries exact provenance (`message_id`, stable `hash`,
+`mailbox`, `conversation`/`sender`, `source`, `timestamp`) so an agent
+cites precisely and a human can open the same message in the loopback
+UI (ADR-0005). `search_messages` is hybrid — FTS5 keyword search fused
+with best-effort vector search (ADR-0015) via reciprocal-rank fusion —
+and degrades to keyword-only when embeddings or the LLM endpoint are
+unavailable. Read tools surface transcripts, surrounding context,
+attachments and their extracted text (SPEC-0009), links, and cited
+contact facts (SPEC-0011). A single mutating tool, `send`, submits
+mail via go-proton-api (SPEC-0010/ADR-0020) and is the only tool that
+writes. Every tool is a thin adapter over the same `store` methods the
+UI uses, so behavior cannot drift between surfaces.
 
-Governing: ADR-0001 (go-proton-api), ADR-0008 (embedded MCP),
-ADR-0010 (multi-Proton-account per user), SPEC-0001 (Account Model),
-SPEC-0003 (IMAP Server) for label/folder mapping consistency.
+Governing: ADR-0017 (stdio MCP + hybrid RAG), ADR-0012 (single-user
+local pivot), ADR-0005 (loopback UI / shared store), ADR-0015
+(embeddings/vector backend), ADR-0016 (attachment extraction),
+ADR-0019 (contact facts), ADR-0020 (outbound send), SPEC-0002 (Sync &
+Local Cache), SPEC-0009 (Attachment Extraction), SPEC-0010 (Outbound
+Send), SPEC-0011 (Contact Facts).
 
 ## Requirements
 
-### Requirement: Bearer Authentication Required
-
-Every MCP tool invocation MUST be authenticated. Authentication MUST
-identify the calling Reduit account and scope all operations to that
-account. Because a single user MAY own multiple accounts per
-ADR-0010 / SPEC-0001, the bearer credential alone MUST be sufficient
-to disambiguate a single account; when it is not, an out-of-band
-account selector is required.
-
-#### Scenario: Per-account MCP token authenticates as the bound account
-
-- **WHEN** an MCP request carries `Authorization: Bearer <token>`
-  where the token is a Reduit-issued per-account MCP token
-- **THEN** the server SHALL look up the token by hash (SHA-256 of
-  the bearer value) in `mcp_tokens`, verify it's not revoked or
-  expired, and bind the request to the issuing account. Per-account
-  tokens are the canonical bearer credential for MCP
-
-#### Scenario: OIDC bearer token requires account selector
-
-- **WHEN** an MCP request carries `Authorization: Bearer <jwt>`
-  where the JWT is a valid OIDC ID token from the configured IdP
-- **THEN** the server SHALL validate the JWT (signature, issuer,
-  audience, expiry, nonce) and resolve `Principal.Subject` to a
-  `user_id` via the `users` table. The request MUST also carry an
-  account selector — either a path parameter (`/accounts/{id}/...`)
-  or the `X-Reduit-Account` header containing the account's UUID —
-  so the server can disambiguate which of the user's accounts to
-  bind. Selector resolution MUST follow the precedence rule
-  ("Selector precedence" REQ). The server SHALL verify the resolved
-  account satisfies `account.user_id == users.id` for the JWT
-  subject (per SPEC-0001) before binding the request. Failure
-  responses MUST follow the indistinguishability rule
-  ("Authorization-failure indistinguishability" REQ)
-
-#### Scenario: OIDC bearer subject with no `users` row is rejected
-
-- **WHEN** an MCP request carries a valid OIDC ID token whose
-  `Principal.Subject` does not resolve to any row in the `users`
-  table (the subject has never completed a web OIDC login, so the
-  callback-driven user-row upsert has never run)
-- **THEN** the server SHALL NOT silently upsert a `users` row from
-  the MCP path. The server SHALL respond `403 Forbidden` with body
-  `{"error":"forbidden"}` — byte-identical (status, headers, body)
-  to the not-existent and not-owned 403 responses defined under the
-  "Authorization-failure indistinguishability" REQ. This forecloses
-  an enumeration oracle for "has any user with this OIDC subject
-  ever logged into Reduit's web UI" and forces the SPEC-0005
-  login-policy gate (web `/auth/callback`) to be the single seam
-  that admits a new subject. Server-side log lines MAY record
-  "no users row for subject" for operator triage, but the wire
-  response MUST NOT distinguish this case from selector-references-
-  unknown-account or selector-references-not-owned-account
-
-#### Scenario: Unauthenticated MCP request is rejected
-
-- **WHEN** an MCP request arrives without a valid bearer token
-- **THEN** the server SHALL respond `401 Unauthorized` with a
-  generic body (e.g., `{"error":"unauthenticated"}`). The
-  `WWW-Authenticate` header MAY name `Bearer` as a scheme but MUST
-  NOT include a `realm` parameter that leaks deployment-internal
-  identifiers
-
-### Requirement: Selector Precedence
-
-When both a path-parameter account selector (`/accounts/{id}/...`)
-and an `X-Reduit-Account` header are present, the path parameter
-MUST win. The header MUST be ignored — not parsed, not validated,
-not error-reported — when a path parameter is also present. The
-header is consulted only on routes that do not carry an account-id
-path parameter (today: the bare `/mcp` endpoint accessed with an
-OIDC bearer).
-
-This rule eliminates a request-shape oracle (an attacker cannot
-probe whether the header value matches the path value to learn
-ownership of a non-owned account).
-
-#### Scenario: Path parameter wins over header
-
-- **WHEN** an MCP request carries both `/accounts/A/mcp` and
-  `X-Reduit-Account: B`
-- **THEN** the server SHALL bind the request to account `A`. The
-  `X-Reduit-Account` header SHALL NOT be parsed; the value of `B`
-  SHALL NOT influence routing, ownership checks, error responses,
-  log lines, or response headers. No "header conflicts with path"
-  warning SHALL be surfaced — the header is silently ignored
-
-#### Scenario: Header consulted only when path has no selector
-
-- **WHEN** an MCP request reaches a route without an account-id
-  path parameter (e.g., bare `/mcp`) AND carries
-  `X-Reduit-Account: A`
-- **THEN** the server SHALL parse the header and treat its value
-  as the account selector for ownership and binding purposes,
-  subject to the indistinguishability rule on failures
-
-#### Scenario: No selector at all
-
-- **WHEN** an OIDC-bearer MCP request arrives at a route without
-  an account-id path parameter and without an `X-Reduit-Account`
-  header
-- **THEN** the server SHALL respond `400 Bad Request` with body
-  `{"error":"selector_required"}`. This is the ONE response code
-  that distinguishes "selector missing" from "selector present but
-  not owned" — and it carries no account identifiers. See the
-  indistinguishability rule
-
-### Requirement: Authorization-Failure Indistinguishability
-
-When an OIDC-bearer MCP request supplies an account selector, the
-server MUST NOT leak which-account-exists-versus-which-is-owned via
-its failure response. "Selector present, account does not exist",
-"selector present, account exists but is not owned by the JWT
-subject", and "selector present, JWT subject has no `users` row at
-all" MUST all produce byte-identical responses (status, headers,
-body, timing characteristics). See the "OIDC bearer subject with no
-`users` row is rejected" scenario for the no-users-row case.
-
-The threat: UUIDv7 carries a creation timestamp. Without this
-discipline, any holder of a valid OIDC ID token (even a non-admin
-user with zero accounts, or a subject the IdP issues tokens to
-without that subject ever having completed a Reduit web login)
-could iterate UUIDs and learn which exist on the deployment, plus
-when each was created.
-
-This REQ is the auth-handshake-layer counterpart to the existing
-"Account Scope on All Operations" REQ, which already mandates
-identical-to-a-genuine-miss responses at the tool layer.
-
-#### Scenario: Non-existent, non-owned, and no-users-row selectors return identical responses
-
-- **WHEN** an OIDC-bearer request carries a selector referencing
-  account UUID `X` where (case A) no account row exists with
-  `id=X`, OR (case B) a row exists but `account.user_id != users.id`
-  for the JWT subject, OR (case C) no `users` row exists for the
-  JWT subject at all (per the "OIDC bearer subject with no `users`
-  row is rejected" scenario)
-- **THEN** in all three cases the server SHALL respond `403 Forbidden`
-  with body `{"error":"forbidden"}` — byte-identical between cases.
-  Headers SHALL be byte-identical: `Content-Type: application/json`,
-  no `WWW-Authenticate` realm leak, no `X-Reduit-*` diagnostic
-  headers. Server-side log lines MAY differ (operators need to
-  triage misconfigurations) but the wire response MUST NOT
-
-#### Scenario: Indistinguishability test exists
-
-- **WHEN** the test suite runs the MCP authz-failure tests
-- **THEN** there SHALL be at least one test that exercises all
-  three cases (A: non-existent UUID; B: existing UUID owned by a
-  different user; C: valid OIDC JWT whose subject has no `users`
-  row at all) with the same OIDC bearer (or, for case C, a
-  separately-issued bearer for an unseen subject) and asserts
-  byte-for-byte equality of the HTTP response (status code,
-  headers minus `Date`, body). Timing-side-channel testing is out
-  of scope for v0.1 but a coarse same-order-of-magnitude check is
-  RECOMMENDED
-
-#### Scenario: Selector-missing distinguishable from selector-present-failures
-
-- **WHEN** the selector is missing entirely (no path id, no
-  `X-Reduit-Account` header)
-- **THEN** the server SHALL respond `400 Bad Request` with body
-  `{"error":"selector_required"}`, distinguishable from the 403
-  used for both case A and case B above. This 400 carries no
-  account identifier and so leaks nothing about which UUIDs
-  exist
-
-### Requirement: Account Scope on All Operations
-
-Every tool's effects MUST be confined to the authenticated account.
-Cross-account access MUST be impossible via the MCP surface.
-
-#### Scenario: Message lookup filters by account_id
-
-- **WHEN** any tool resolves a message ID, attachment ID, or
-  conversation ID
-- **THEN** the SQL query SHALL include `WHERE account_id = ?` for
-  the authenticated account. A message ID belonging to another
-  account SHALL surface as a `not_found` tool error, identical to a
-  genuine miss
-
-### Requirement: Required Tool Set
-
-The MCP server MUST expose at minimum the following tools, each with
-a defined JSON schema:
-
-- `list_messages(folder, query?, page?, page_size?)`
-- `get_message(message_id, format?)`
-- `search_messages(query, page?, page_size?)`
-- `send_message(to, cc?, bcc?, subject, body, body_format, attachments?)`
-- `list_labels()`
-- `add_label(message_id, label_id)`
-- `remove_label(message_id, label_id)`
-- `move_to_folder(message_id, folder)`
-- `mark_read(message_ids)`
-- `mark_unread(message_ids)`
-- `download_attachment(message_id, attachment_id)`
-
-#### Scenario: Tool listing reflects the required set
-
-- **WHEN** an MCP client calls `tools/list`
-- **THEN** the response SHALL include at minimum the tools enumerated
-  above, each with name, description, and JSON schema for inputs
-
-#### Scenario: Each tool has a stable name and schema
-
-- **WHEN** a tool's name or input schema changes
-- **THEN** the change SHALL be a documented breaking change, bumped
-  in CHANGELOG. The MCP server's protocol version MAY be bumped to
-  signal incompatibility
-
-### Requirement: Idempotent Mutations
-
-Label add/remove and folder move tools MUST be idempotent: calling
-them when the target state already exists MUST succeed without an
-error.
-
-#### Scenario: Adding an already-applied label
-
-- **WHEN** `add_label` is called with `(message_id, label_id)` where
-  the message already carries the label
-- **THEN** the tool SHALL return `{ "applied": false, "already_present":
-  true }` with no error. No mutation SHALL be sent to Proton
-
-#### Scenario: Removing a non-applied label
-
-- **WHEN** `remove_label` is called for a label not present on the
-  message
-- **THEN** the tool SHALL return `{ "removed": false, "not_present":
-  true }` with no error
-
-#### Scenario: Moving to current folder
-
-- **WHEN** `move_to_folder` targets the folder the message is
-  already in
-- **THEN** the tool SHALL return `{ "moved": false, "already_in_folder":
-  true }` with no error
-
-### Requirement: Send-Message Encryption
-
-`send_message` MUST handle Proton-recipient encryption automatically
-per SPEC-0004's encryption pipeline. The caller MUST NOT need to
-specify encryption mode.
-
-#### Scenario: Recipient mix is handled per-recipient
-
-- **WHEN** `send_message` includes Proton and external recipients in
-  one envelope
-- **THEN** the server SHALL encrypt to each Proton recipient's key
-  individually and send plain (or per the user's external-encryption
-  preference) to external recipients. Each recipient's encryption
-  outcome SHALL be reported in the tool response
-
-#### Scenario: Send failure surfaces structured error
-
-- **WHEN** Proton rejects the send (HV required, rate limit, key
-  fetch failure for a recipient, etc.)
-- **THEN** the tool SHALL return a structured error:
-  `{ "code": "<symbolic>", "message": "<human>", "retriable":
-  <bool>, "details": { ... } }`
-
-### Requirement: Pagination on List and Search
-
-`list_messages` and `search_messages` MUST support pagination via
-`page` and `page_size` parameters, with a documented maximum
-`page_size`.
-
-#### Scenario: Default and max page_size
-
-- **WHEN** the caller omits `page_size`
-- **THEN** the server SHALL use `page_size = 50`. The maximum
-  permitted `page_size` SHALL be `200`; values above SHALL be clamped
-  to 200 and the response SHALL include `clamped: true` in metadata
-
-#### Scenario: Pagination metadata included
-
-- **WHEN** a list/search response is returned
-- **THEN** it SHALL include `page`, `page_size`, `total_count` (if
-  cheaply available; otherwise `total_count_known: false`), and
-  `has_more`
-
-### Requirement: Folder Names Match IMAP Mapping
-
-Folder names accepted by `move_to_folder` and returned by
-`get_message` MUST match the IMAP folder names defined in
-SPEC-0003's folder mapping (system folders `INBOX`, `Sent`, etc.;
-user labels under `Labels/<name>`).
-
-#### Scenario: Symbolic folder names are accepted
-
-- **WHEN** `move_to_folder` receives `INBOX` or `Labels/Receipts`
-- **THEN** the server SHALL resolve them to the corresponding
-  Proton system folder or user label, identical to the IMAP backend's
-  resolution
-
-#### Scenario: Unknown folder name yields a clear error
-
-- **WHEN** `move_to_folder` receives a folder name that doesn't
-  resolve
-- **THEN** the tool SHALL return `{ "code": "unknown_folder",
-  "message": "Folder X does not exist", "retriable": false }`
-
-### Requirement: Streaming Bodies and Attachments
-
-`get_message` and `download_attachment` MUST support streaming for
-large payloads to avoid buffering whole messages in process memory.
-
-#### Scenario: Large message body streamed
-
-- **WHEN** `get_message` is called with `format=raw` on a 50 MiB
-  message
-- **THEN** the response SHALL stream as MCP-protocol-defined content
-  chunks (or be returned as a content URL the client can range-fetch).
-  The server's memory usage SHALL NOT exceed a documented cap (default
-  16 MiB) regardless of message size
-
-#### Scenario: Attachment streaming
-
-- **WHEN** `download_attachment` is called for a 100 MiB attachment
-- **THEN** the response SHALL stream from Proton through Reduit to
-  the MCP client without full buffering. The decryption pipeline
-  SHALL operate on a streaming reader
-
-### Requirement: Per-Account Concurrency Limit
-
-The MCP server MUST cap concurrent tool invocations per account to
-avoid one user exhausting per-account Proton API quotas.
-
-#### Scenario: Per-account concurrency cap
-
-- **WHEN** a single account has the configured cap
-  (`MCP_PER_ACCOUNT_CONCURRENCY`, default 4) of concurrent tool
-  invocations in flight
-- **THEN** additional invocations from the same account SHALL queue
-  with a maximum queue depth of 16; queue overflow SHALL return
-  `503 Service Unavailable` with a `Retry-After` header
-
-### Requirement: Token Issuance and Revocation
-
-Per-account MCP tokens MUST be issuable from the admin UI and
-revocable. Tokens are scoped to exactly one account; a user who owns
-multiple accounts issues tokens separately for each. Issuance and
-revocation authority is "owner of the target account, OR an admin"
-— admins MAY operate on any account; non-admins MAY operate only
-on accounts where `account.user_id == session.user_id`.
-
-#### Scenario: Owner or admin issues a new MCP token
-
-- **WHEN** an authenticated user creates a token via the admin UI
-  scoped to an account `A` (e.g., `POST /accounts/A/mcp-tokens`)
-- **THEN** the server SHALL verify either `A.user_id ==
-  session.user_id` OR `session.is_admin == true`. On success it
-  SHALL generate a 32-byte random token, store its SHA-256 hash
-  with `account_id = A`, an optional label, and optional expiry.
-  The plaintext token SHALL be returned exactly once via the admin
-  UI. If neither authority condition holds, the server SHALL
-  respond `403 Forbidden` with the indistinguishability discipline
-  applied to the case where `A` does not exist (an attacker without
-  admin must not be able to learn whether a given UUID exists)
-
-#### Scenario: Owner or admin revokes a token
-
-- **WHEN** an authenticated user revokes a token via the admin UI
-  for account `A`
-- **THEN** the server SHALL apply the same authority check
-  (`A.user_id == session.user_id || session.is_admin`). On success
-  the token SHALL be marked revoked and subsequent MCP requests
-  carrying it SHALL fail with `401 Unauthorized` within 1 second.
-  Failure responses follow the indistinguishability discipline
+### Requirement: Stdio Transport, No Auth
+
+The MCP server MUST speak stdio JSON-RPC and be launched as a
+subprocess by the user's MCP client via `reduit mcp`. It MUST NOT open
+a network listener, require a bearer token, or perform any
+authentication: it runs with the authority of the local OS user. All
+diagnostic and log output MUST go to stderr so stdout carries only the
+JSON-RPC protocol stream. An optional loopback streamable-HTTP mode
+MAY exist for clients that need it, but stdio is the default.
+
+#### Scenario: Server launched over stdio
+
+- **WHEN** an MCP client spawns `reduit mcp` as a subprocess and
+  performs the MCP initialize handshake over stdin/stdout
+- **THEN** the server SHALL complete the handshake and serve tool
+  calls over the stdio JSON-RPC stream, having opened no network
+  socket
+
+#### Scenario: Logs never corrupt the protocol stream
+
+- **WHEN** the server emits a log line, warning, or error at any
+  point during a session
+- **THEN** it SHALL write that output to stderr only; stdout SHALL
+  carry exclusively well-formed JSON-RPC messages
+
+#### Scenario: No bearer token is required
+
+- **WHEN** a tool call arrives over the stdio transport with no
+  credential of any kind
+- **THEN** the server SHALL execute the tool with the local user's
+  authority; it SHALL NOT reject the call for missing authentication
+
+### Requirement: Citation Contract on Every Retrieval Result
+
+Every message/search retrieval result the server returns MUST carry
+its coordinates: `message_id`, the stable content `hash`, `mailbox`,
+`conversation`/`sender`, `source`, and `timestamp`. The server MUST
+NOT return a passage, transcript line, attachment snippet, or link
+without the coordinates needed to cite it and open it in the UI — such
+a result is either fully cited or omitted. Contact facts are cited
+differently: each fact MUST carry its `source_message_hash` (SPEC-0011)
+as its citation and is returned even when the source message is not
+cached, marked source-not-cached, with the full coordinates
+(`mailbox`, `message_id`, `timestamp`) added when the source is
+cached.
+
+#### Scenario: Search hit carries full provenance
+
+- **WHEN** any message/search retrieval tool (`search_messages`,
+  `get_message`, transcript, context, attachment text, links) returns
+  a result item
+- **THEN** the item SHALL include `message_id`, stable `hash`,
+  `mailbox`, `conversation`/`sender`, `source`, and `timestamp`
+  (contact facts cite by `source_message_hash`; see the contact-fact
+  scenario)
+
+#### Scenario: No coordinate-less message or search result is ever returned
+
+- **WHEN** a message or search retrieval result (`search_messages`,
+  `get_message`, transcript, context, attachment text, link) would
+  otherwise be returned without one or more of its required
+  coordinates
+- **THEN** the server SHALL treat that as a defect and SHALL NOT emit
+  the bare passage; a message/search retrieval result is either fully
+  cited or omitted
+
+#### Scenario: Contact facts cite by hash and are never omitted
+
+- **WHEN** a contact fact is returned whose source message is not
+  cached locally
+- **THEN** the server SHALL still return the fact carrying its
+  `source_message_hash` citation (SPEC-0011), marked
+  source-not-cached, rather than omitting it; coordinates (`mailbox`,
+  `message_id`, `timestamp`) SHALL be added when the source message is
+  cached
+
+### Requirement: Hybrid `search_messages`
+
+`search_messages` MUST run FTS5 keyword search and best-effort vector
+search (ADR-0015) and fuse the two ranked lists with hybrid
+reciprocal-rank fusion. The fusion algorithm is normatively defined in
+SPEC-0008 (Hybrid Search & Ranking); this tool MUST conform to it and
+MUST NOT re-define it. When embeddings or the LLM endpoint are
+unavailable, it MUST degrade to keyword-only rather than failing. It
+MUST support filters for mailbox, sender, date range, and the presence
+of attachments or links.
+
+#### Scenario: Keyword and vector results are rank-fused
+
+- **WHEN** `search_messages` runs with a reachable embedding endpoint
+  and existing vectors
+- **THEN** it SHALL compute an FTS5 keyword ranking and a vector
+  similarity ranking and SHALL fuse them per the SPEC-0008 ranking
+  algorithm, returning a single ranked, cited result list
+
+#### Scenario: Degrade to keyword-only when vectors are absent
+
+- **WHEN** the embedding endpoint is unreachable or no vectors exist
+  for the corpus
+- **THEN** `search_messages` SHALL return keyword-only results rather
+  than erroring; results SHALL still be fully cited
+
+#### Scenario: Filters narrow the candidate set
+
+- **WHEN** `search_messages` is called with any of `mailbox`,
+  `sender`, a date range, `has_attachment`, or `has_link`
+- **THEN** the server SHALL restrict both the keyword and vector
+  passes to candidates matching those filters before fusion
+
+### Requirement: Read Tools Over the Cache
+
+The server MUST expose read tools that retrieve a single message, a
+conversation transcript, and the surrounding context of a message;
+list a message's attachments and fetch an attachment's extracted text
+(SPEC-0009); list a message's links; and return a contact's cited
+facts (SPEC-0011). All read tools MUST source their data from the
+local cache via the same `store` methods the UI uses and MUST return
+cited results.
+
+#### Scenario: Get message and transcript
+
+- **WHEN** an agent calls the get-message or conversation-transcript
+  tool with a `message_id`/`conversation` reference
+- **THEN** the server SHALL return the message or the ordered
+  transcript from the cache, each line carrying the citation
+  coordinates
+
+#### Scenario: List attachments and fetch extracted text
+
+- **WHEN** an agent lists a message's attachments and then fetches an
+  attachment's extracted text
+- **THEN** the server SHALL return the attachment list and the cached
+  extracted text (SPEC-0009), with provenance back to the
+  `(message_hash, attachment_id)`
+
+#### Scenario: Get a contact's cited facts
+
+- **WHEN** an agent requests a contact's facts
+- **THEN** the server SHALL return the deduped, cited facts
+  (SPEC-0011), each carrying its `source_message_hash` so the source
+  can be opened
+
+### Requirement: The `send` Tool Is the Only Mutating Tool
+
+The server MUST expose exactly one mutating tool, `send`, which
+submits mail via go-proton-api (ADR-0020/SPEC-0010). Every other tool
+MUST be read-only over the cache. `send` MUST require explicit,
+unambiguous invocation with the fields from-mailbox, recipients,
+subject, and body, and MUST NOT fire as a silent or automatic side
+effect of any other operation.
+
+#### Scenario: Send requires explicit fields
+
+- **WHEN** the `send` tool is invoked missing any of from-mailbox,
+  recipients, subject, or body
+- **THEN** the server SHALL reject the call with a structured
+  validation error and SHALL NOT submit any mail
+
+#### Scenario: Send never fires implicitly
+
+- **WHEN** any read or search tool is invoked
+- **THEN** the server SHALL NOT, as a side effect, compose or submit
+  mail; submission happens only through an explicit `send` invocation
+
+#### Scenario: No other tool writes
+
+- **WHEN** any tool other than `send` is invoked
+- **THEN** that tool SHALL perform read-only operations over the
+  cache and SHALL make no write to Proton
+
+### Requirement: Multi-Mailbox Operation
+
+Tools MUST operate across all of the user's mailboxes by default and
+MUST accept a `mailbox` filter that scopes the operation to a single
+mailbox (ADR-0012).
+
+#### Scenario: Search spans all mailboxes by default
+
+- **WHEN** a retrieval tool is invoked without a `mailbox` filter
+- **THEN** the server SHALL search across every configured mailbox
+
+#### Scenario: Mailbox filter scopes to one mailbox
+
+- **WHEN** a retrieval tool is invoked with a `mailbox` filter
+- **THEN** the server SHALL restrict the operation to that mailbox
+  only
+
+### Requirement: Thin Adapter Over the Store
+
+Every tool MUST call the same `store` methods the loopback UI uses
+(ADR-0005) — search, transcript/context, list attachments/links,
+fetch attachment text, contact facts, send — so keyword, semantic, and
+media behavior cannot drift between the MCP surface and the UI. A tool
+MUST NOT implement its own query path that bypasses the store.
+
+#### Scenario: Tools and UI share store methods
+
+- **WHEN** a tool resolves a search, transcript, attachment-text, or
+  facts request
+- **THEN** it SHALL invoke the same `store` method the UI invokes for
+  that operation, with no parallel or divergent query path
+
+### Requirement: In-Memory Round-Trip Testability
+
+The tool surface MUST be exercisable via an in-memory client↔server
+transport (`NewInMemoryTransports`) so tests drive the real tools as a
+client sees them, with no spawned process or socket.
+
+#### Scenario: Round-trip test exercises a tool
+
+- **WHEN** the test suite connects a client to the server over an
+  in-memory transport and calls a tool
+- **THEN** the test SHALL receive the same typed, cited result a real
+  MCP client would receive over stdio
 
 ## Out of Scope
 
-- Folder/label CRUD (creating new labels via MCP) — deferred. Labels
-  are created via the user's email client or Proton web UI.
-- Calendar / Drive tool surface (deferred or out-of-project).
-- Aggregate / cross-account tools for admins (admins use the admin
-  UI; no special MCP access).
-- Webhook-style push from server to MCP client (MCP polling /
-  resources / prompts patterns are sufficient for v0.1).
+- HTTP+SSE transport with OIDC bearer auth and per-account/per-user
+  MCP tokens (ADR-0008 design; deleted by ADR-0017 — no listener, no
+  IdP, no account records).
+- Journal / "on this day" tools — deferred until journal generation
+  produces the entries those tools would read.
+- Any tool that bypasses the `store` to query Proton or the cache
+  directly.
+- Folder/label CRUD and other mutating mail operations beyond `send`.
+- Concurrent multi-client access to one server process (stdio is one
+  client session per spawned process; this is a personal tool).

@@ -1,8 +1,16 @@
 # ADR-0003: Service-master-key envelope encryption for at-rest secrets
 
-- **Status:** accepted
+- **Status:** superseded by [ADR-0013](ADR-0013-secrets-in-os-keychain.md) (2026-06-29)
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
+
+> **Superseded by [ADR-0013](ADR-0013-secrets-in-os-keychain.md) (2026-06-29).**
+> With the move to a single-user local binary (ADR-0012), there is no longer a
+> shared daemon holding many users' secrets, so the service-master-key envelope
+> is both unnecessary and a liability (a single on-disk key decrypting
+> everything). Secrets now live in the OS keychain, per mailbox; there is no
+> `master.key`, no envelope, and no `reduit master-key` command. Retained for
+> historical context.
 
 ## Context and Problem Statement
 
