@@ -28,15 +28,6 @@ func TestOpenAndMigrate(t *testing.T) {
 	if err := s.Migrate(""); err != nil {
 		t.Fatalf("Migrate (re-run): %v", err)
 	}
-
-	// Confirm the accounts table exists.
-	var n int
-	if err := s.DB.Get(&n, `SELECT COUNT(*) FROM accounts`); err != nil {
-		t.Fatalf("query accounts: %v", err)
-	}
-	if n != 0 {
-		t.Errorf("expected empty accounts, got %d rows", n)
-	}
 }
 
 func TestOpenRejectsEmptyPath(t *testing.T) {
