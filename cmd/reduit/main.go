@@ -1,4 +1,4 @@
-// Reduit — a sovereign, multi-user Proton Mail relay for self-hosters.
+// Reduit — a local-first Proton Mail CLI with semantic search and MCP.
 //
 // See https://github.com/joestump/reduit for documentation.
 package main

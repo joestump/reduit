@@ -66,7 +66,7 @@ import (
 // Governing: ADR-0006 (SQLite, single-host, HA out of scope).
 var migrateMu sync.Mutex
 
-//go:embed all:migrations/*.sql
+//go:embed all:migrations
 var embeddedMigrations embed.FS
 
 // Store wraps a *sqlx.DB plus knowledge of where it came from so we
@@ -233,6 +233,10 @@ func (s *Store) Migrate(dirOverride string) error {
 		dir = "migrations"
 	}
 	if err := goose.Up(s.DB.DB, dir); err != nil {
+		if errors.Is(err, goose.ErrNoMigrationFiles) {
+			// No migration files yet — valid for a freshly-stripped store.
+			return nil
+		}
 		return fmt.Errorf("store: goose up: %w", err)
 	}
 	return nil

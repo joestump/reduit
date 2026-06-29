@@ -27,8 +27,8 @@ const fileSuffix = "_FILE"
 //
 // The env mapping uses underscore-to-dot translation. Examples:
 //
-//	REDUIT_OIDC_CLIENT_SECRET -> oidc.client_secret
-//	REDUIT_STORE_PATH         -> store.path
+//	REDUIT_DATA_DIR           -> data_dir
+//	REDUIT_LLM_BASE_URL       -> llm.base_url
 //	REDUIT_LOGGER_LEVEL       -> logger.level
 //
 // Any env var ending in `_FILE` (e.g. REDUIT_OIDC_CLIENT_SECRET_FILE)
@@ -138,28 +138,13 @@ func resolveFileEnv(prefix string) error {
 // up the env var).
 func bindDefaults(v *viper.Viper, cfg Config) error {
 	defaults := map[string]any{
-		"server.http_addr":       cfg.Server.HTTPAddr,
-		"server.imap_addr":       cfg.Server.IMAPAddr,
-		"server.smtp_addr":       cfg.Server.SMTPAddr,
-		"server.metrics_addr":    cfg.Server.MetricsAddr,
-		"server.trusted_proxies": cfg.Server.TrustedProxies,
-		"tls.cert_path":          cfg.TLS.CertPath,
-		"tls.key_path":           cfg.TLS.KeyPath,
-		"tls.disabled":           cfg.TLS.Disabled,
-		"master_key.path":        cfg.MasterKey.Path,
-		"store.path":             cfg.Store.Path,
-		"store.migrations_dir":   cfg.Store.MigrationsDir,
-		"store.retention_period": cfg.Store.RetentionPeriod,
-		"store.sweep_interval":   cfg.Store.SweepInterval,
-		"oidc.issuer_url":        cfg.OIDC.IssuerURL,
-		"oidc.client_id":         cfg.OIDC.ClientID,
-		"oidc.client_secret":     cfg.OIDC.ClientSecret,
-		"oidc.redirect_url":      cfg.OIDC.RedirectURL,
-		"oidc.scopes":            cfg.OIDC.Scopes,
-		"oidc.admin_subjects":    cfg.OIDC.AdminSubjects,
-		"oidc.auto_create":       cfg.OIDC.AutoCreate,
-		"logger.level":           cfg.Logger.Level,
-		"logger.format":          cfg.Logger.Format,
+		"data_dir":             cfg.DataDir,
+		"llm.base_url":         cfg.LLM.BaseURL,
+		"llm.text_model":       cfg.LLM.TextModel,
+		"llm.multimodal_model": cfg.LLM.MultimodalModel,
+		"logger.level":         cfg.Logger.Level,
+		"logger.format":        cfg.Logger.Format,
+		"ui.listen_addr":       cfg.UI.ListenAddr,
 	}
 	for k, val := range defaults {
 		v.SetDefault(k, val)
