@@ -104,4 +104,3 @@ already provides.
   refactor decisions — rely on OS full-disk encryption). The keychain protects
   the *credentials*; FDE protects the *derived plaintext cache*. See ADR-0012 and
   SECURITY.md.
-</content>

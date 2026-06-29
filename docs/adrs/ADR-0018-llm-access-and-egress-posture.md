@@ -61,10 +61,15 @@ so heavy media handling can target a different endpoint than cheap text work.
     egress (raw image/audio bytes) and is documented as such.
 - **Keys via env.** `REDUIT_LLM_API_KEY` (and a separate key for the multimodal
   role if different), env or `_FILE` indirection only; never committed.
-- **Privacy denylist.** A per-conversation / per-sender denylist names threads
-  whose content is **never** sent to any model, for any feature (referenced by
-  ADR-0016/0019). The local default plus this denylist keep the user in control of
-  every byte that leaves.
+- **Privacy denylist.** A per-conversation / per-sender denylist names content
+  that is **never** sent to any model, for any feature (embed, attachment media,
+  facts). It is persisted in a `denylist` table — `(mailbox_id NULLABLE, kind,
+  value, added_at)`, `kind ∈ {conversation, sender}`, a NULL `mailbox_id` applying
+  to all mailboxes — and managed via `reduit denylist add|remove|list`. Its
+  storage and management surface are **defined by SPEC-0001** (mailbox model, the
+  owner of local config); the enforcing features (ADR-0015/0016/0019 and their
+  specs) consult it before any model call. The local default plus this denylist
+  keep the user in control of every byte that leaves.
 - **Graceful absence.** With no reachable endpoint, embedding/extraction features
   fail cleanly; browsing and keyword search keep working (ADR-0015/0017).
 
@@ -92,4 +97,3 @@ so heavy media handling can target a different endpoint than cheap text work.
   separately; supply keys via env.
 - Keep the default local route for a fully on-device deployment; any hosted route
   is a deliberate, documented change.
-</content>

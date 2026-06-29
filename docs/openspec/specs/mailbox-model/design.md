@@ -27,6 +27,7 @@ erDiagram
     mailboxes ||--|| sync_state : "has cursor"
     messages ||--o{ attachments : "carries"
     messages ||--o{ links : "carries"
+    mailboxes ||--o{ denylist : "scopes (NULL = all)"
     mailboxes }o..o{ keychain : "references (out of DB)"
 
     mailboxes {
@@ -50,6 +51,7 @@ erDiagram
     attachments {
         text id PK
         text message_hash FK
+        text attachment_id
         text filename
         text mime
         text extracted_text
@@ -58,6 +60,12 @@ erDiagram
         text mailbox_id PK
         text event_cursor
         timestamp last_run_at
+    }
+    denylist {
+        text mailbox_id FK "NULL = all mailboxes"
+        text kind "conversation | sender"
+        text value
+        timestamp added_at
     }
     keychain {
         text service "reduit"
@@ -74,6 +82,22 @@ FK to `mailboxes(id)`, so removing a mailbox tears down its derived
 state in one operation; the keychain deletion is an explicit second
 step the removal path performs (the keychain is outside the DB and not
 covered by the FK cascade).
+
+`attachments` are keyed by `message_hash` (the FK to `messages.hash`),
+never `source_message_hash`. Attachment rows and their `extracted_text`
+are upserted by `(message_hash, attachment_id)` so that an idempotent
+re-sync (ADR-0014) re-applies the same rows in place: re-sync MUST NOT
+cascade-wipe attachments or clear `extracted_text`. Extracted text
+survives across re-syncs and is only removed when the owning message is
+removed.
+
+The `denylist` table is local configuration owned by this spec
+(SPEC-0001 "Privacy Denylist"). A row scopes to one mailbox via
+`mailbox_id` or applies to all mailboxes when `mailbox_id` is NULL; its
+`kind` is `conversation` or `sender` (never `thread`). The denylist is
+enforced downstream by SPEC-0008 (embeddings/search), SPEC-0009
+(attachments), and SPEC-0011 (facts); the egress decision is ADR-0018.
+Reduit manages it through `reduit denylist add|remove|list`.
 
 The `keychain` node in the diagram is **not** a table — it represents
 the OS secret store. It is drawn only to make the reference boundary

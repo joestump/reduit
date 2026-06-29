@@ -153,6 +153,41 @@ partially executed.
 - **THEN** it SHALL NOT cause mail to be sent; sending SHALL occur only
   on an explicit `send` invocation, the sole mutating tool
 
+### Requirement: Explicit Confirmation Before Submit
+
+Because send is the one mutating capability, the system SHALL require an
+explicit go-ahead before any message is submitted to Proton — this is the
+confirmation contract that ADR-0020 and SPEC-0005 defer here. On the CLI,
+`reduit send` SHALL present a summary (from-mailbox, recipients, subject) and
+SHALL require interactive confirmation before submitting, unless a `--yes`
+(non-interactive) flag is passed. On the MCP surface, the `send` tool's explicit,
+all-required-fields invocation (see Agent-Safe MCP Send) IS the confirmation —
+the tool SHALL NOT add a second blocking prompt the agent cannot answer, and
+SHALL NOT submit on anything less than a complete, explicit call. Neither surface
+SHALL submit a message that the caller has not explicitly authorized.
+
+#### Scenario: CLI confirms before submitting
+
+- **WHEN** `reduit send` is invoked interactively without `--yes`
+- **THEN** the system SHALL display the from-mailbox, recipients, and subject
+  and SHALL submit only after the operator confirms; declining SHALL abort the
+  send with no message submitted
+
+#### Scenario: Non-interactive send requires an explicit opt-out of the prompt
+
+- **WHEN** `reduit send` is invoked in a non-interactive context (e.g. a script)
+  without `--yes`
+- **THEN** the system SHALL NOT submit; it SHALL exit with an error instructing
+  the caller to pass `--yes` to confirm explicitly
+
+#### Scenario: MCP send treats the explicit call as the confirmation
+
+- **WHEN** the MCP `send` tool is invoked with a complete, explicit set of
+  required fields
+- **THEN** that invocation SHALL stand as the authorization to submit; the tool
+  SHALL NOT block on an out-of-band prompt, and SHALL NOT submit on any
+  incomplete or implicit call
+
 ### Requirement: Local Reflection of Sent Mail
 
 A successful send SHALL become visible and searchable in the local

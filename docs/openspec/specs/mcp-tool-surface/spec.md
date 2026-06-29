@@ -29,8 +29,8 @@ UI uses, so behavior cannot drift between surfaces.
 Governing: ADR-0017 (stdio MCP + hybrid RAG), ADR-0012 (single-user
 local pivot), ADR-0005 (loopback UI / shared store), ADR-0015
 (embeddings/vector backend), ADR-0016 (attachment extraction),
-ADR-0019 (contact facts), ADR-0020 (outbound send), SPEC-0007 (Local
-Cache Store), SPEC-0009 (Attachment Extraction), SPEC-0010 (Outbound
+ADR-0019 (contact facts), ADR-0020 (outbound send), SPEC-0002 (Sync &
+Local Cache), SPEC-0009 (Attachment Extraction), SPEC-0010 (Outbound
 Send), SPEC-0011 (Contact Facts).
 
 ## Requirements
@@ -69,33 +69,55 @@ MAY exist for clients that need it, but stdio is the default.
 
 ### Requirement: Citation Contract on Every Retrieval Result
 
-Every retrieval result the server returns MUST carry its coordinates:
-`message_id`, the stable content `hash`, `mailbox`,
+Every message/search retrieval result the server returns MUST carry
+its coordinates: `message_id`, the stable content `hash`, `mailbox`,
 `conversation`/`sender`, `source`, and `timestamp`. The server MUST
-NOT return a passage, transcript line, attachment snippet, link, or
-contact fact without the coordinates needed to cite it and open it in
-the UI.
+NOT return a passage, transcript line, attachment snippet, or link
+without the coordinates needed to cite it and open it in the UI — such
+a result is either fully cited or omitted. Contact facts are cited
+differently: each fact MUST carry its `source_message_hash` (SPEC-0011)
+as its citation and is returned even when the source message is not
+cached, marked source-not-cached, with the full coordinates
+(`mailbox`, `message_id`, `timestamp`) added when the source is
+cached.
 
 #### Scenario: Search hit carries full provenance
 
-- **WHEN** any retrieval tool (`search_messages`, transcript,
-  context, attachment text, contact facts) returns a result item
+- **WHEN** any message/search retrieval tool (`search_messages`,
+  `get_message`, transcript, context, attachment text, links) returns
+  a result item
 - **THEN** the item SHALL include `message_id`, stable `hash`,
   `mailbox`, `conversation`/`sender`, `source`, and `timestamp`
+  (contact facts cite by `source_message_hash`; see the contact-fact
+  scenario)
 
-#### Scenario: No coordinate-less passage is ever returned
+#### Scenario: No coordinate-less message or search result is ever returned
 
-- **WHEN** a result would otherwise be returned without one or more
-  of its required coordinates
+- **WHEN** a message or search retrieval result (`search_messages`,
+  `get_message`, transcript, context, attachment text, link) would
+  otherwise be returned without one or more of its required
+  coordinates
 - **THEN** the server SHALL treat that as a defect and SHALL NOT emit
-  the bare passage; a result is either fully cited or omitted
+  the bare passage; a message/search retrieval result is either fully
+  cited or omitted
+
+#### Scenario: Contact facts cite by hash and are never omitted
+
+- **WHEN** a contact fact is returned whose source message is not
+  cached locally
+- **THEN** the server SHALL still return the fact carrying its
+  `source_message_hash` citation (SPEC-0011), marked
+  source-not-cached, rather than omitting it; coordinates (`mailbox`,
+  `message_id`, `timestamp`) SHALL be added when the source message is
+  cached
 
 ### Requirement: Hybrid `search_messages`
 
 `search_messages` MUST run FTS5 keyword search and best-effort vector
-search (ADR-0015) and fuse the two ranked lists with reciprocal-rank
-fusion (`score = Σ 1/(60 + rank)`), because bm25 and cosine scores are
-not directly comparable. When embeddings or the LLM endpoint are
+search (ADR-0015) and fuse the two ranked lists with hybrid
+reciprocal-rank fusion. The fusion algorithm is normatively defined in
+SPEC-0008 (Hybrid Search & Ranking); this tool MUST conform to it and
+MUST NOT re-define it. When embeddings or the LLM endpoint are
 unavailable, it MUST degrade to keyword-only rather than failing. It
 MUST support filters for mailbox, sender, date range, and the presence
 of attachments or links.
@@ -105,9 +127,8 @@ of attachments or links.
 - **WHEN** `search_messages` runs with a reachable embedding endpoint
   and existing vectors
 - **THEN** it SHALL compute an FTS5 keyword ranking and a vector
-  similarity ranking and SHALL fuse them with reciprocal-rank fusion
-  (`score = Σ 1/(60 + rank)`), returning a single ranked, cited result
-  list
+  similarity ranking and SHALL fuse them per the SPEC-0008 ranking
+  algorithm, returning a single ranked, cited result list
 
 #### Scenario: Degrade to keyword-only when vectors are absent
 
@@ -147,7 +168,7 @@ cited results.
   attachment's extracted text
 - **THEN** the server SHALL return the attachment list and the cached
   extracted text (SPEC-0009), with provenance back to the
-  `(source_message_hash, attachment_id)`
+  `(message_hash, attachment_id)`
 
 #### Scenario: Get a contact's cited facts
 

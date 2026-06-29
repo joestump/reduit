@@ -52,8 +52,11 @@ hands an agent a write path.
 - **Agent safety.** The MCP `send` tool is the **only** mutating tool. It is
   designed to require explicit, unambiguous invocation (clear required fields:
   from-mailbox, recipients, subject, body; no silent/auto-send), so an agent
-  cannot fire mail as a side effect. The exact confirmation UX is a spec detail
-  (Outbound Send spec) but the principle is fixed here.
+  cannot fire mail as a side effect. The exact confirmation UX is specified by
+  SPEC-0010's "Explicit Confirmation Before Submit" requirement (CLI confirms
+  before submit unless `--yes`; the MCP tool's explicit complete-fields call is
+  itself the authorization); the principle — never submit unauthorized — is fixed
+  here.
 - **Local record.** Sent messages are reflected in the local cache (via the next
   sync picking up the Sent folder, and/or an immediate local insert), so sends are
   visible and searchable like received mail.
@@ -85,4 +88,3 @@ hands an agent a write path.
 - `reduit send --from <mailbox> --to … --subject … [body/attachments]`.
 - The MCP `send` tool mirrors it with the same required fields and explicit
   invocation.
-</content>

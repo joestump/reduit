@@ -102,8 +102,9 @@ MUST NOT be rejected on the grounds that a mailbox already exists.
 
 The schema SHALL NOT contain a `users` table, an `oidc_subject` column,
 or an `is_admin` column on any table. The OS user is the identity;
-there is no session store, no OIDC, and no admin role. Any code path
-that reads such a column SHALL fail at compile or lint time.
+there is no session store, no OIDC, and no admin role. Because these
+columns SHALL NOT exist in the schema, there is no `oidc_subject` or
+`is_admin` value for any code path to read.
 
 #### Scenario: No users table exists
 
@@ -115,8 +116,8 @@ that reads such a column SHALL fail at compile or lint time.
 
 - **WHEN** any code path persists a `mailboxes` row
 - **THEN** the row SHALL NOT carry an `oidc_subject` or `is_admin`
-  column. Any code attempting to read `oidc_subject` or `is_admin` from
-  any table SHALL fail at compile or lint time
+  column, and no `oidc_subject` or `is_admin` column SHALL exist on any
+  table in the schema
 
 #### Scenario: The OS user is the identity
 
@@ -228,6 +229,54 @@ a mailbox in an undefined state.
 - **THEN** the system SHALL transition it to `removed` (or delete the
   row), cascade-delete its `mailbox_id`-scoped cache rows, and delete
   its keychain entries; no orphaned secret SHALL remain in the keychain
+
+### Requirement: Privacy Denylist
+
+This spec OWNS the privacy denylist as local configuration. The schema
+SHALL contain a `denylist` table with columns `mailbox_id` (NULLABLE),
+`kind`, `value`, and `added_at`, where `kind` SHALL be one of
+`conversation` or `sender` (the value `thread` SHALL NOT be used). A row
+with a NULL `mailbox_id` SHALL apply to all mailboxes; a non-NULL
+`mailbox_id` SHALL scope the entry to that one mailbox. The denylist
+SHALL be managed via the CLI `reduit denylist add|remove|list`.
+
+The denylist is ENFORCED by SPEC-0008 (embeddings/search), SPEC-0009
+(attachments), and SPEC-0011 (facts), which reference this requirement;
+the governing egress decision is ADR-0018. A denylisted conversation or
+sender SHALL be excluded from any operation those specs gate on the
+denylist.
+
+#### Scenario: Denylist a sender
+
+- **WHEN** the operator runs `reduit denylist add --kind sender
+  --value alice@example.com` (optionally scoped to a `--mailbox`)
+- **THEN** the system SHALL insert a `denylist` row with
+  `kind = sender`, the supplied `value`, the resolved `mailbox_id` (or
+  NULL when no mailbox is given), and an `added_at` timestamp
+
+#### Scenario: Denylist a conversation
+
+- **WHEN** the operator runs `reduit denylist add --kind conversation
+  --value <conversation-id>`
+- **THEN** the system SHALL insert a `denylist` row with
+  `kind = conversation` and the supplied `value`, and that conversation
+  SHALL be excluded by the specs that enforce the denylist (SPEC-0008,
+  SPEC-0009, SPEC-0011)
+
+#### Scenario: A global all-mailbox denylist entry
+
+- **WHEN** the operator runs `reduit denylist add` without a `--mailbox`
+  argument
+- **THEN** the system SHALL insert a `denylist` row with a NULL
+  `mailbox_id`, and the entry SHALL apply to all configured mailboxes
+
+#### Scenario: List and remove denylist entries
+
+- **WHEN** the operator runs `reduit denylist list` or `reduit denylist
+  remove`
+- **THEN** the system SHALL respectively enumerate the current
+  `denylist` rows or delete the matching row, and the change SHALL take
+  effect for subsequent enforcement by SPEC-0008/0009/0011
 
 ## Out of Scope
 

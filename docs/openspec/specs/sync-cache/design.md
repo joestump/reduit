@@ -40,7 +40,8 @@ sequenceDiagram
     loop per message / conversation
         S->>DB: BEGIN TX
         S->>DB: upsert messages (keyed by stable hash)
-        S->>DB: upsert attachments / links
+        S->>DB: upsert attachments / links (by message_hash)
+        S->>DB: upsert contacts / contact_identifiers
         S->>DB: UPDATE sync_state cursor + counts
         S->>DB: COMMIT TX
         Note over DB: triggers keep messages_fts current
@@ -107,6 +108,31 @@ erDiagram
         text model PK
     }
 ```
+
+## Contact materialization and link extraction
+
+Two derived surfaces are materialized **during** sync, inside the same
+per-message transaction as the message upsert, so they converge with the
+idempotent stable-hash model rather than living in a separate pass:
+
+- **Contacts.** Every distinct sender / recipient email address the
+  pipeline sees is upserted into `contact_identifiers`. An address with
+  no existing contact creates a fresh `contacts` row with a UUIDv7
+  identity; a known address reuses its contact. This is the contact layer
+  SPEC-0011 (contact facts) and the UI read from — sync owns the
+  *materialization* of identifiers and bare contact rows; SPEC-0011 owns
+  the *facts* over them and the manual `reduit contacts merge`. Re-sync
+  upserts and never cascade-wipes these rows.
+- **Links.** URLs in a decrypted body are parsed into the `links` table,
+  each row keyed to its message by the message's stable hash and upserted
+  so the link set survives re-sync without duplicating. SPEC-0006's
+  `list_links` tool and `has_link` filter only *read* this table; sync is
+  its sole producer. A body with no URLs simply yields no `links` rows
+  and never fails the message.
+
+Both follow the same rule as the other derived indexes: keyed off the
+stable hash, upserted, never orphaned or cascade-wiped by a re-import of
+their source message.
 
 ## Decryption in the pipeline
 

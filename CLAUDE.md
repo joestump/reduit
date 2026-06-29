@@ -114,7 +114,7 @@ Run `/design:prime [topic]` at the start of a session to load relevant ADRs and 
 When implementing code governed by ADRs or specs, leave comments referencing the governing artifacts:
 
 ```
-// Governing: ADR-0001 (chose JWT over sessions), SPEC-0003 REQ "Token Validation"
+// Governing: ADR-0013 (secrets in OS keychain), SPEC-0001 REQ "Mailbox Identity"
 ```
 
 These comments help future sessions (and `/design:check`) trace implementation back to decisions.

@@ -220,9 +220,16 @@ Cached rows carry `mailbox_id` so per-mailbox scoping is a `WHERE` clause away,
 and a global search simply omits it. Derived data — `embeddings` (ADR-0015),
 `contact_facts` (ADR-0019), attachment `extracted_text` (ADR-0016) — is keyed by
 **stable content hash, not message row id, with no FK to `messages`**, so
-idempotent re-sync (ADR-0014) never wipes or orphans it. `messages_fts` is an
-FTS5 external-content table kept current by triggers. No column is encrypted;
-secrets are in the keychain and the cache relies on OS full-disk encryption.
+idempotent re-sync (ADR-0014) never wipes or orphans it. `attachments` and
+`links` are keyed to their message by `message_hash` and **upserted** by their
+stable key (`(message_hash, attachment_id)` for attachments) — re-sync replaces
+message *content* in place rather than cascade-deleting, so the expensive
+attachment `extracted_text` survives a re-sync. `messages_fts` is an FTS5
+external-content table kept current by triggers. A `denylist` table —
+`(mailbox_id NULLABLE, kind ∈ {conversation, sender}, value, added_at)`, owned by
+SPEC-0001 and consulted before any LLM call (ADR-0018) — holds the per-thread
+privacy exclusions. No column is encrypted; secrets are in the keychain and the
+cache relies on OS full-disk encryption.
 
 ## References
 

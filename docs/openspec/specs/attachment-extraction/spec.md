@@ -15,17 +15,22 @@ Extraction is **tiered** (ADR-0016). **Tier 1 — text — is always-on
 and fully local**: embedded text is pulled from text-bearing documents
 (PDF, plain text, common office formats) by local Go libraries or a
 local extractor, with **no model call**, stored in
-`attachments.extracted_text`, chunked, embedded (SPEC-0008), and
-FTS-indexed. **Tier 2 — media — is opt-in and routes to the multimodal
+`attachments.extracted_text`, chunked, and FTS-indexed — all locally.
+Embedding (SPEC-0008) is the one Tier-1 step that calls a model, so it
+SHALL be skipped for any attachment whose conversation or sender is on
+the denylist (SPEC-0001, ADR-0018), exactly like message-body embedding;
+extraction and FTS indexing still run. **Tier 2 — media — is opt-in and routes to the multimodal
 model role (ADR-0018)**: OCR of images, vision captions/descriptions,
 and audio transcription are **off by default**; enabling them against a
 *hosted* multimodal model is the single heaviest and most sensitive
 egress Reduit has (raw image/audio bytes leaving the device) and MUST
-be documented as such. The privacy denylist (ADR-0018) excludes a
-conversation or sender from any tier-2 model call entirely.
+be documented as such. The privacy denylist (owned by SPEC-0001 as a
+`denylist` table; egress decision ADR-0018) excludes a conversation or
+sender from any model call — both the Tier-1 embed step and every Tier-2
+model call — entirely; this spec only enforces it.
 
 Extraction is cached by **stable attachment identity** with a
-`(source_message_hash, attachment_id)` provenance link, so re-sync
+`(message_hash, attachment_id)` provenance link, so re-sync
 (SPEC-0002) and re-embed (SPEC-0008) reuse the cache and nothing is
 re-extracted or re-sent unless the attachment or the relevant model
 changed. The archive is hostile input: a crafted or corrupt attachment
@@ -33,10 +38,11 @@ MUST fail safe — logged and skipped — and MUST NEVER crash the
 pipeline.
 
 Governing: ADR-0016 (attachment extraction & indexing), ADR-0018 (LLM
-access, two model roles, denylist, single egress), ADR-0006 (SQLite
-store; `extracted_text`, hash-keyed derived data), SPEC-0008
-(embeddings & hybrid search), SPEC-0006 (MCP tool surface, citations),
-SPEC-0002 (sync & cache).
+access, two model roles, egress decision), SPEC-0001 (owns the
+`denylist` table this spec enforces), ADR-0006 (SQLite store;
+`extracted_text`, hash-keyed derived data), SPEC-0008 (embeddings &
+hybrid search), SPEC-0006 (MCP tool surface, citations), SPEC-0002
+(sync & cache).
 
 ## Requirements
 
@@ -46,9 +52,14 @@ For every cached attachment whose type is text-bearing (PDF, plain
 text, common office formats), the system SHALL extract embedded text
 using local Go libraries or a local extractor, with **no model call and
 no network egress**. The result SHALL be stored in
-`attachments.extracted_text`, then chunked, embedded (SPEC-0008), and
-FTS-indexed (ADR-0006). Tier-1 extraction SHALL NOT be gated behind any
-opt-in flag.
+`attachments.extracted_text`, then chunked and FTS-indexed (ADR-0006) —
+all locally, for every text-bearing attachment, with no opt-in flag and
+no exception for the denylist. The chunks SHALL also be embedded
+(SPEC-0008); because embedding is a model call, the embed step SHALL be
+skipped for any attachment whose conversation or sender is on the
+denylist (SPEC-0001, ADR-0018), exactly like message-body embedding.
+Tier-1 extraction and FTS indexing SHALL NOT be gated behind any opt-in
+flag.
 
 #### Scenario: PDF text extracted locally with no model call
 
@@ -57,13 +68,21 @@ opt-in flag.
   in `attachments.extracted_text`, and make no outbound model or
   network call to do so
 
-#### Scenario: Extracted text is chunked, embedded, and FTS-indexed
+#### Scenario: Extracted text is chunked and FTS-indexed locally
 
 - **WHEN** Tier-1 extraction produces `extracted_text` for an
-  attachment
-- **THEN** the system SHALL chunk that text and hand the chunks to the
-  embedding pipeline (SPEC-0008) and the FTS5 index (ADR-0006) so the
-  attachment's content is reachable by hybrid search
+  attachment whose conversation/sender is not denylisted
+- **THEN** the system SHALL chunk that text, index it in the FTS5 index
+  (ADR-0006) locally, and hand the chunks to the embedding pipeline
+  (SPEC-0008) so the attachment's content is reachable by hybrid search
+
+#### Scenario: Embedding is skipped for a denylisted attachment
+
+- **WHEN** Tier-1 extraction produces `extracted_text` for an attachment
+  whose conversation or sender is on the denylist (SPEC-0001, ADR-0018)
+- **THEN** the system SHALL still extract and FTS-index that text
+  locally, but SHALL NOT send any chunk of it to the embedding model —
+  exactly as message-body embedding skips denylisted content
 
 #### Scenario: Office and plain-text documents extracted locally
 
@@ -125,10 +144,13 @@ as such in SECURITY.md.
 ### Requirement: Denylist Excludes Attachments From All Model Calls
 
 An attachment carried by a message whose conversation or sender is on
-the privacy denylist (ADR-0018) SHALL NEVER be sent to any model, for
-any Tier-2 feature, regardless of which opt-in flags are set. The
-denylist check SHALL be enforced before any multimodal call is
-prepared.
+the privacy denylist SHALL NEVER be sent to any model — neither the
+Tier-1 embed step nor any Tier-2 multimodal feature — regardless of
+which opt-in flags are set. The denylist is owned by SPEC-0001 (a
+`denylist` table) and the egress decision is ADR-0018; this spec only
+enforces it. The denylist check SHALL be enforced before any embedding
+or multimodal call is prepared. Local extraction and FTS indexing
+(Tier-1) are unaffected, since they make no model call.
 
 #### Scenario: Denylisted conversation's attachment is never sent
 
@@ -144,17 +166,18 @@ prepared.
 - **THEN** the denylist SHALL take precedence and the attachment SHALL
   be treated as if the feature were disabled for it
 
-#### Scenario: Tier-1 still runs for denylisted attachments
+#### Scenario: Tier-1 extraction and FTS still run for denylisted attachments
 
-- **WHEN** an attachment on a denylisted conversation is text-bearing
-- **THEN** local Tier-1 extraction MAY still run (it makes no model
-  call); only model-bound Tier-2 features are suppressed by the
-  denylist
+- **WHEN** an attachment on a denylisted conversation or sender is
+  text-bearing
+- **THEN** local Tier-1 extraction and FTS indexing SHALL still run
+  (they make no model call); only the model-bound steps — the Tier-1
+  embed step and every Tier-2 feature — are suppressed by the denylist
 
 ### Requirement: Caching and Provenance by Stable Attachment Identity
 
 Extracted text (Tier-1 and media-derived) SHALL be cached keyed by
-**stable attachment identity**, carrying a `(source_message_hash,
+**stable attachment identity**, carrying a `(message_hash,
 attachment_id)` provenance link back to the message that supplied it.
 Re-sync (SPEC-0002) and re-embed (SPEC-0008) SHALL reuse the cache.
 Nothing SHALL be re-extracted or re-sent to a model unless the
@@ -171,7 +194,7 @@ role) changed.
 #### Scenario: Provenance link is recorded
 
 - **WHEN** extracted text is cached for an attachment
-- **THEN** the record SHALL carry the `(source_message_hash,
+- **THEN** the record SHALL carry the `(message_hash,
   attachment_id)` link so consumers (SPEC-0006, SPEC-0008) can cite the
   exact source message and attachment
 
@@ -242,7 +265,7 @@ Attachment-derived text SHALL participate in hybrid search (SPEC-0008)
 and SHALL be retrievable through the MCP tool surface (SPEC-0006): an
 agent SHALL be able to list a message's attachments (`list_attachments`)
 and fetch an attachment's extracted text, with citations back to the
-`(source_message_hash, attachment_id)` provenance.
+`(message_hash, attachment_id)` provenance.
 
 #### Scenario: Attachment text is searchable
 
@@ -256,7 +279,7 @@ and fetch an attachment's extracted text, with citations back to the
 - **WHEN** an agent calls `list_attachments` for a message and then
   fetches an attachment's extracted text
 - **THEN** the server SHALL return the attachment list and the cached
-  extracted text, each carrying the `(source_message_hash,
+  extracted text, each carrying the `(message_hash,
   attachment_id)` citation (SPEC-0006)
 
 ### Requirement: Per-Feature Opt-In and Multimodal Role Config
@@ -293,6 +316,7 @@ extraction SHALL require no configuration to run.
 - **The embedding and search algorithms themselves** — chunking is
   invoked here, but vector indexing, hybrid ranking, and the search
   query path are owned by SPEC-0008.
-- **The single-egress LLM client and denylist mechanism** — defined by
-  ADR-0018 / the LLM-access spec; this spec consumes the multimodal
-  role and honors the denylist, it does not define them.
+- **The single-egress LLM client and denylist mechanism** — the egress
+  decision is ADR-0018 and the `denylist` table is owned by SPEC-0001;
+  this spec consumes the multimodal role and enforces the denylist, it
+  does not define them.

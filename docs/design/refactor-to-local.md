@@ -130,5 +130,3 @@ local RAG cache."
    → Outbound Send → MCP surface → Web UI → Contact Facts. Retire 0003/0004 specs.
 4. **Top-level docs** (CLAUDE.md, README, ARCHITECTURE, SECURITY, Makefile/deploy).
 5. **Code refactor** — separate pass, after the doc layer settles.
-</content>
-</invoke>

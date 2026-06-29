@@ -17,7 +17,7 @@ JSON Schema from its Go structs. Every handler is a thin wrapper over
 the same `store` methods the loopback UI uses (ADR-0005), so the MCP
 surface and the UI cannot diverge. Only `send` writes; it reaches
 Proton through go-proton-api (ADR-0020). All other tools read the
-local SQLite cache (ADR-0006 / SPEC-0007).
+local SQLite cache (ADR-0006 / SPEC-0002 (Sync & Local Cache)).
 
 ```mermaid
 flowchart LR
@@ -84,20 +84,18 @@ ADR-0004 contract.
 
 `search_messages` calls `store.SearchMessages` (FTS5) and, when
 available, `store.SemanticSearch` (vector), then fuses the two ranked
-lists with reciprocal-rank fusion:
-
-```
-score(doc) = Σ_lists 1 / (60 + rank_in_list(doc))
-```
-
-RRF is chosen because bm25 and cosine scores are not comparable; rank
-fusion is scale-free and robust. The vector pass is **best-effort**:
-the query is embedded once via `internal/llm` (ADR-0018, local by
-default); if the endpoint is unreachable or no vectors exist, the tool
-returns keyword-only results rather than erroring. Filters (`mailbox`,
-`sender`, date range, `has_attachment`, `has_link`) narrow the
-candidate set before fusion, which also keeps the brute-force cosine
-pass (ADR-0015) over a pre-filtered set.
+lists with hybrid reciprocal-rank fusion. The fusion algorithm is
+normatively defined in **SPEC-0008 (Hybrid Search & Ranking)** — this
+tool conforms to it and does not redefine it; the one-line summary is
+that the two rank lists are combined by reciprocal-rank fusion so
+non-comparable bm25 and cosine scores need not be reconciled. The
+vector pass is **best-effort**: the query is embedded once via
+`internal/llm` (ADR-0018, local by default); if the endpoint is
+unreachable or no vectors exist, the tool returns keyword-only results
+rather than erroring. Filters (`mailbox`, `sender`, date range,
+`has_attachment`, `has_link`) narrow the candidate set before fusion,
+which also keeps the brute-force cosine pass (ADR-0015) over a
+pre-filtered set.
 
 ```mermaid
 flowchart TD
@@ -105,7 +103,7 @@ flowchart TD
     Q --> EMB{endpoint &<br/>vectors?}
     EMB -- yes --> VEC[vector search]
     EMB -- no --> RET[keyword-only, cited]
-    KW --> RRF[reciprocal-rank fusion<br/>Σ 1/(60+rank)]
+    KW --> RRF[hybrid rank fusion<br/>SPEC-0008]
     VEC --> RRF
     RRF --> OUT[ranked, cited results]
 ```
@@ -125,7 +123,7 @@ only handler with a write path.
 | `get_transcript` | `conversation`, `mailbox?` | ordered `messages[]` each with `Citation` | yes — per line |
 | `get_context` | `message_id`, `before?`, `after?` | surrounding `messages[]` with `Citation` | yes — per line |
 | `list_attachments` | `message_id` | `attachments[]` (id, name, mime, `Citation`) | yes |
-| `get_attachment_text` | `message_id`, `attachment_id` | extracted text + `(source_message_hash, attachment_id)` | yes (SPEC-0009) |
+| `get_attachment_text` | `message_id`, `attachment_id` | extracted text + `(message_hash, attachment_id)` | yes (SPEC-0009) |
 | `list_links` | `message_id` | `links[]` (url, anchor, `Citation`) | yes |
 | `get_contact_facts` | `contact` | deduped `facts[]` each with `source_message_hash` | yes (SPEC-0011) |
 | `send` (mutating) | `from_mailbox`, `to[]`, `cc?`, `bcc?`, `subject`, `body`, `attachments?` | `{ message_id, mailbox, recipients[] }` | n/a (write) |
@@ -234,7 +232,8 @@ send routine asserts no submission occurs).
 - ADR-0018 (LLM access and single egress)
 - ADR-0019 (sender/contact facts extraction)
 - ADR-0020 (outbound send via go-proton-api)
-- SPEC-0007 (Local Cache Store), SPEC-0009 (Attachment Extraction),
-  SPEC-0010 (Outbound Send), SPEC-0011 (Contact Facts)
+- SPEC-0002 (Sync & Local Cache), SPEC-0008 (Hybrid Search & Ranking),
+  SPEC-0009 (Attachment Extraction), SPEC-0010 (Outbound Send),
+  SPEC-0011 (Contact Facts)
 - [`modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk)
 - `msgbrowse` ADR-0004 (mirrored citation/RRF contract)

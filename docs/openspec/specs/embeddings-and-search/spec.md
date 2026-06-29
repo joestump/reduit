@@ -25,8 +25,9 @@ lists with reciprocal-rank fusion (`score = Σ 1/(60 + rank)`) because
 bm25 and cosine scores are not comparable.
 
 Every byte that could leave the box obeys the single-egress boundary
-and per-thread denylist (ADR-0018); the local default sends nothing
-off-device. Extracted attachment text (SPEC-0009) participates in both
+(ADR-0018) and the per-conversation/sender denylist defined by SPEC-0001
+(the `denylist` table); this spec only enforces it. The local default
+sends nothing off-device. Extracted attachment text (SPEC-0009) participates in both
 the FTS index and the embedding set, carrying provenance back to its
 source attachment, so a hit on a PDF's body text cites the PDF.
 
@@ -176,7 +177,11 @@ results contract.
 result list using reciprocal-rank fusion, scoring each result by
 `Σ 1/(60 + rank)` across the lists it appears in, because bm25 and
 cosine scores are not directly comparable. The fused order SHALL be
-returned to MCP (ADR-0017) and UI callers identically.
+returned to MCP (ADR-0017) and UI callers identically. This spec
+(SPEC-0008) is the normative owner of the RRF ranking definition
+(the `Σ 1/(60 + rank)` formula and the constant `60`); SPEC-0006's
+`search_messages` tool references this requirement rather than
+redefining it, so the ranking is defined in exactly one place.
 
 #### Scenario: Keyword and vector lists are fused by RRF
 
@@ -252,15 +257,15 @@ the extraction.
 ### Requirement: Search Honors the Single-Egress Boundary
 
 Query embedding and content embedding SHALL pass only through the single
-LLM egress (ADR-0018) and SHALL respect the per-thread/per-sender
-denylist: content named on the denylist SHALL never be embedded or sent
-to any model. With the local default configured, search SHALL send
+LLM egress (ADR-0018) and SHALL respect the per-conversation/sender
+denylist defined by SPEC-0001 (the `denylist` table): content named on
+the denylist SHALL never be embedded or sent to any model. With the local default configured, search SHALL send
 nothing off-device.
 
 #### Scenario: Denylisted content is never embedded
 
 - **WHEN** `reduit embed` encounters a message or attachment whose
-  thread or sender is on the denylist (ADR-0018)
+  conversation or sender is on the denylist (SPEC-0001)
 - **THEN** the system SHALL skip it, SHALL NOT send its content to any
   model, and SHALL NOT write a vector for it
 

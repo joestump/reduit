@@ -80,4 +80,3 @@ keyed on email correspondents.
 
 - `reduit facts [--mailbox …] [--contact …]` — incremental; safe to re-run.
 - Excluded threads (denylist) never contribute facts.
-</content>

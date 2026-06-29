@@ -117,4 +117,3 @@ the architecture around it.
   Docker deployment. Docker becomes an optional convenience (ADR-0018 egress).
 - Existing multi-tenant migrations, OIDC config, and TLS/cert plumbing are removed
   in the code refactor that follows the doc layer.
-</content>

@@ -186,4 +186,3 @@ read-only over the cache.
 - `msgbrowse` ADR-0010 / SECURITY.md (loopback/CSP/escaping/path-traversal model)
 - SPEC-0010 (outbound send — compose hand-off)
 - SPEC-0011 (contact facts — cited facts on the contact view)
-</content>

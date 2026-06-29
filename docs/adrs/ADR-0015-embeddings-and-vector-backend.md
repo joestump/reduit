@@ -80,4 +80,3 @@ in `msgbrowse` (its ADR-0002).
 
 - `reduit embed [--mailbox …] [--model …]` computes missing vectors; safe to
   re-run. Needs a reachable embedding endpoint (ADR-0018), local by default.
-</content>

@@ -250,5 +250,3 @@ SSE MUST NOT be load-bearing for core browse/search.
   control; the UI ships no authentication to make that safe.
 - IMAP/SMTP relay credentials, MCP-token issuance, and per-account
   state management — all removed with the relay (ADR-0012).
-</content>
-</invoke>

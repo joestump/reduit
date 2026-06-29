@@ -98,4 +98,3 @@ the cheap text embedder (per the confirmed refactor decisions and ADR-0018).
   (ADR-0018), plus per-feature opt-in flags for OCR/vision/audio.
 - `reduit embed` (or a dedicated extract step) populates and reuses the extraction
   cache; safe to re-run.
-</content>

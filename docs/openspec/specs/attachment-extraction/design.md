@@ -7,21 +7,25 @@ landed a message and its attachment rows in the cache, and before (or
 as part of) the embed pass. It has exactly two tiers with sharply
 different trust and cost profiles:
 
-- **Tier 1 (text)** is local, always-on, and free of any model or
-  network call. It reads text-bearing payloads (PDF, plain text, common
-  office formats) with Go libraries / a local extractor and writes
-  `attachments.extracted_text`.
+- **Tier 1 (text)** extraction and FTS indexing are local, always-on,
+  and free of any model or network call. It reads text-bearing payloads
+  (PDF, plain text, common office formats) with Go libraries / a local
+  extractor and writes `attachments.extracted_text`. The one Tier-1 step
+  that *does* call a model is embedding (SPEC-0008); like message-body
+  embedding it is skipped for denylisted conversation/sender (SPEC-0001,
+  ADR-0018), while extraction and FTS indexing still run.
 - **Tier 2 (media)** is opt-in and is the *only* path that sends
   attachment bytes outward. OCR, vision captioning, and audio
   transcription each have a default-off flag and, when enabled, route
   through the **multimodal model role** (ADR-0018) — a different
   endpoint than the cheap text/embedding role.
 
-Both tiers converge on the same downstream: `extracted_text` is chunked
-and handed to SPEC-0008 for embedding and to the FTS5 index, and is
-later cited through MCP (SPEC-0006). The only egress in the whole
-design is the multimodal call in Tier 2; everything else stays on the
-box.
+Both tiers converge on the same downstream: `extracted_text` is chunked,
+indexed in FTS5 locally, handed to SPEC-0008 for embedding (a model
+call, skipped for denylisted conversation/sender), and later cited
+through MCP (SPEC-0006). Two steps reach a model — Tier-1 embedding and
+the Tier-2 multimodal call — and both honor the denylist (SPEC-0001,
+ADR-0018); everything else stays on the box.
 
 ```mermaid
 flowchart TD
@@ -37,22 +41,29 @@ flowchart TD
     X --> T2[Tier 2: multimodal role<br/>OCR / vision / transcribe]
     T1 --> CACHE[(attachments.extracted_text<br/>+ provenance link)]
     T2 --> CACHE
-    CACHE --> CHUNK[chunk] --> EMB[embeddings SPEC-0008]
+    CACHE --> CHUNK[chunk]
     CHUNK --> FTS[messages_fts ADR-0006]
+    CHUNK --> DL{conversation/sender<br/>denylisted? SPEC-0001}
+    DL -- yes --> NOEMB[skip embedding<br/>no model call]
+    DL -- no --> EMB[embeddings SPEC-0008]
     CACHE --> MCP[MCP list_attachments /<br/>fetch text SPEC-0006]
 ```
 
-The denylist gate sits **before** any multimodal call is prepared, so a
-denylisted attachment never has its bytes marshalled for egress. Tier 1
-is upstream of that gate because it makes no model call — local text
-extraction may still run for denylisted attachments.
+A denylist gate sits **before** any model call is prepared — both the
+Tier-2 multimodal call and the Tier-1 embed step — so a denylisted
+attachment never has its bytes marshalled for any model egress
+(SPEC-0001 owns the `denylist` table; ADR-0018 is the egress decision).
+Local Tier-1 extraction and FTS indexing are upstream of that gate
+because they make no model call, so they always run for denylisted
+conversation/sender; only the embed step and Tier-2 features are
+suppressed.
 
 ## Storage and provenance
 
 Extraction reuses the `attachments` row and its `extracted_text` column
 (ADR-0006). The cache key is **stable attachment identity**, not a
 message row id, and each cached extraction carries the
-`(source_message_hash, attachment_id)` provenance link. This is the
+`(message_hash, attachment_id)` provenance link. This is the
 same hash-keyed, FK-free pattern used by `embeddings` and
 `contact_facts` (ADR-0006 / SPEC-0001): idempotent re-sync (SPEC-0002)
 never orphans or re-derives extracted text, and the provenance link is
@@ -70,19 +81,24 @@ changed.**
 
 Tier 1 dispatches on attachment type to a local extractor (Go library
 per format, or a local extractor binary). It produces UTF-8 text into
-`extracted_text`, which is then chunked and embedded/FTS-indexed by the
-SPEC-0008 path. There is no flag to disable Tier 1 — local text is the
-core win of ADR-0016 and costs nothing in egress. Types with no
-extractable embedded text leave `extracted_text` empty and fall through
-to the Tier-2 decision (only relevant if a media feature is enabled).
+`extracted_text`, which is then chunked and FTS-indexed locally and
+handed to the SPEC-0008 embedding path. Extraction and FTS indexing have
+no flag to disable them and run for every text-bearing attachment —
+local text is the core win of ADR-0016 and costs nothing in egress. The
+embed step is the lone Tier-1 model call, so it is skipped for any
+attachment whose conversation or sender is denylisted (SPEC-0001,
+ADR-0018), exactly as message-body embedding behaves; the local text and
+FTS row remain. Types with no extractable embedded text leave
+`extracted_text` empty and fall through to the Tier-2 decision (only
+relevant if a media feature is enabled).
 
 ## Tier 2 — opt-in media via the multimodal role
 
 Each of OCR, vision, and audio is an independent default-off flag.
 When a flag is on and an attachment qualifies, the pipeline:
 
-1. Checks the **denylist** (ADR-0018); a denylisted conversation/sender
-   short-circuits to skip.
+1. Checks the **denylist** (owned by SPEC-0001; egress decision
+   ADR-0018); a denylisted conversation/sender short-circuits to skip.
 2. Runs any required **external conversion** (e.g. HEIC→JPEG) by
    shelling out to a converter on `PATH`.
 3. Calls the **multimodal model role** (`Vision` / `Transcribe`,
@@ -138,19 +154,23 @@ endpoint — or keep everything local. Keys come from the environment
 
 ## Downstream integration
 
-- **Search (SPEC-0008):** chunked `extracted_text` is embedded and
-  FTS-indexed, so attachment content surfaces in hybrid search hits
-  alongside message bodies.
+- **Search (SPEC-0008):** chunked `extracted_text` is FTS-indexed
+  locally for every attachment and embedded (unless its
+  conversation/sender is denylisted, in which case the embed step is
+  skipped per SPEC-0001 / ADR-0018), so attachment content surfaces in
+  hybrid search hits alongside message bodies.
 - **MCP (SPEC-0006):** `list_attachments` and the fetch-attachment-text
-  tool return the cached text with `(source_message_hash,
+  tool return the cached text with `(message_hash,
   attachment_id)` citations; the citation contract (SPEC-0006) is
   satisfied directly by the provenance link stored here.
 
 ## Edge cases
 
-- **Denylisted but text-bearing.** Tier 1 still runs (no model call);
-  only model-bound Tier-2 features are suppressed. The denylist gate is
-  specifically the egress boundary, not a blanket index exclusion.
+- **Denylisted but text-bearing.** Tier-1 extraction and FTS indexing
+  still run (no model call); the model-bound steps — the Tier-1 embed
+  step and every Tier-2 feature — are suppressed. The denylist gate is
+  specifically the egress boundary, not a blanket index exclusion: the
+  text stays searchable by keyword (FTS) but is not embedded.
 - **Tier-2 enabled, no converter for the format.** The attachment's
   Tier-2 step is skipped with a single log line; its Tier-1 text (if
   any) is unaffected.
@@ -162,7 +182,7 @@ endpoint — or keep everything local. Keys come from the environment
   already-processed-under-the-same-model attachments are not re-sent.
 - **Same attachment on multiple messages.** Because the cache is keyed
   by stable attachment identity, identical content is extracted once;
-  each carrying message gets its own `(source_message_hash,
+  each carrying message gets its own `(message_hash,
   attachment_id)` provenance link to the shared extraction.
 
 ## References
@@ -171,8 +191,10 @@ endpoint — or keep everything local. Keys come from the environment
   always-on/local, Tier-2 opt-in/multimodal, caching + provenance,
   external converters.
 - ADR-0018 (LLM access & egress posture) — two model roles, multimodal
-  role, single egress, per-conversation/sender denylist, env keys,
-  graceful absence.
+  role, single egress, the conversation/sender denylist egress decision,
+  env keys, graceful absence.
+- SPEC-0001 (mailbox cache) — owns the `denylist` table this spec
+  enforces for both the Tier-1 embed step and Tier-2 model calls.
 - ADR-0006 (SQLite store) — `attachments.extracted_text`; hash-keyed,
   FK-free derived data; FTS5 external-content index.
 - msgbrowse ADR-0014 (external image converter) — the converter-on-PATH

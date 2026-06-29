@@ -89,4 +89,3 @@ logic is the most valuable thing to carry forward; only its *sink* changes, from
 - `reduit sync [--mailbox …] [--full]` — incremental by default; `--full` forces a
   rescan. Schedule it via cron/timer.
 - Sync writes only to the cache DB; it never writes to Proton (that is ADR-0020).
-</content>

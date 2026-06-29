@@ -93,4 +93,3 @@ ADR-0004.
 - Configure the client with `command: reduit`, `args: ["--data-dir", "…", "mcp"]`.
 - The official SDK floors the Go toolchain at a recent version (documented in the
   README build prerequisites), consistent with `msgbrowse`.
-</content>

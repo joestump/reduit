@@ -116,6 +116,67 @@ never orphans or wipes it.
   attachment extracted text keyed by that hash intact — re-sync SHALL
   NOT delete or orphan derived rows
 
+### Requirement: Contact Materialization
+
+During sync, every distinct sender / recipient email address the pipeline
+sees MUST be upserted into `contact_identifiers`; an identifier with no
+existing contact MUST create a fresh `contacts` row keyed by a UUIDv7.
+This materializes the contact layer that SPEC-0011 (contact facts) and
+the UI read from. Manual merge of two contacts is SPEC-0011's
+`reduit contacts merge` and is out of scope here.
+
+#### Scenario: New address creates a contact
+
+- **WHEN** sync materializes a message whose sender or recipient email
+  address has no matching row in `contact_identifiers`
+- **THEN** the system SHALL insert a `contact_identifiers` row for that
+  address and, finding no existing contact, SHALL create a fresh
+  `contacts` row with a UUIDv7 identity and link the identifier to it
+
+#### Scenario: Known address reuses its contact
+
+- **WHEN** sync materializes a message whose email address already exists
+  in `contact_identifiers`
+- **THEN** the system SHALL upsert that one identifier row rather than
+  insert a duplicate and SHALL NOT create a second `contacts` row — the
+  identifier stays linked to its existing contact
+
+#### Scenario: Re-sync preserves the contact layer
+
+- **WHEN** a message is re-synced and its stable hash is unchanged
+- **THEN** the system SHALL leave existing `contacts` and
+  `contact_identifiers` rows intact — re-sync SHALL upsert, never
+  cascade-wipe, the contact layer
+
+### Requirement: Link Extraction
+
+During sync, URLs in message bodies MUST be parsed into the `links`
+table, each row keyed to its message by that message's stable hash and
+upserted so links survive idempotent re-sync. This `links` table is what
+SPEC-0006's `list_links` tool and `has_link` filter consume; those
+surfaces only read it.
+
+#### Scenario: URLs in a body populate links
+
+- **WHEN** sync materializes a message whose decrypted body contains one
+  or more URLs
+- **THEN** the system SHALL parse each URL into a `links` row keyed to
+  the message by its stable hash, so SPEC-0006's `list_links` and
+  `has_link` can read them
+
+#### Scenario: Re-sync converges links without duplicating
+
+- **WHEN** a message is re-synced and its stable hash is unchanged
+- **THEN** the system SHALL upsert the message's `links` rows rather than
+  insert duplicates; the link set for that message SHALL NOT grow and
+  SHALL survive re-sync
+
+#### Scenario: A message with no URLs yields no links
+
+- **WHEN** sync materializes a message whose body contains no URLs
+- **THEN** the system SHALL write no `links` rows for that message and
+  SHALL NOT fail the message on account of having nothing to extract
+
 ### Requirement: Decrypt In The Pipeline
 
 Message bodies and attachment metadata MUST be decrypted via
