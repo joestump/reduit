@@ -42,6 +42,15 @@ per-person, local-first tool — not an IMAP/SMTP relay.`,
 		"enable debug-level logging")
 
 	root.AddCommand(newMigrateCmd(&cfgPath, &verbose))
+	root.AddCommand(newAuthCmd(&cfgPath, &verbose))
+	root.AddCommand(newSyncCmd(&cfgPath, &verbose))
+	root.AddCommand(newEmbedCmd(&cfgPath, &verbose))
+	root.AddCommand(newFactsCmd(&cfgPath, &verbose))
+	root.AddCommand(newSendCmd(&cfgPath, &verbose))
+	root.AddCommand(newMCPCmd(&cfgPath, &verbose))
+	root.AddCommand(newServeCmd(&cfgPath, &verbose))
+	root.AddCommand(newDenylistCmd(&cfgPath, &verbose))
+	root.AddCommand(newContactsCmd(&cfgPath, &verbose))
 
 	return root
 }
