@@ -3,8 +3,10 @@
 # Common targets:
 #   make build      compile the reduit binary into ./bin/reduit
 #   make test       go test -race ./...
-#   make fmt        gofmt + goimports
-#   make lint       go vet + staticcheck (if installed)
+#   make fmt        gofmt + goimports (rewrites)
+#   make fmtcheck   fail if any file is not gofmt-clean (CI gate)
+#   make lint       gofmt check + go vet + pinned staticcheck
+#   make ci         everything CI runs: lint + race tests
 #   make tidy       go mod tidy
 #   make run        go run ./cmd/reduit serve (with REDUIT_CONFIG=./reduit.yaml)
 #   make docker     build the deployment Docker image
@@ -18,8 +20,20 @@ LDFLAGS     := -X $(PKG)/internal/cli.Version=$(VERSION)
 DOCKER_IMG  ?= ghcr.io/joestump/reduit
 DOCKER_TAG  ?= $(VERSION)
 
+# Static-analysis linter, pinned to match .gitea/workflows/ci.yaml and
+# .github/workflows/ci.yml. STATICCHECK_TOOLCHAIN forces staticcheck to
+# build with the go.mod toolchain; under GOTOOLCHAIN=auto it can build
+# with an older Go than this module's floor and then refuse to analyze.
+STATICCHECK_VERSION   ?= 2025.1.1
+STATICCHECK_TOOLCHAIN := $(shell awk '/^toolchain /{print $$2}' go.mod)
+
 .PHONY: all
 all: fmt lint test build
+
+# ci reproduces the .gitea/workflows/ci.yaml gate locally: the same
+# gofmt check, go vet, staticcheck, and race tests CI runs on every PR.
+.PHONY: ci
+ci: lint test
 
 .PHONY: build
 build:
@@ -58,10 +72,25 @@ fmt:
 	$(GO) fmt ./...
 	@command -v goimports >/dev/null 2>&1 && goimports -w . || true
 
+# fmtcheck is the read-only CI gate: it fails if any file is not
+# gofmt-clean instead of rewriting. `make fmt` is the fix.
+.PHONY: fmtcheck
+fmtcheck:
+	@unformatted=$$(gofmt -l .); \
+	if [ -n "$$unformatted" ]; then \
+	  echo "These files are not gofmt-formatted:"; \
+	  echo "$$unformatted"; \
+	  echo "Run 'make fmt' to fix."; \
+	  exit 1; \
+	fi
+
+# lint mirrors .gitea/workflows/ci.yaml: gofmt check, go vet, and the
+# pinned staticcheck. Uses `go run ...@version` so no separate install
+# step is needed and the version stays pinned.
 .PHONY: lint
-lint:
+lint: fmtcheck
 	$(GO) vet ./...
-	@command -v staticcheck >/dev/null 2>&1 && staticcheck ./... || echo "staticcheck not installed; skipping"
+	GOTOOLCHAIN=$(STATICCHECK_TOOLCHAIN) $(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
 
 .PHONY: tidy
 tidy:

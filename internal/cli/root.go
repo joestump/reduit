@@ -55,17 +55,6 @@ per-person, local-first tool that runs entirely on your machine.`,
 	return root
 }
 
-func loadConfig(cfgPathPtr *string, verbosePtr *bool) (config.Config, *slog.Logger, error) {
-	cfg, logger, err := loadConfigUnchecked(cfgPathPtr, verbosePtr)
-	if err != nil {
-		return config.Config{}, nil, err
-	}
-	if err := cfg.Validate(); err != nil {
-		return config.Config{}, nil, fmt.Errorf("invalid config: %w", err)
-	}
-	return cfg, logger, nil
-}
-
 func loadConfigUnchecked(cfgPathPtr *string, verbosePtr *bool) (config.Config, *slog.Logger, error) {
 	path := config.ResolveConfigPath(*cfgPathPtr)
 	cfg, err := config.Load(path)

@@ -1,8 +1,9 @@
 // Package store — mailbox persistence methods.
 //
 // Governing: SPEC-0001 REQ "Mailbox Identity", SPEC-0001 REQ "Multi-Mailbox",
-//   ADR-0006 (SQLite cache), ADR-0012 (single-user local-first),
-//   ADR-0013 (secrets in OS keychain — no secret columns here).
+//
+//	ADR-0006 (SQLite cache), ADR-0012 (single-user local-first),
+//	ADR-0013 (secrets in OS keychain — no secret columns here).
 package store
 
 import (
@@ -98,7 +99,8 @@ func (s *Store) ListMailboxes(ctx context.Context) ([]Mailbox, error) {
 // does not match, returns ErrProtonUserIDConflict without modifying the row.
 //
 // Governing: SPEC-0001 REQ "proton_user_id recorded on first successful auth",
-//   SPEC-0001 REQ "proton_user_id is immutable after it is set".
+//
+//	SPEC-0001 REQ "proton_user_id is immutable after it is set".
 func (s *Store) SetProtonUserID(ctx context.Context, id, protonUserID string) error {
 	m, err := s.GetMailbox(ctx, id)
 	if err != nil {

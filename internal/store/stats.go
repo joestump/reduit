@@ -5,7 +5,8 @@
 // surfaces cannot drift (SPEC-0006 REQ "Thin Adapter Over the Store").
 //
 // Governing: ADR-0006 (SQLite cache), ADR-0012 (single-user local-first),
-//   ADR-0017 (stdio MCP), SPEC-0006 REQ "Thin Adapter Over the Store".
+//
+//	ADR-0017 (stdio MCP), SPEC-0006 REQ "Thin Adapter Over the Store".
 package store
 
 import (
@@ -80,7 +81,8 @@ type MailboxStat struct {
 // at which point they light up automatically. Read-only.
 //
 // Governing: SPEC-0006 REQ "Thin Adapter Over the Store", ADR-0015
-//   (embeddings/vector backend), ADR-0014 (stable-hash keying).
+//
+//	(embeddings/vector backend), ADR-0014 (stable-hash keying).
 func (s *Store) MailboxStats(ctx context.Context) ([]MailboxStat, error) {
 	if s == nil || s.DB == nil {
 		return nil, errors.New("store: not open")
@@ -110,7 +112,8 @@ func (s *Store) MailboxStats(ctx context.Context) ([]MailboxStat, error) {
 // initial version-0 sentinel row).
 //
 // Governing: ADR-0006 (SQLite + goose), SPEC-0006 REQ "Thin Adapter Over the
-//   Store" (the `status` tool reports cache schema health via the store).
+//
+//	Store" (the `status` tool reports cache schema health via the store).
 func (s *Store) SchemaVersion(ctx context.Context) (int64, error) {
 	if s == nil || s.DB == nil {
 		return 0, errors.New("store: not open")

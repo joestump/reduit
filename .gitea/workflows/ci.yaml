@@ -1,0 +1,83 @@
+# Gitea Actions: the per-PR / per-push correctness gate for reduit on
+# gitea.stump.rocks/joestump/reduit (the source of truth).
+#
+# On every pull request and every push to main this runs the four
+# checks a dev can reproduce with `make ci`:
+#   - gofmt        -- `gofmt -l .` must be empty (formatting enforced)
+#   - go vet ./...
+#   - staticcheck  -- static analysis, pinned (honnef.co/go/tools)
+#   - go test -race ./...
+#
+# Relationship to the other workflows in this directory:
+#   - build.yaml is a pure build-and-publish path; it deliberately does
+#     NOT run tests (see its header). This file is the missing
+#     correctness gate it refers to, now run on Gitea itself rather than
+#     only on the github.com mirror (.github/workflows/ci.yml).
+#   - Single sequential job (not the parallel job-per-check layout of
+#     the GitHub workflow) on purpose: Gitea's act_runner is more
+#     contended than GitHub's hosted runners, and build.yaml notes that
+#     timing-sensitive tests can flake under contention. One job keeps
+#     the race tests off a runner that's simultaneously compiling
+#     staticcheck.
+#
+# Dependabot only watches `.github/workflows/`, so the pinned tool
+# versions here (setup-go inputs, staticcheck) must be bumped by hand to
+# stay aligned with .github/workflows/ci.yml.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ gitea.workflow }}-${{ gitea.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: fmt + vet + staticcheck + race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          # Read the language floor + toolchain pin from go.mod so every
+          # check below sees the same compiler the build uses.
+          go-version-file: go.mod
+
+      # `gofmt -l` lists files that are not formatted; CI fails if that
+      # list is non-empty. Reproduce locally with `make fmt` (writes) or
+      # `make fmtcheck` (this same gate).
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            echo "Run 'make fmt' to fix."
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # staticcheck 2025.1.1's own module pins an older build toolchain,
+      # so under GOTOOLCHAIN=auto it gets compiled with a Go older than
+      # this module's go.mod floor and then refuses to analyze the code
+      # ("module requires at least go1.26.1, but Staticcheck was built
+      # with go1.25.x"). Forcing GOTOOLCHAIN to the go.mod toolchain
+      # builds staticcheck with the matching compiler. Kept in lockstep
+      # with .github/workflows/ci.yml's staticcheck pin.
+      - name: staticcheck
+        run: |
+          export GOTOOLCHAIN=$(awk '/^toolchain /{print $2}' go.mod)
+          go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 ./...
+
+      - name: go test -race
+        run: go test -race -count=1 ./...

@@ -14,8 +14,9 @@
 // This package owns no query path of its own.
 //
 // Governing: ADR-0017 (stdio MCP + hybrid RAG), ADR-0012 (single-user
-//   local-first), ADR-0005 (loopback UI / shared store),
-//   SPEC-0006 (MCP Tool Surface).
+//
+//	local-first), ADR-0005 (loopback UI / shared store),
+//	SPEC-0006 (MCP Tool Surface).
 package mcp
 
 import (
@@ -56,7 +57,8 @@ type Options struct {
 // NewServer builds the MCP server and registers every tool.
 //
 // Governing: SPEC-0006 REQ "Thin Adapter Over the Store" (tools read only via
-//   st), SPEC-0006 REQ "Stdio Transport, No Auth" (no listener constructed).
+//
+//	st), SPEC-0006 REQ "Stdio Transport, No Auth" (no listener constructed).
 func NewServer(st *store.Store, opts Options) *Server {
 	log := opts.Logger
 	if log == nil {

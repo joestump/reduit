@@ -7,7 +7,8 @@
 // stderr (buildLogger writes there) so stdout carries only the JSON-RPC stream.
 //
 // Governing: ADR-0017 (stdio MCP and hybrid RAG), ADR-0012 (single-user
-//   local-first), SPEC-0006 REQ "Stdio Transport, No Auth".
+//
+//	local-first), SPEC-0006 REQ "Stdio Transport, No Auth".
 package cli
 
 import (

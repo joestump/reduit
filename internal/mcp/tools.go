@@ -6,7 +6,8 @@
 // Adapter Over the Store").
 //
 // Governing: ADR-0017 (stdio MCP), ADR-0012 (single-user local-first),
-//   SPEC-0006 (MCP Tool Surface).
+//
+//	SPEC-0006 (MCP Tool Surface).
 package mcp
 
 import (
@@ -72,8 +73,9 @@ type mailboxStatus struct {
 // statusOut is the typed result an MCP client receives from `status`.
 //
 // Governing: SPEC-0006 REQ "Thin Adapter Over the Store" (sourced via
-//   store.Stats / store.MailboxStats / store.SchemaVersion, the same methods
-//   the UI uses).
+//
+//	store.Stats / store.MailboxStats / store.SchemaVersion, the same methods
+//	the UI uses).
 type statusOut struct {
 	// SchemaVersion is the current goose migration version (0 = un-migrated).
 	SchemaVersion int64 `json:"schema_version"`
