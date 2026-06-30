@@ -31,7 +31,7 @@ const fileSuffix = "_FILE"
 //	REDUIT_LLM_BASE_URL       -> llm.base_url
 //	REDUIT_LOGGER_LEVEL       -> logger.level
 //
-// Any env var ending in `_FILE` (e.g. REDUIT_LLM_BASE_URL_FILE)
+// Any env var ending in `_FILE` (e.g. REDUIT_LLM_API_KEY_FILE)
 // is resolved by reading the file at that path; the file's trimmed
 // contents become the value of the corresponding non-`_FILE` env var.
 // This mirrors the Docker secrets convention where the secret value
@@ -44,8 +44,8 @@ func Load(path string) (Config, error) {
 
 	v := viper.New()
 	v.SetEnvPrefix(envPrefix)
-	// Map dotted config keys ("llm.base_url") to env names
-	// ("REDUIT_LLM_BASE_URL").
+	// Map dotted config keys ("llm.api_key") to env names
+	// ("REDUIT_LLM_API_KEY").
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 
@@ -122,9 +122,8 @@ func resolveFileEnv(prefix string) error {
 			// A whitespace-only or zero-byte file is treated as a
 			// hard error rather than silently substituting an empty
 			// secret -- a botched secret mount would otherwise let
-			// the binary boot with an empty required value (e.g. an
-			// empty llm.base_url) and fail every model call later with
-			// an opaque error.
+			// the binary boot with e.g. LLM.APIKey="" and fail every
+			// model call later with an opaque auth error.
 			return fmt.Errorf("%s=%q: file is empty after trim", name, path)
 		}
 		if err := os.Setenv(baseName, value); err != nil {
@@ -139,13 +138,17 @@ func resolveFileEnv(prefix string) error {
 // up the env var).
 func bindDefaults(v *viper.Viper, cfg Config) error {
 	defaults := map[string]any{
-		"data_dir":             cfg.DataDir,
-		"llm.base_url":         cfg.LLM.BaseURL,
-		"llm.text_model":       cfg.LLM.TextModel,
-		"llm.multimodal_model": cfg.LLM.MultimodalModel,
-		"logger.level":         cfg.Logger.Level,
-		"logger.format":        cfg.Logger.Format,
-		"ui.listen_addr":       cfg.UI.ListenAddr,
+		"data_dir":                cfg.DataDir,
+		"llm.base_url":            cfg.LLM.BaseURL,
+		"llm.api_key":             cfg.LLM.APIKey,
+		"llm.text_model":          cfg.LLM.TextModel,
+		"llm.embed_model":         cfg.LLM.EmbedModel,
+		"llm.multimodal_base_url": cfg.LLM.MultimodalBaseURL,
+		"llm.multimodal_api_key":  cfg.LLM.MultimodalAPIKey,
+		"llm.multimodal_model":    cfg.LLM.MultimodalModel,
+		"logger.level":            cfg.Logger.Level,
+		"logger.format":           cfg.Logger.Format,
+		"ui.listen_addr":          cfg.UI.ListenAddr,
 	}
 	for k, val := range defaults {
 		v.SetDefault(k, val)

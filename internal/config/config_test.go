@@ -71,6 +71,69 @@ func TestLoad_NoFile(t *testing.T) {
 	}
 }
 
+func TestDefaults_LLMTwoRoles(t *testing.T) {
+	cfg := Defaults()
+	// Text/embedding role has sensible local defaults out of the box.
+	if cfg.LLM.TextModel == "" {
+		t.Error("LLM.TextModel should default")
+	}
+	if cfg.LLM.EmbedModel != "nomic-embed-text" {
+		t.Errorf("LLM.EmbedModel = %q, want nomic-embed-text", cfg.LLM.EmbedModel)
+	}
+	// Multimodal role is opt-in: disabled by default (ADR-0018).
+	if cfg.LLM.MultimodalModel != "" || cfg.LLM.MultimodalBaseURL != "" {
+		t.Errorf("multimodal role should be unconfigured by default, got base=%q model=%q",
+			cfg.LLM.MultimodalBaseURL, cfg.LLM.MultimodalModel)
+	}
+}
+
+func TestLoad_LLMEnvOverrides(t *testing.T) {
+	t.Setenv("REDUIT_LLM_API_KEY", "text-secret")
+	t.Setenv("REDUIT_LLM_EMBED_MODEL", "custom-embed")
+	t.Setenv("REDUIT_LLM_MULTIMODAL_BASE_URL", "http://mm:4001/v1")
+	t.Setenv("REDUIT_LLM_MULTIMODAL_API_KEY", "mm-secret")
+	t.Setenv("REDUIT_LLM_MULTIMODAL_MODEL", "vision-pro")
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LLM.APIKey != "text-secret" {
+		t.Errorf("LLM.APIKey = %q", cfg.LLM.APIKey)
+	}
+	if cfg.LLM.EmbedModel != "custom-embed" {
+		t.Errorf("LLM.EmbedModel = %q", cfg.LLM.EmbedModel)
+	}
+	if cfg.LLM.MultimodalBaseURL != "http://mm:4001/v1" {
+		t.Errorf("LLM.MultimodalBaseURL = %q", cfg.LLM.MultimodalBaseURL)
+	}
+	if cfg.LLM.MultimodalAPIKey != "mm-secret" {
+		t.Errorf("LLM.MultimodalAPIKey = %q", cfg.LLM.MultimodalAPIKey)
+	}
+	if cfg.LLM.MultimodalModel != "vision-pro" {
+		t.Errorf("LLM.MultimodalModel = %q", cfg.LLM.MultimodalModel)
+	}
+}
+
+func TestLoad_LLMKeyFromFile(t *testing.T) {
+	// _FILE indirection delivers the API key from a secret file, the
+	// preferred path for secret delivery (ADR-0018).
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "llm.key")
+	if err := os.WriteFile(keyPath, []byte("file-secret\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("REDUIT_LLM_API_KEY_FILE", keyPath)
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LLM.APIKey != "file-secret" {
+		t.Errorf("LLM.APIKey = %q, want file-secret (trimmed from file)", cfg.LLM.APIKey)
+	}
+}
+
 func TestLoad_WithFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "reduit.yaml")

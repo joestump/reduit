@@ -39,18 +39,48 @@ type Config struct {
 	UI UIConfig `mapstructure:"ui"`
 }
 
-// LLMConfig configures the single OpenAI-compatible LLM egress.
-// Two model roles exist: the text model (search, summarise, facts) and
-// the multimodal model (OCR/vision/audio extraction — optional).
+// LLMConfig configures the single OpenAI-compatible LLM egress and its
+// two independently-configured model roles (ADR-0018):
 //
-// Governing: ADR-0018 (one LLM egress, two model roles).
+//   - Text/embedding role — the embedding model (Embed) and the text
+//     chat model (search, summarise, contact-facts extraction, RAG).
+//     Local by default; BaseURL/APIKey back both.
+//   - Multimodal role — the OCR/vision/audio model (opt-in). Its base
+//     URL, model, and key are configured independently of the text role
+//     so the operator can keep text fully local while routing only media
+//     to a hosted model, by deliberate choice. Pointing it at a hosted
+//     endpoint is Reduit's heaviest, most sensitive egress (raw
+//     image/audio bytes).
+//
+// API keys come from the environment (REDUIT_LLM_API_KEY,
+// REDUIT_LLM_MULTIMODAL_API_KEY), with `_FILE` indirection for
+// secret-file delivery; they are never committed and never logged.
+//
+// Governing: ADR-0018 (one LLM egress, two model roles, secrets via env),
+// SPEC-0008 (text/embedding role), SPEC-0009 (multimodal role).
 type LLMConfig struct {
-	// BaseURL is the OpenAI-compatible endpoint (e.g. LiteLLM proxy →
-	// Ollama). Defaults to http://localhost:4000/v1.
+	// BaseURL is the OpenAI-compatible endpoint for the text/embedding
+	// role (e.g. LiteLLM proxy → Ollama). Defaults to
+	// http://localhost:4000/v1.
 	BaseURL string `mapstructure:"base_url"`
-	// TextModel is the model name for text-only tasks (search,
-	// summarise, contact-facts extraction).
+	// APIKey authenticates the text/embedding role. Sourced from
+	// REDUIT_LLM_API_KEY (or REDUIT_LLM_API_KEY_FILE). Empty is allowed:
+	// local proxies/Ollama accept any or no key. Never committed.
+	APIKey string `mapstructure:"api_key"`
+	// TextModel is the chat model for text-only tasks (search,
+	// summarise, contact-facts extraction, RAG).
 	TextModel string `mapstructure:"text_model"`
+	// EmbedModel is the embedding model for the text/embedding role.
+	// Defaults to nomic-embed-text (ADR-0018, on-device out of the box).
+	EmbedModel string `mapstructure:"embed_model"`
+
+	// MultimodalBaseURL is the OpenAI-compatible endpoint for the
+	// multimodal role. Empty disables the role (opt-in); set it to route
+	// OCR/vision/audio to a separate endpoint from the text role.
+	MultimodalBaseURL string `mapstructure:"multimodal_base_url"`
+	// MultimodalAPIKey authenticates the multimodal role. Sourced from
+	// REDUIT_LLM_MULTIMODAL_API_KEY (or ..._FILE). Never committed.
+	MultimodalAPIKey string `mapstructure:"multimodal_api_key"`
 	// MultimodalModel is the model name for OCR/vision/audio extraction.
 	// Empty disables multimodal extraction.
 	MultimodalModel string `mapstructure:"multimodal_model"`
@@ -80,8 +110,12 @@ func Defaults() Config {
 	return Config{
 		DataDir: filepath.Join(home, ".local", "share", "reduit"),
 		LLM: LLMConfig{
-			BaseURL:   "http://localhost:4000/v1",
-			TextModel: "ollama/llama3.2",
+			BaseURL:    "http://localhost:4000/v1",
+			TextModel:  "ollama/llama3.2",
+			EmbedModel: "nomic-embed-text",
+			// Multimodal role is opt-in (ADR-0018): left unconfigured by
+			// default so nothing media-related leaves the box until the
+			// operator deliberately points it somewhere.
 		},
 		Logger: LoggerConfig{
 			Level:  "info",
