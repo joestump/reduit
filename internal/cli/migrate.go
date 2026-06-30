@@ -5,8 +5,6 @@ import (
 	"log/slog"
 
 	"github.com/spf13/cobra"
-
-	"github.com/joestump/reduit/internal/store"
 )
 
 func newMigrateCmd(cfgPath *string, verbose *bool) *cobra.Command {
@@ -23,9 +21,9 @@ migrations. Idempotent — safe to run on every deploy.`,
 			if err != nil {
 				return err
 			}
-			st, err := store.Open(cfg.DBPath())
+			st, err := openStore(cfg)
 			if err != nil {
-				return fmt.Errorf("open store: %w", err)
+				return err
 			}
 			defer st.Close()
 			if err := st.Migrate(""); err != nil {

@@ -12,15 +12,12 @@ package cli
 
 import (
 	"fmt"
-	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 
 	"github.com/spf13/cobra"
 
 	"github.com/joestump/reduit/internal/mcp"
-	"github.com/joestump/reduit/internal/store"
 )
 
 func newMCPCmd(cfgPath *string, verbose *bool) *cobra.Command {
@@ -41,18 +38,12 @@ carries only the JSON-RPC protocol stream.`,
 				return err
 			}
 
-			// modernc.org/sqlite will not create parent directories, so on a
-			// clean machine (~/.local/share/reduit absent) Open would fail.
-			// Create the data dir first, owner-only (0700) — the cache is
-			// personal data (ADR-0012).
-			dbPath := cfg.DBPath()
-			if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
-				return fmt.Errorf("create data dir: %w", err)
-			}
-
-			st, err := store.Open(dbPath)
+			// openStore creates the data dir (owner-only 0700) before opening,
+			// since modernc.org/sqlite will not create parent directories and
+			// on a clean machine (~/.local/share/reduit absent) Open would fail.
+			st, err := openStore(cfg)
 			if err != nil {
-				return fmt.Errorf("open store: %w", err)
+				return err
 			}
 			defer st.Close()
 
