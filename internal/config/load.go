@@ -146,6 +146,8 @@ func bindDefaults(v *viper.Viper, cfg Config) error {
 		"llm.multimodal_base_url": cfg.LLM.MultimodalBaseURL,
 		"llm.multimodal_api_key":  cfg.LLM.MultimodalAPIKey,
 		"llm.multimodal_model":    cfg.LLM.MultimodalModel,
+		"proton.app_version":      cfg.Proton.AppVersion,
+		"proton.host_url":         cfg.Proton.HostURL,
 		"logger.level":            cfg.Logger.Level,
 		"logger.format":           cfg.Logger.Format,
 		"ui.listen_addr":          cfg.UI.ListenAddr,

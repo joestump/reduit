@@ -43,6 +43,7 @@ per-person, local-first tool that runs entirely on your machine.`,
 
 	root.AddCommand(newMigrateCmd(&cfgPath, &verbose))
 	root.AddCommand(newAuthCmd(&cfgPath, &verbose))
+	root.AddCommand(newLabelsCmd(&cfgPath, &verbose))
 	root.AddCommand(newSyncCmd(&cfgPath, &verbose))
 	root.AddCommand(newEmbedCmd(&cfgPath, &verbose))
 	root.AddCommand(newFactsCmd(&cfgPath, &verbose))

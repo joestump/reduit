@@ -39,6 +39,11 @@ type Fake struct {
 	RefreshErr error
 	SendErr    error
 
+	// LabelList is returned by a successful Labels call; LabelsErr, when set,
+	// is returned instead.
+	LabelList []Label
+	LabelsErr error
+
 	// LatestEvent is returned by LatestEventID.
 	LatestEvent string
 	// Batches are returned by successive GetEvents calls (FIFO); when drained,
@@ -150,6 +155,18 @@ func (f *Fake) Refresh(_ context.Context) error {
 		f.RefreshTokens = f.RefreshTokens[1:]
 	}
 	return nil
+}
+
+func (f *Fake) Labels(_ context.Context) ([]Label, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.authed {
+		return nil, ErrNotAuthenticated
+	}
+	if f.LabelsErr != nil {
+		return nil, f.LabelsErr
+	}
+	return f.LabelList, nil
 }
 
 func (f *Fake) LatestEventID(_ context.Context) (string, error) {

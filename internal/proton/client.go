@@ -60,6 +60,13 @@ type Client interface {
 	// decrypt/send is needed.
 	Refresh(ctx context.Context) error
 
+	// Labels returns the account's labels, folders, and system mailboxes in
+	// reduit domain types. It needs only an authenticated session — no mailbox
+	// keyring Unlock — so it doubles as the live connection test the CLI runs
+	// after `auth add` (SPEC-0007 "Re-Auth Flow" exercises the same Resume +
+	// authenticated-call path). go-proton-api types do not cross this boundary.
+	Labels(ctx context.Context) ([]Label, error)
+
 	// LatestEventID returns the current head of the Proton event stream, used
 	// to seed a mailbox's sync cursor on first sync (ADR-0014 "Bootstrap then
 	// tail").
@@ -156,6 +163,34 @@ type Address struct {
 	Name  string
 	Email string
 }
+
+// Label is one of a mailbox's organizing entities — a user label, a user
+// folder, or a built-in system mailbox (Inbox, Sent, …) — in reduit domain
+// terms. It is the surface the `reduit labels` connection test prints; go-
+// proton-api's label representation does not cross the Client boundary.
+type Label struct {
+	// ID is Proton's stable label id. System mailboxes have well-known numeric
+	// ids ("0" = Inbox, "7" = Sent, …); user labels/folders have opaque ids.
+	ID string
+	// Name is the human-readable label name.
+	Name string
+	// Type is the label class: "label", "folder", or "system". An unrecognized
+	// upstream type maps to "unknown" rather than leaking the numeric code.
+	Type string
+	// Color is the label's display color (hex like "#c44800"), empty for system
+	// mailboxes that carry none.
+	Color string
+}
+
+// Label type strings. These are the reduit-facing values of Label.Type; they
+// are deliberately decoupled from go-proton-api's numeric LabelType so a change
+// upstream does not ripple into reduit's domain or the CLI's output.
+const (
+	LabelTypeLabel   = "label"
+	LabelTypeFolder  = "folder"
+	LabelTypeSystem  = "system"
+	LabelTypeUnknown = "unknown"
+)
 
 // EventAction is the kind of change an event item describes (ADR-0014
 // "applying creates/updates/deletes idempotently").

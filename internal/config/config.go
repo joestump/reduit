@@ -30,6 +30,11 @@ type Config struct {
 	// Governing: ADR-0018 (one OpenAI-compatible client, two model roles).
 	LLM LLMConfig `mapstructure:"llm"`
 
+	// Proton configures the go-proton-api client used by auth/sync/send.
+	//
+	// Governing: SPEC-0007 (onboarding & auth), ADR-0001 (go-proton-api edge).
+	Proton ProtonConfig `mapstructure:"proton"`
+
 	// Logger configures the structured logger.
 	Logger LoggerConfig `mapstructure:"logger"`
 
@@ -86,6 +91,23 @@ type LLMConfig struct {
 	MultimodalModel string `mapstructure:"multimodal_model"`
 }
 
+// ProtonConfig configures the go-proton-api client. Both fields are non-secret.
+//
+// Governing: SPEC-0007 (onboarding & auth), ADR-0001 (go-proton-api edge).
+type ProtonConfig struct {
+	// AppVersion is the app-version string presented to Proton as the
+	// x-pm-appversion header. Proton VALIDATES this and rejects unacceptable
+	// values (code 5001 missing, 5003 bad), so it is overridable: if the real
+	// API rejects the default, the operator can set a value Proton accepts
+	// without a recompile. Sourced from config (proton.app_version) or
+	// REDUIT_PROTON_APP_VERSION. Defaults to "Other".
+	AppVersion string `mapstructure:"app_version"`
+	// HostURL is the Proton API base URL. Empty targets go-proton-api's default
+	// production host; set it only to point at a test/self-hosted server.
+	// Sourced from REDUIT_PROTON_HOST_URL.
+	HostURL string `mapstructure:"host_url"`
+}
+
 // LoggerConfig configures the structured logger.
 type LoggerConfig struct {
 	// Level is one of debug, info, warn, error.
@@ -116,6 +138,11 @@ func Defaults() Config {
 			// Multimodal role is opt-in (ADR-0018): left unconfigured by
 			// default so nothing media-related leaves the box until the
 			// operator deliberately points it somewhere.
+		},
+		Proton: ProtonConfig{
+			// "Other" is go-proton-api's generic third-party app-version value;
+			// overridable via config/env if Proton rejects it (code 5003).
+			AppVersion: "Other",
 		},
 		Logger: LoggerConfig{
 			Level:  "info",

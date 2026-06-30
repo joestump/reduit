@@ -19,6 +19,8 @@ func TestClassifyError(t *testing.T) {
 		{"wrong password", &gpa.APIError{Code: gpa.PasswordWrong, Status: 422, Message: "Incorrect login credentials"}, ErrAuthFailed},
 		{"human verification", &gpa.APIError{Code: gpa.HumanVerificationRequired, Status: 422, Message: "HV"}, ErrHumanVerification},
 		{"refresh token invalid", &gpa.APIError{Code: gpa.AuthRefreshTokenInvalid, Status: 422, Message: "bad token"}, ErrRefreshTokenInvalid},
+		{"app version bad", &gpa.APIError{Code: gpa.AppVersionBadCode, Status: 400, Message: "bad app version"}, ErrAppVersionRejected},
+		{"app version missing", &gpa.APIError{Code: gpa.AppVersionMissingCode, Status: 400, Message: "missing app version"}, ErrAppVersionRejected},
 		{"api error by value", gpa.APIError{Code: gpa.PasswordWrong, Status: 422, Message: "v"}, ErrAuthFailed},
 		{"net error", &gpa.NetError{Cause: errors.New("dial tcp: timeout"), Message: "unreachable"}, ErrNetwork},
 		{"wrapped net error", fmt.Errorf("login: %w", &gpa.NetError{Cause: errors.New("eof"), Message: "x"}), ErrNetwork},

@@ -40,6 +40,13 @@ type GPADialer struct {
 // cfg. The Manager is the thin edge over the network; the Dialer/Client
 // interface above it is what reduit's layers depend on (ADR-0001).
 func NewDialer(cfg Config) *GPADialer {
+	// Note: we pass WithLogger but deliberately NOT WithDebug. go-proton-api
+	// gates resty's request/response BODY logging on its own debug flag (default
+	// off), not on the logger or its level. So even under reduit's --verbose
+	// (which only raises reduit's slog level) the SRP/auth payloads, TOTP code,
+	// and refresh token are never written to the logs (SPEC-0007 "No Secret
+	// Leakage"). The logger here only receives resty's connection-level
+	// diagnostics, which carry no secret.
 	opts := []gpa.Option{gpa.WithLogger(newSlogLogger(cfg.Logger))}
 	if cfg.HostURL != "" {
 		opts = append(opts, gpa.WithHostURL(cfg.HostURL))
@@ -151,10 +158,19 @@ func (c *gpaClient) Unlock(ctx context.Context, passphrase []byte) error {
 	if err != nil {
 		return classifyError(err)
 	}
-	keyPass, err := salts.SaltForKey(passphrase, user.Keys.Primary().ID)
+	// go-proton-api's Keys.Primary() PANICS when no key carries the Primary
+	// flag (#123). Select the primary key id defensively so a malformed key
+	// set surfaces as a typed error rather than a crash on the user's login
+	// path (SPEC-0007 REQ "Mailbox Passphrase Capture and Key Unlock").
+	primaryKeyID, err := primaryKeyID(user.Keys)
 	if err != nil {
-		// Salt selection failed (e.g. no primary key); not a passphrase value
-		// problem, so don't claim a wrong passphrase.
+		return err
+	}
+	keyPass, err := salts.SaltForKey(passphrase, primaryKeyID)
+	if err != nil {
+		// Salt lookup for the (already-validated) primary key failed; this is a
+		// key-set problem, not a wrong-passphrase one, so don't claim the value
+		// was wrong.
 		return fmt.Errorf("proton: derive key passphrase: %w", err)
 	}
 	_, addrKRs, err := gpa.Unlock(user, addrs, keyPass, async.NoopPanicHandler{})
@@ -195,6 +211,56 @@ func (c *gpaClient) refreshWithUID(ctx context.Context, uid string) error {
 	c.userID = auth.UserID
 	c.refreshToken = auth.RefreshToken
 	return nil
+}
+
+// Labels fetches the account's labels, folders, and system mailboxes and maps
+// them to reduit's domain type. It needs only an authenticated session (no
+// Unlock), making it the cheap end-to-end connectivity check the CLI runs.
+func (c *gpaClient) Labels(ctx context.Context) ([]Label, error) {
+	if c.cli == nil {
+		return nil, ErrNotAuthenticated
+	}
+	upstream, err := c.cli.GetLabels(ctx, gpa.LabelTypeLabel, gpa.LabelTypeFolder, gpa.LabelTypeSystem)
+	if err != nil {
+		return nil, classifyError(err)
+	}
+	out := make([]Label, 0, len(upstream))
+	for _, l := range upstream {
+		out = append(out, Label{
+			ID:    l.ID,
+			Name:  l.Name,
+			Type:  labelTypeString(l.Type),
+			Color: l.Color,
+		})
+	}
+	return out, nil
+}
+
+// labelTypeString maps go-proton-api's numeric LabelType onto reduit's stable
+// type strings, keeping the upstream enum out of the domain type.
+func labelTypeString(t gpa.LabelType) string {
+	switch t {
+	case gpa.LabelTypeLabel:
+		return LabelTypeLabel
+	case gpa.LabelTypeFolder:
+		return LabelTypeFolder
+	case gpa.LabelTypeSystem:
+		return LabelTypeSystem
+	default:
+		return LabelTypeUnknown
+	}
+}
+
+// primaryKeyID returns the id of the key flagged Primary, or ErrNoPrimaryKey
+// if none is. It replaces go-proton-api's Keys.Primary(), which panics on an
+// empty/flagless key set (#123).
+func primaryKeyID(keys gpa.Keys) (string, error) {
+	for _, k := range keys {
+		if bool(k.Primary) {
+			return k.ID, nil
+		}
+	}
+	return "", ErrNoPrimaryKey
 }
 
 // LatestEventID seeds a mailbox's sync cursor (ADR-0014 "Bootstrap then tail").

@@ -29,6 +29,12 @@ var (
 	// maps this to the needs_reauth state.
 	ErrRefreshTokenInvalid = errors.New("proton: refresh token invalid")
 
+	// ErrAppVersionRejected means Proton rejected the client's app-version
+	// header (codes 5001 missing / 5003 bad). The fix is operator-actionable —
+	// set a value Proton accepts — so the message points at the config knob
+	// rather than reading as a generic auth failure.
+	ErrAppVersionRejected = errors.New("proton: rejected the client app version; set proton.app_version in your config (or REDUIT_PROTON_APP_VERSION) to a value Proton accepts")
+
 	// ErrNetwork is a transport-level failure reaching Proton; the operation
 	// may succeed on retry (ADR-0014 — sync is resumable).
 	ErrNetwork = errors.New("proton: network error")
@@ -53,6 +59,11 @@ var (
 	// keys (SPEC-0007 scenario "Passphrase unlocks OpenPGP keys"). The message
 	// never contains the passphrase.
 	ErrUnlockFailed = errors.New("proton: mailbox passphrase did not unlock keys")
+
+	// ErrNoPrimaryKey means the account's key set has no key flagged Primary,
+	// so a salt-for-key derivation cannot proceed (#123). It replaces the panic
+	// in go-proton-api's Keys.Primary(); the mailbox cannot be unlocked.
+	ErrNoPrimaryKey = errors.New("proton: account has no primary key")
 
 	// ErrSendNotWired marks the live send-packaging edge that resolves
 	// recipient public keys and builds encryption packages. Defining the Send
@@ -112,6 +123,8 @@ func classifyAPICode(apiErr *gpa.APIError) error {
 		return fmt.Errorf("%w (code %d)", ErrHumanVerification, apiErr.Code)
 	case gpa.AuthRefreshTokenInvalid:
 		return fmt.Errorf("%w (code %d)", ErrRefreshTokenInvalid, apiErr.Code)
+	case gpa.AppVersionMissingCode, gpa.AppVersionBadCode:
+		return fmt.Errorf("%w (code %d)", ErrAppVersionRejected, apiErr.Code)
 	default:
 		// Preserve the upstream message and code without inventing a category.
 		return fmt.Errorf("proton: api error: %w", apiErr)

@@ -115,6 +115,31 @@ func TestLoad_LLMEnvOverrides(t *testing.T) {
 	}
 }
 
+func TestDefaults_ProtonAppVersion(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Proton.AppVersion != "Other" {
+		t.Errorf("Proton.AppVersion = %q, want Other", cfg.Proton.AppVersion)
+	}
+	if cfg.Proton.HostURL != "" {
+		t.Errorf("Proton.HostURL = %q, want empty (production default)", cfg.Proton.HostURL)
+	}
+}
+
+func TestLoad_ProtonEnvOverrides(t *testing.T) {
+	t.Setenv("REDUIT_PROTON_APP_VERSION", "macos-mail@4.0.0")
+	t.Setenv("REDUIT_PROTON_HOST_URL", "https://proton.test")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Proton.AppVersion != "macos-mail@4.0.0" {
+		t.Errorf("Proton.AppVersion = %q", cfg.Proton.AppVersion)
+	}
+	if cfg.Proton.HostURL != "https://proton.test" {
+		t.Errorf("Proton.HostURL = %q", cfg.Proton.HostURL)
+	}
+}
+
 func TestLoad_LLMKeyFromFile(t *testing.T) {
 	// _FILE indirection delivers the API key from a secret file, the
 	// preferred path for secret delivery (ADR-0018).
