@@ -35,7 +35,7 @@ jobs:
           fetch-depth: 0
 
       - name: AI bot
-        uses: stumpcloud/gitea-aibot-action@main
+        uses: https://gitea.stump.rocks/stumpcloud/gitea-aibot-action@main
         env:
           AIBOT_HARNESS: ${{ vars.AIBOT_HARNESS || 'claude' }}
           AIBOT_MODEL:   ${{ vars.AIBOT_MODEL   || 'claude-haiku-4-5-20251001' }}
