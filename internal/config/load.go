@@ -31,7 +31,7 @@ const fileSuffix = "_FILE"
 //	REDUIT_LLM_BASE_URL       -> llm.base_url
 //	REDUIT_LOGGER_LEVEL       -> logger.level
 //
-// Any env var ending in `_FILE` (e.g. REDUIT_OIDC_CLIENT_SECRET_FILE)
+// Any env var ending in `_FILE` (e.g. REDUIT_LLM_BASE_URL_FILE)
 // is resolved by reading the file at that path; the file's trimmed
 // contents become the value of the corresponding non-`_FILE` env var.
 // This mirrors the Docker secrets convention where the secret value
@@ -44,8 +44,8 @@ func Load(path string) (Config, error) {
 
 	v := viper.New()
 	v.SetEnvPrefix(envPrefix)
-	// Map dotted config keys ("oidc.client_secret") to env names
-	// ("REDUIT_OIDC_CLIENT_SECRET").
+	// Map dotted config keys ("llm.base_url") to env names
+	// ("REDUIT_LLM_BASE_URL").
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 
@@ -122,8 +122,9 @@ func resolveFileEnv(prefix string) error {
 			// A whitespace-only or zero-byte file is treated as a
 			// hard error rather than silently substituting an empty
 			// secret -- a botched secret mount would otherwise let
-			// the service boot with e.g. OIDC.ClientSecret="" and
-			// degrade to public-client mode without warning.
+			// the binary boot with an empty required value (e.g. an
+			// empty llm.base_url) and fail every model call later with
+			// an opaque error.
 			return fmt.Errorf("%s=%q: file is empty after trim", name, path)
 		}
 		if err := os.Setenv(baseName, value); err != nil {

@@ -8,8 +8,9 @@
 // that BEGIN IMMEDIATE serialisation does not matter. The writer pool
 // returned by `WriterDB` is opened against the SAME underlying file
 // but pinned to MaxOpenConns(1), so callers that race for the write
-// lock (mailbox.AssignUID is the canonical example) serialise at the
-// connection layer instead of through SQLITE_BUSY retries.
+// lock (any hot write path that would otherwise contend on the file
+// lock) serialise at the connection layer instead of through
+// SQLITE_BUSY retries.
 //
 // SQLite's WAL mode allows exactly one writer at a time anyway; the
 // single-conn writer pool surfaces that constraint at the database/sql
@@ -18,9 +19,9 @@
 // jitter, and retry. Reads continue to use `DB` and remain fully
 // concurrent under WAL.
 //
-// Governing: ADR-0006 (SQLite + WAL + goose), SPEC-0001 REQ
-// "Account-Scoped Data" (every per-account table carries account_id;
-// enforced at the schema layer in migrations).
+// Governing: ADR-0006 (SQLite + WAL + goose), ADR-0012 (single-user
+// local-first; the schema is mailbox-scoped — per-mailbox tables carry
+// mailbox_id, enforced at the schema layer in migrations).
 package store
 
 import (
@@ -43,11 +44,11 @@ import (
 // concurrency-safe, so two parallel callers of Migrate can race on
 // them even though their target databases are independent.
 //
-// Scope: process-local only. This lock is sufficient for the v0.x
-// single-process Reduit deployment described in ADR-0006 ("the relay
-// is single-host", "single-file deployment", "Replication / HA is out
-// of scope") and for parallel `go test` runs that open many fresh
-// stores.
+// Scope: process-local only. This lock is sufficient for the
+// single-process Reduit binary described in ADR-0006 ("single-file
+// deployment", "Replication / HA is out of scope") and ADR-0012
+// (single-user local-first; one process owns the data directory) and
+// for parallel `go test` runs that open many fresh stores.
 //
 // DECISION (item #20.3): a database-level advisory lock around
 // goose.Up (e.g. BEGIN IMMEDIATE) is deliberately NOT added. It would
@@ -136,9 +137,10 @@ func (s *Store) Path() string { return s.path }
 
 // WriterDB returns the single-connection writer pool. Callers whose
 // writes would otherwise contend on SQLITE_BUSY at BEGIN IMMEDIATE
-// time (e.g. internal/mailbox.AssignUID) should issue their writes
-// through this handle. The connection cap of 1 means transactions
-// queue at the database/sql layer instead of racing the file lock.
+// time (any hot, frequently-contended write path) should issue their
+// writes through this handle. The connection cap of 1 means
+// transactions queue at the database/sql layer instead of racing the
+// file lock.
 //
 // Reads should continue to use `DB` so WAL's many-readers-one-writer
 // concurrency story is preserved.
@@ -168,48 +170,6 @@ func (s *Store) Close() error {
 		}
 	}
 	return first
-}
-
-// CheckpointTruncate forces a full WAL checkpoint in TRUNCATE mode and
-// verifies it actually flushed every committed frame from the -wal file
-// into the main database, then truncated the WAL to zero length.
-//
-// Why this exists: the store opens SQLite with synchronous=NORMAL + WAL
-// (see buildDSN). Under that pragma a COMMIT is durable against an
-// application crash, but NOT against an OS crash / power loss until the
-// next checkpoint — committed frames can still live only in the -wal
-// file, which has not necessarily been fsynced. `master-key rotate`
-// relies on "DB committed before key-file swap" as its crash-safety
-// ordering; that ordering is only TRUE if the committed re-wrapped
-// envelopes have actually reached the main database file before the key
-// file is swapped. This call provides that guarantee: a successful
-// TRUNCATE checkpoint fsyncs the database file and empties the WAL.
-//
-// PRAGMA wal_checkpoint(TRUNCATE) returns a single row (busy, log,
-// checkpointed):
-//   - busy != 0 means the checkpoint could NOT run to completion because
-//     another connection held a read/write lock — we treat that as an
-//     error so rotate refuses to proceed to the key swap.
-//   - log/checkpointed are the WAL frame counts; TRUNCATE resets the WAL
-//     to zero, so after success both are 0.
-//
-// The checkpoint is issued on the single-connection writer pool so it
-// does not race a concurrent reader on `DB` mid-checkpoint.
-//
-// Governing: ADR-0006 (SQLite + WAL, synchronous=NORMAL); #50.
-func (s *Store) CheckpointTruncate() error {
-	if s == nil || s.writer == nil {
-		return errors.New("store: not open")
-	}
-	var busy, logFrames, checkpointed int
-	row := s.writer.QueryRow("PRAGMA wal_checkpoint(TRUNCATE);")
-	if err := row.Scan(&busy, &logFrames, &checkpointed); err != nil {
-		return fmt.Errorf("store: wal_checkpoint(TRUNCATE): %w", err)
-	}
-	if busy != 0 {
-		return fmt.Errorf("store: wal_checkpoint(TRUNCATE) reported busy=%d; another connection holds the WAL lock", busy)
-	}
-	return nil
 }
 
 // Migrate runs all unapplied goose migrations. If `dirOverride` is

@@ -18,7 +18,7 @@ var Version = "0.1.0-dev"
 // NewRootCmd returns the root command tree. Subcommands are added here
 // as foundation stories complete.
 //
-// Governing: ADR-0012 (single-user local-first, no relay, no OIDC).
+// Governing: ADR-0012 (single-user local-first).
 func NewRootCmd() *cobra.Command {
 	var (
 		cfgPath string
@@ -30,7 +30,7 @@ func NewRootCmd() *cobra.Command {
 		Short: "Local-first Proton Mail CLI with semantic search and MCP",
 		Long: `Reduit caches Proton Mail locally, embeds messages for semantic
 search, and exposes a stdio MCP server for AI agents. It is a
-per-person, local-first tool — not an IMAP/SMTP relay.`,
+per-person, local-first tool that runs entirely on your machine.`,
 		Version:       Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
