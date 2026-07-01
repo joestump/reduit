@@ -3,9 +3,80 @@ package proton
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	gpa "github.com/ProtonMail/go-proton-api"
 )
+
+// HVRequiredError is a typed human-verification (CAPTCHA) challenge carried out
+// of Login/LoginWithHV so the CLI can SOLVE it rather than merely report it
+// (SPEC-0007 scenario "Human verification / CAPTCHA is requested"). Proton
+// returns code 9001 with the challenge details; this type carries the offered
+// Methods (e.g. "captcha", "email", "sms") and the challenge Token the solver
+// fetches the CAPTCHA with and, once solved, retries the login with. It unwraps
+// to ErrHumanVerification so existing errors.Is checks keep working.
+//
+// Governing: SPEC-0007 REQ "SRP and 2FA Handling", ADR-0001.
+type HVRequiredError struct {
+	// Methods are the human-verification methods Proton will accept. reduit
+	// only solves "captcha"; the CLI reports the offered set when it cannot.
+	Methods []string
+	// Token is the HV challenge token. It is not a login secret, but it is not
+	// echoed in Error() to keep failure logs clean.
+	Token string
+}
+
+// Error describes the challenge without echoing the token.
+func (e *HVRequiredError) Error() string {
+	if len(e.Methods) == 0 {
+		return ErrHumanVerification.Error()
+	}
+	return fmt.Sprintf("%s (methods: %s)", ErrHumanVerification.Error(), strings.Join(e.Methods, ", "))
+}
+
+// Unwrap lets errors.Is(err, ErrHumanVerification) match an *HVRequiredError,
+// preserving the sentinel-based branching callers already use.
+func (e *HVRequiredError) Unwrap() error { return ErrHumanVerification }
+
+// AsHVRequired reports whether err is (or wraps) an *HVRequiredError, returning
+// it so the caller can drive the CAPTCHA solve. It is the CLI's branch point
+// after Login.
+func AsHVRequired(err error) (*HVRequiredError, bool) {
+	var hv *HVRequiredError
+	if errors.As(err, &hv) {
+		return hv, true
+	}
+	return nil, false
+}
+
+// hvRequiredFrom builds an *HVRequiredError from a go-proton-api HV APIError,
+// reporting false when err is not a human-verification error or its details do
+// not parse. The Methods/Token come from the upstream APIHVDetails payload.
+func hvRequiredFrom(err error) (*HVRequiredError, bool) {
+	apiErr, ok := gpaAPIError(err)
+	if !ok || !apiErr.IsHVError() {
+		return nil, false
+	}
+	details, derr := apiErr.GetHVDetails()
+	if derr != nil {
+		return nil, false
+	}
+	return &HVRequiredError{Methods: details.Methods, Token: details.Token}, true
+}
+
+// gpaAPIError unwraps err to a *gpa.APIError, handling both the pointer and
+// by-value shapes go-proton-api returns from different paths.
+func gpaAPIError(err error) (*gpa.APIError, bool) {
+	var apiErr *gpa.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr, true
+	}
+	var apiErrVal gpa.APIError
+	if errors.As(err, &apiErrVal) {
+		return &apiErrVal, true
+	}
+	return nil, false
+}
 
 // Sentinel errors let the auth/sync/send layers branch on a failure's meaning
 // without parsing go-proton-api's wire errors or its messages. classifyError
@@ -101,15 +172,10 @@ func classifyError(err error) error {
 		return fmt.Errorf("%w: %v", ErrNetwork, netErr)
 	}
 
-	// API-level failures carry a numeric Proton code.
-	var apiErr *gpa.APIError
-	if errors.As(err, &apiErr) {
+	// API-level failures carry a numeric Proton code. Handles both the pointer
+	// and by-value shapes upstream returns from different paths.
+	if apiErr, ok := gpaAPIError(err); ok {
 		return classifyAPICode(apiErr)
-	}
-	// Some upstream paths return APIError by value rather than pointer.
-	var apiErrVal gpa.APIError
-	if errors.As(err, &apiErrVal) {
-		return classifyAPICode(&apiErrVal)
 	}
 
 	return fmt.Errorf("proton: %w", err)

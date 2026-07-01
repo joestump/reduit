@@ -114,17 +114,60 @@ type gpaClient struct {
 var _ Client = (*gpaClient)(nil)
 
 // Login runs the SRP password exchange via go-proton-api (SPEC-0007 REQ "SRP
-// and 2FA Handling"). reduit never implements SRP itself.
+// and 2FA Handling"). reduit never implements SRP itself. When Proton demands
+// human verification (code 9001), Login returns a typed *HVRequiredError so the
+// CLI can solve the CAPTCHA and retry via LoginWithHV, rather than dying with a
+// generic "login failed" (SPEC-0007 scenario "Human verification / CAPTCHA is
+// requested").
 func (c *gpaClient) Login(ctx context.Context, address string, password []byte) (AuthStatus, error) {
 	cli, auth, err := c.mgr.NewClientWithLogin(ctx, address, password)
 	if err != nil {
+		if hv, ok := hvRequiredFrom(err); ok {
+			return AuthStatus{}, hv
+		}
 		return AuthStatus{}, classifyError(err)
 	}
+	return c.applyAuth(cli, auth), nil
+}
+
+// Captcha fetches the CAPTCHA challenge HTML for an HV token from a Login that
+// reported human verification (SPEC-0007, ADR-0001). The bytes are Proton's
+// self-contained captcha page; the CLI serves them from a loopback origin so
+// the operator can solve the challenge in a browser.
+func (c *gpaClient) Captcha(ctx context.Context, token string) ([]byte, error) {
+	return c.mgr.GetCaptcha(ctx, token)
+}
+
+// LoginWithHV retries the SRP password exchange carrying a solved human-
+// verification token (SPEC-0007, ADR-0001). It mirrors Login's post-processing;
+// if Proton STILL demands verification (an expired or rejected token) it returns
+// an *HVRequiredError again so the caller can report a clean "solve it again".
+func (c *gpaClient) LoginWithHV(ctx context.Context, address string, password []byte, hvToken string) (AuthStatus, error) {
+	// Methods is "captcha" by construction: the CLI solver only ever calls this
+	// after gating on a captcha challenge (email/SMS HV is not yet supported), so
+	// the solved token is always a captcha token.
+	cli, auth, err := c.mgr.NewClientWithLoginWithHVToken(ctx, address, password,
+		&gpa.APIHVDetails{Methods: []string{"captcha"}, Token: hvToken})
+	if err != nil {
+		if hv, ok := hvRequiredFrom(err); ok {
+			return AuthStatus{}, hv
+		}
+		return AuthStatus{}, classifyError(err)
+	}
+	return c.applyAuth(cli, auth), nil
+}
+
+// applyAuth records the authenticated session from a successful login and
+// derives the reduit AuthStatus. It is the shared post-login processing for
+// Login and LoginWithHV: store the client, session UID, immutable
+// proton_user_id, and rotated refresh token, and compute the 2FA state. The
+// mailbox keyring is loaded later by Unlock, not here.
+func (c *gpaClient) applyAuth(cli *gpa.Client, auth gpa.Auth) AuthStatus {
 	c.cli = cli
 	c.uid = auth.UID
 	c.userID = auth.UserID
 	c.refreshToken = auth.RefreshToken
-	return AuthStatus{ProtonUserID: auth.UserID, TwoFA: classify2FA(auth.TwoFA)}, nil
+	return AuthStatus{ProtonUserID: auth.UserID, TwoFA: classify2FA(auth.TwoFA)}
 }
 
 // SubmitTOTP completes a login that reported TwoFATOTP.

@@ -31,6 +31,24 @@ type Client interface {
 	// not retain or log it.
 	Login(ctx context.Context, address string, password []byte) (AuthStatus, error)
 
+	// Captcha fetches the CAPTCHA challenge HTML for a human-verification token
+	// returned by a Login that failed with an *HVRequiredError (SPEC-0007
+	// scenario "Human verification / CAPTCHA is requested", ADR-0001). The
+	// returned bytes are Proton's self-contained captcha page; the CLI re-serves
+	// them from a loopback origin so the operator can solve the challenge in a
+	// browser and postMessage back the solved token.
+	Captcha(ctx context.Context, token string) ([]byte, error)
+
+	// LoginWithHV retries the SRP password exchange carrying a solved human-
+	// verification token, after Login returned an *HVRequiredError (SPEC-0007,
+	// ADR-0001). It mirrors Login: the returned AuthStatus reports the
+	// proton_user_id and any remaining 2FA challenge, so the flow continues into
+	// SubmitTOTP/Unlock exactly as a non-HV login would. If Proton still demands
+	// verification (an expired or rejected token) the returned error is again an
+	// *HVRequiredError. password is the caller's buffer; it is not retained or
+	// logged.
+	LoginWithHV(ctx context.Context, address string, password []byte, hvToken string) (AuthStatus, error)
+
 	// SubmitTOTP submits a TOTP code to complete a login that reported
 	// TwoFATOTP (SPEC-0007 scenario "TOTP 2FA is required"). It is an error to
 	// call this when no 2FA challenge is pending.

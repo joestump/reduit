@@ -23,8 +23,24 @@ type Fake struct {
 	// Token is the current refresh token; rotated values can be scripted via
 	// RefreshTokens.
 	Token string
-	// TwoFA is the 2FA state Login reports.
+	// TwoFA is the 2FA state Login (or LoginWithHV, once HV is passed) reports.
 	TwoFA TwoFAState
+
+	// HVChallenge, when non-nil, makes the FIRST Login fail with it — modeling
+	// Proton's 9001 anti-abuse wall — so tests can drive the CAPTCHA solve →
+	// LoginWithHV → 2FA → unlock sequence. Later Logins (and a LoginWithHV with
+	// an accepted token) succeed. A LoginWithHV whose token is rejected (see
+	// HVToken) fails with this same challenge again, modeling an expired/failed
+	// token.
+	HVChallenge *HVRequiredError
+	// CaptchaHTML is returned by Captcha; CaptchaErr, when set, is returned
+	// instead.
+	CaptchaHTML []byte
+	CaptchaErr  error
+	// HVToken, when non-empty, is the only solved token LoginWithHV accepts; any
+	// other value re-issues HVChallenge (or ErrHumanVerification if none is set).
+	// Empty accepts any token.
+	HVToken string
 	// TOTPCode, when non-empty, is the only code SubmitTOTP accepts; any other
 	// code yields ErrAuthFailed. Empty accepts any code.
 	TOTPCode string
@@ -63,6 +79,8 @@ type Fake struct {
 
 	Sent          []OutgoingMessage
 	TOTPSubmitted []string
+	CaptchaTokens []string // tokens passed to Captcha
+	HVTokens      []string // solved tokens passed to LoginWithHV
 	RefreshCalls  int
 	Closed        bool
 
@@ -70,6 +88,7 @@ type Fake struct {
 	authed   bool
 	unlocked bool
 	pending  bool // 2FA outstanding
+	hvIssued bool // first HVChallenge has been handed out
 	batchIdx int
 }
 
@@ -88,6 +107,36 @@ func (f *Fake) Login(_ context.Context, _ string, _ []byte) (AuthStatus, error) 
 	defer f.mu.Unlock()
 	if f.LoginErr != nil {
 		return AuthStatus{}, f.LoginErr
+	}
+	if f.HVChallenge != nil && !f.hvIssued {
+		f.hvIssued = true
+		return AuthStatus{}, f.HVChallenge
+	}
+	f.authed = true
+	f.pending = f.TwoFA == TwoFATOTP
+	return AuthStatus{ProtonUserID: f.UserID, TwoFA: f.TwoFA}, nil
+}
+
+func (f *Fake) Captcha(_ context.Context, token string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.CaptchaTokens = append(f.CaptchaTokens, token)
+	if f.CaptchaErr != nil {
+		return nil, f.CaptchaErr
+	}
+	return f.CaptchaHTML, nil
+}
+
+func (f *Fake) LoginWithHV(_ context.Context, _ string, _ []byte, hvToken string) (AuthStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.HVTokens = append(f.HVTokens, hvToken)
+	if f.HVToken != "" && hvToken != f.HVToken {
+		// Token rejected/expired: Proton re-issues the challenge.
+		if f.HVChallenge != nil {
+			return AuthStatus{}, f.HVChallenge
+		}
+		return AuthStatus{}, ErrHumanVerification
 	}
 	f.authed = true
 	f.pending = f.TwoFA == TwoFATOTP

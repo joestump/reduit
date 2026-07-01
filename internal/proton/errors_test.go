@@ -70,3 +70,53 @@ func TestErrorsNeverContainSecrets(t *testing.T) {
 		t.Fatalf("classified error leaked secret: %q", got.Error())
 	}
 }
+
+// TestHVRequiredError_FromLogin verifies that a go-proton-api human-verification
+// APIError (code 9001) is surfaced as a typed *HVRequiredError carrying the
+// offered methods and challenge token, that it still satisfies
+// errors.Is(ErrHumanVerification) for existing callers, and that AsHVRequired
+// recovers it even when wrapped. The token is never echoed in Error().
+func TestHVRequiredError_FromLogin(t *testing.T) {
+	apiErr := &gpa.APIError{
+		Code:    gpa.HumanVerificationRequired,
+		Status:  422,
+		Message: "Human verification required",
+		Details: gpa.ErrDetails(`{"HumanVerificationMethods":["captcha","email"],"HumanVerificationToken":"challenge-tok-xyz"}`),
+	}
+
+	hv, ok := hvRequiredFrom(apiErr)
+	if !ok {
+		t.Fatal("hvRequiredFrom did not recognize the HV error")
+	}
+	if len(hv.Methods) != 2 || hv.Methods[0] != "captcha" {
+		t.Errorf("methods = %v, want [captcha email]", hv.Methods)
+	}
+	if hv.Token != "challenge-tok-xyz" {
+		t.Errorf("token = %q, want challenge-tok-xyz", hv.Token)
+	}
+	// Backward-compatible sentinel branch.
+	if !errors.Is(hv, ErrHumanVerification) {
+		t.Error("HVRequiredError does not unwrap to ErrHumanVerification")
+	}
+	// Recoverable when wrapped.
+	if got, ok := AsHVRequired(fmt.Errorf("login failed: %w", hv)); !ok || got.Token != "challenge-tok-xyz" {
+		t.Errorf("AsHVRequired failed to recover wrapped HV error: %v %v", got, ok)
+	}
+	// Error() names the methods but never the token.
+	if strings.Contains(hv.Error(), "challenge-tok-xyz") {
+		t.Errorf("HV error leaked token: %q", hv.Error())
+	}
+	if !strings.Contains(hv.Error(), "captcha") {
+		t.Errorf("HV error omits methods: %q", hv.Error())
+	}
+}
+
+// TestHVRequiredFrom_NonHV confirms a non-HV error is not misclassified.
+func TestHVRequiredFrom_NonHV(t *testing.T) {
+	if _, ok := hvRequiredFrom(&gpa.APIError{Code: gpa.PasswordWrong}); ok {
+		t.Error("hvRequiredFrom matched a non-HV error")
+	}
+	if _, ok := AsHVRequired(ErrAuthFailed); ok {
+		t.Error("AsHVRequired matched a plain sentinel")
+	}
+}
