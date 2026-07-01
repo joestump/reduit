@@ -21,6 +21,7 @@ require (
 	github.com/pressly/goose/v3 v3.27.1
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
+	github.com/webview/webview_go v0.0.0-20240831120633-6173450d4dd6
 	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/term v0.44.0
 	modernc.org/sqlite v1.50.0
