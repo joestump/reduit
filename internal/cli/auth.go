@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -37,6 +38,10 @@ var (
 	openKeychain = func() keychain.Store { return keychain.New() }
 	dialProton   = func(cfg proton.Config) dialerCloser { return proton.NewDialer(cfg) }
 	newPrompter  = func() prompter { return newTerminalPrompter() }
+	// detectAppVersion resolves Proton's current web app-version when the
+	// operator leaves proton.app_version unset (or "auto"). Overridable in
+	// tests to assert an explicit configured value bypasses the network fetch.
+	detectAppVersion = proton.DetectAppVersion
 )
 
 func newAuthCmd(cfgPath *string, verbose *bool) *cobra.Command {
@@ -55,13 +60,29 @@ func newAuthCmd(cfgPath *string, verbose *bool) *cobra.Command {
 }
 
 // protonConfig builds the non-secret dialer config from the operator's config.
-// AppVersion and HostURL are operator-overridable (proton.app_version /
-// proton.host_url, REDUIT_PROTON_*) so a Proton app-version rejection is fixable
-// without a recompile; the logger is the shim that never receives secret values
-// (gpa_client.go).
-func protonConfig(cfg config.Config, logger *slog.Logger) proton.Config {
+// HostURL is operator-overridable (proton.host_url / REDUIT_PROTON_HOST_URL);
+// the logger is the shim that never receives secret values (gpa_client.go).
+//
+// AppVersion resolution: an explicit proton.app_version (config or
+// REDUIT_PROTON_APP_VERSION) is used verbatim and wins — no network fetch. When
+// it is unset (the default) or the literal "auto", reduit auto-detects Proton's
+// current "web-mail@<version>" here (proton.DetectAppVersion). Detection has its
+// own short timeout and returns a usable fallback on any error, so an offline
+// run still gets an acceptable header rather than blocking startup.
+func protonConfig(ctx context.Context, cfg config.Config, logger *slog.Logger) proton.Config {
+	appVersion := cfg.Proton.AppVersion
+	if appVersion == "" || strings.EqualFold(appVersion, "auto") {
+		detected, err := detectAppVersion(ctx)
+		if err != nil {
+			logger.Warn("proton app-version auto-detect failed; using fallback",
+				"app_version", detected, "error", err)
+		} else {
+			logger.Debug("proton app-version auto-detected", "app_version", detected)
+		}
+		appVersion = detected
+	}
 	return proton.Config{
-		AppVersion: cfg.Proton.AppVersion,
+		AppVersion: appVersion,
 		HostURL:    cfg.Proton.HostURL,
 		Logger:     logger,
 	}
@@ -84,7 +105,7 @@ func newAuthAddCmd(cfgPath *string, verbose *bool) *cobra.Command {
 			}
 			defer st.Close()
 
-			dialer := dialProton(protonConfig(cfg, logger))
+			dialer := dialProton(protonConfig(cmd.Context(), cfg, logger))
 			defer dialer.Close()
 
 			return authAdd(cmd.Context(), st, openKeychain(), dialer, newPrompter(),
@@ -372,7 +393,7 @@ func newAuthRefreshCmd(cfgPath *string, verbose *bool) *cobra.Command {
 			}
 			defer st.Close()
 
-			dialer := dialProton(protonConfig(cfg, logger))
+			dialer := dialProton(protonConfig(cmd.Context(), cfg, logger))
 			defer dialer.Close()
 
 			return authRefresh(cmd.Context(), st, openKeychain(), dialer, newPrompter(), args[0], cmd.OutOrStdout())

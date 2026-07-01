@@ -117,8 +117,8 @@ func TestLoad_LLMEnvOverrides(t *testing.T) {
 
 func TestDefaults_ProtonAppVersion(t *testing.T) {
 	cfg := Defaults()
-	if cfg.Proton.AppVersion != "Other" {
-		t.Errorf("Proton.AppVersion = %q, want Other", cfg.Proton.AppVersion)
+	if cfg.Proton.AppVersion != "" {
+		t.Errorf("Proton.AppVersion = %q, want empty (auto-detect)", cfg.Proton.AppVersion)
 	}
 	if cfg.Proton.HostURL != "" {
 		t.Errorf("Proton.HostURL = %q, want empty (production default)", cfg.Proton.HostURL)

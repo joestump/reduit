@@ -40,7 +40,7 @@ authentication and connectivity to Proton are working.`,
 			}
 			defer st.Close()
 
-			dialer := dialProton(protonConfig(cfg, logger))
+			dialer := dialProton(protonConfig(cmd.Context(), cfg, logger))
 			defer dialer.Close()
 
 			return runLabels(cmd.Context(), st, openKeychain(), dialer, mailbox, cmd.OutOrStdout())

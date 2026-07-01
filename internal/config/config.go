@@ -97,10 +97,15 @@ type LLMConfig struct {
 type ProtonConfig struct {
 	// AppVersion is the app-version string presented to Proton as the
 	// x-pm-appversion header. Proton VALIDATES this and rejects unacceptable
-	// values (code 5001 missing, 5003 bad), so it is overridable: if the real
-	// API rejects the default, the operator can set a value Proton accepts
-	// without a recompile. Sourced from config (proton.app_version) or
-	// REDUIT_PROTON_APP_VERSION. Defaults to "Other".
+	// values (code 5001 missing, 5003 bad).
+	//
+	// It defaults to empty, which means AUTO-DETECT: at auth/labels time reduit
+	// fetches Proton's currently-published web release and presents
+	// "web-mail@<version>" (see proton.DetectAppVersion). The literal "auto"
+	// forces the same behaviour explicitly. Any other value is used verbatim
+	// with no fetch, so the operator can pin a value Proton accepts without a
+	// recompile if the detected one is ever rejected. Sourced from config
+	// (proton.app_version) or REDUIT_PROTON_APP_VERSION.
 	AppVersion string `mapstructure:"app_version"`
 	// HostURL is the Proton API base URL. Empty targets go-proton-api's default
 	// production host; set it only to point at a test/self-hosted server.
@@ -140,9 +145,10 @@ func Defaults() Config {
 			// operator deliberately points it somewhere.
 		},
 		Proton: ProtonConfig{
-			// "Other" is go-proton-api's generic third-party app-version value;
-			// overridable via config/env if Proton rejects it (code 5003).
-			AppVersion: "Other",
+			// Empty = auto-detect: protonConfig() resolves the live
+			// "web-mail@<version>" at auth/labels time (proton.DetectAppVersion).
+			// An explicit config/env value wins and skips the fetch.
+			AppVersion: "",
 		},
 		Logger: LoggerConfig{
 			Level:  "info",
