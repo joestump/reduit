@@ -99,13 +99,16 @@ type ProtonConfig struct {
 	// x-pm-appversion header. Proton VALIDATES this and rejects unacceptable
 	// values (code 5001 missing, 5003 bad).
 	//
-	// It defaults to empty, which means AUTO-DETECT: at auth/labels time reduit
-	// fetches Proton's currently-published web release and presents
-	// "web-mail@<version>" (see proton.DetectAppVersion). The literal "auto"
-	// forces the same behaviour explicitly. Any other value is used verbatim
-	// with no fetch, so the operator can pin a value Proton accepts without a
-	// recompile if the detected one is ever rejected. Sourced from config
-	// (proton.app_version) or REDUIT_PROTON_APP_VERSION.
+	// It defaults to empty, which resolves to proton.DefaultAppVersion
+	// ("Bridge_3.0.0+reduit"). Identifying as a Bridge variant is deliberate:
+	// Proton's anti-abuse challenges the web client with a CAPTCHA but waves the
+	// Bridge family through, so this avoids human verification (see
+	// proton.DefaultAppVersion / ADR-0021). The literal "auto" instead
+	// auto-detects "web-mail@<version>" — which Proton WILL challenge, so it is
+	// opt-in only. Any other value is used verbatim. Whatever value is chosen
+	// must be used consistently across auth and later commands (Proton binds the
+	// session to it; a mismatch yields 10013 invalid refresh token). Sourced from
+	// config (proton.app_version) or REDUIT_PROTON_APP_VERSION.
 	AppVersion string `mapstructure:"app_version"`
 	// HostURL is the Proton API base URL. Empty targets go-proton-api's default
 	// production host; set it only to point at a test/self-hosted server.
@@ -145,9 +148,10 @@ func Defaults() Config {
 			// operator deliberately points it somewhere.
 		},
 		Proton: ProtonConfig{
-			// Empty = auto-detect: protonConfig() resolves the live
-			// "web-mail@<version>" at auth/labels time (proton.DetectAppVersion).
-			// An explicit config/env value wins and skips the fetch.
+			// Empty resolves to proton.DefaultAppVersion ("Bridge_3.0.0+reduit")
+			// in protonConfig() — the Bridge client family avoids Proton's
+			// CAPTCHA. The literal "auto" instead detects "web-mail@<version>"
+			// (opt-in; Proton challenges the web client). An explicit value wins.
 			AppVersion: "",
 		},
 		Logger: LoggerConfig{

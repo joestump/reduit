@@ -63,15 +63,27 @@ func newAuthCmd(cfgPath *string, verbose *bool) *cobra.Command {
 // HostURL is operator-overridable (proton.host_url / REDUIT_PROTON_HOST_URL);
 // the logger is the shim that never receives secret values (gpa_client.go).
 //
-// AppVersion resolution: an explicit proton.app_version (config or
-// REDUIT_PROTON_APP_VERSION) is used verbatim and wins — no network fetch. When
-// it is unset (the default) or the literal "auto", reduit auto-detects Proton's
-// current "web-mail@<version>" here (proton.DetectAppVersion). Detection has its
-// own short timeout and returns a usable fallback on any error, so an offline
-// run still gets an acceptable header rather than blocking startup.
+// AppVersion resolution (order matters — the DEFAULT deliberately avoids the
+// web client's human-verification wall):
+//   - explicit proton.app_version / REDUIT_PROTON_APP_VERSION → used verbatim.
+//   - the literal "auto" → auto-detect Proton's current "web-mail@<version>"
+//     (proton.DetectAppVersion). NOTE this presents as the web client, which
+//     Proton reliably challenges with a 9001 CAPTCHA — opt-in only.
+//   - unset (the default) → proton.DefaultAppVersion ("Bridge_3.0.0+reduit").
+//     Proton's anti-abuse waves the Bridge client family through without a
+//     CAPTCHA (the mechanism the old relay Reduit relied on).
+//
+// The SAME value must be presented at mint (auth) and at resume (labels/sync),
+// because Proton binds the session to the app-version that created it —
+// resuming under a different client yields 10013 "invalid refresh token". A
+// single default satisfies that for the normal path; an operator who overrides
+// must do so consistently across commands.
 func protonConfig(ctx context.Context, cfg config.Config, logger *slog.Logger) proton.Config {
 	appVersion := cfg.Proton.AppVersion
-	if appVersion == "" || strings.EqualFold(appVersion, "auto") {
+	switch {
+	case appVersion == "":
+		appVersion = proton.DefaultAppVersion
+	case strings.EqualFold(appVersion, "auto"):
 		detected, err := detectAppVersion(ctx)
 		if err != nil {
 			logger.Warn("proton app-version auto-detect failed; using fallback",

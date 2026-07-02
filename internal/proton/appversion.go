@@ -25,6 +25,22 @@ import (
 // version (e.g. web-mail@5.0.0) is also rejected, so pinning a stale constant
 // eventually breaks — hence auto-detection.
 const (
+	// DefaultAppVersion is the x-pm-appversion reduit presents unless the
+	// operator overrides it. It identifies reduit as a Proton Bridge variant.
+	//
+	// This is deliberate, not cosmetic: Proton's anti-abuse challenges the web
+	// client ("web-mail@…") with a 9001 CAPTCHA on effectively every fresh
+	// login, but waves the Bridge client family through — so a Bridge app-version
+	// avoids human verification entirely (confirmed live, and the mechanism the
+	// old relay Reduit relied on). Proton requires the shape "Bridge_<semver>+
+	// <suffix>": it regex-matches the semver, then checks the platform prefix is
+	// known — "go-proton-api" → code 2064, a bare "Bridge_<sha>" → 5002. The
+	// semver is pinned (Proton doesn't accept arbitrary versions anyway, so
+	// bumping per release is pointless); "+reduit" records the client identity.
+	// Identifying as bridge-like is honest: reduit relays a Proton mailbox to a
+	// local user, exactly Bridge's role. Governing: ADR-0001, ADR-0021.
+	DefaultAppVersion = "Bridge_3.0.0+reduit"
+
 	// versionURL is Proton's published web-mail version manifest.
 	versionURL = "https://mail.proton.me/assets/version.json"
 

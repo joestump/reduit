@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/joestump/reduit/internal/config"
+	"github.com/joestump/reduit/internal/proton"
 )
 
 // discardLogger is a logger that drops output; protonConfig only logs
@@ -46,20 +47,23 @@ func TestProtonConfig_ExplicitValueSkipsDetect(t *testing.T) {
 	}
 }
 
-func TestProtonConfig_UnsetTriggersDetect(t *testing.T) {
+func TestProtonConfig_UnsetUsesBridgeDefault(t *testing.T) {
+	// The default (unset) must resolve to the Bridge app-version — which avoids
+	// Proton's CAPTCHA — and must NOT auto-detect the web client (which Proton
+	// challenges). This is the fix for the whole human-verification saga.
 	calls := withDetectStub(t, "web-mail@5.0.121.4", nil)
 
-	cfg := config.Defaults() // AppVersion defaults to "" -> auto-detect
+	cfg := config.Defaults() // AppVersion defaults to "" -> Bridge default
 	if cfg.Proton.AppVersion != "" {
 		t.Fatalf("precondition: default AppVersion = %q, want empty", cfg.Proton.AppVersion)
 	}
 
 	got := protonConfig(context.Background(), cfg, discardLogger())
-	if got.AppVersion != "web-mail@5.0.121.4" {
-		t.Errorf("AppVersion = %q, want the detected %q", got.AppVersion, "web-mail@5.0.121.4")
+	if got.AppVersion != proton.DefaultAppVersion {
+		t.Errorf("AppVersion = %q, want the Bridge default %q", got.AppVersion, proton.DefaultAppVersion)
 	}
-	if *calls != 1 {
-		t.Errorf("detectAppVersion called %d times, want 1", *calls)
+	if *calls != 0 {
+		t.Errorf("detectAppVersion called %d times, want 0 (Bridge default does not fetch)", *calls)
 	}
 }
 
@@ -84,6 +88,7 @@ func TestProtonConfig_DetectErrorUsesFallback(t *testing.T) {
 	calls := withDetectStub(t, "web-mail@5.0.121.4", errors.New("offline"))
 
 	cfg := config.Defaults()
+	cfg.Proton.AppVersion = "auto" // detection is opt-in now
 
 	got := protonConfig(context.Background(), cfg, discardLogger())
 	if got.AppVersion != "web-mail@5.0.121.4" {
