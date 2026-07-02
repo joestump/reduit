@@ -31,9 +31,14 @@ type Config struct {
 }
 
 // GPADialer is the go-proton-api-backed Dialer. It owns a single *gpa.Manager
-// (the connection pool) and mints Clients from it.
+// (the connection pool) and mints Clients from it. It also retains the resolved
+// app-version and host so the Clients it mints can report them (Client.AppVersion
+// / Client.Host) — the CAPTCHA solver needs both to load Proton's captcha
+// wrapper in a controlled browser (ADR-0021).
 type GPADialer struct {
-	mgr *gpa.Manager
+	mgr        *gpa.Manager
+	appVersion string
+	hostURL    string
 }
 
 // NewDialer builds a GPADialer and its underlying go-proton-api Manager from
@@ -57,7 +62,7 @@ func NewDialer(cfg Config) *GPADialer {
 	if cfg.Transport != nil {
 		opts = append(opts, gpa.WithTransport(cfg.Transport))
 	}
-	return &GPADialer{mgr: gpa.New(opts...)}
+	return &GPADialer{mgr: gpa.New(opts...), appVersion: cfg.AppVersion, hostURL: cfg.HostURL}
 }
 
 // Close releases the Manager's pooled connections.
@@ -65,7 +70,7 @@ func (d *GPADialer) Close() { d.mgr.Close() }
 
 // NewClient returns a fresh unauthenticated client for the Login flow.
 func (d *GPADialer) NewClient() Client {
-	return &gpaClient{mgr: d.mgr}
+	return &gpaClient{mgr: d.mgr, appVersion: d.appVersion, hostURL: d.hostURL}
 }
 
 // Resume reconstructs an authenticated client from a stored refresh token
@@ -75,7 +80,7 @@ func (d *GPADialer) NewClient() Client {
 // supplies the passphrase to Unlock. The expected proton user id is verified to
 // catch a token that resolves a different account (SPEC-0007 "Re-Auth Flow").
 func (d *GPADialer) Resume(ctx context.Context, protonUserID, refreshToken string) (Client, error) {
-	c := &gpaClient{mgr: d.mgr, userID: protonUserID, refreshToken: refreshToken}
+	c := &gpaClient{mgr: d.mgr, appVersion: d.appVersion, hostURL: d.hostURL, userID: protonUserID, refreshToken: refreshToken}
 	// A resume needs a session UID; NewClientWithRefresh derives a fresh one
 	// from the refresh token. We have no stored UID here, so pass "" — the
 	// upstream auth-refresh path re-establishes the session from the token.
@@ -101,6 +106,9 @@ func (d *GPADialer) Resume(ctx context.Context, protonUserID, refreshToken strin
 type gpaClient struct {
 	mgr *gpa.Manager
 	cli *gpa.Client
+
+	appVersion string // resolved x-pm-appversion (may be "" → FallbackAppVersion)
+	hostURL    string // API base URL (may be "" → gpa.DefaultHostURL)
 
 	userID       string // immutable proton_user_id, set on Login/Resume
 	uid          string // go-proton-api session UID
@@ -230,6 +238,26 @@ func (c *gpaClient) Unlock(ctx context.Context, passphrase []byte) error {
 
 func (c *gpaClient) ProtonUserID() string { return c.userID }
 func (c *gpaClient) RefreshToken() string { return c.refreshToken }
+
+// AppVersion reports the x-pm-appversion this client sends, falling back to the
+// detection fallback so the CAPTCHA solver always has an acceptable header value
+// even when none was configured (ADR-0021).
+func (c *gpaClient) AppVersion() string {
+	if c.appVersion == "" {
+		return FallbackAppVersion
+	}
+	return c.appVersion
+}
+
+// Host reports the Proton API base URL this client targets, falling back to
+// go-proton-api's production default when unset so the CAPTCHA solver can always
+// build a wrapper URL (ADR-0021).
+func (c *gpaClient) Host() string {
+	if c.hostURL == "" {
+		return gpa.DefaultHostURL
+	}
+	return c.hostURL
+}
 
 // Refresh rotates the session from the stored refresh token.
 func (c *gpaClient) Refresh(ctx context.Context) error {

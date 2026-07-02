@@ -71,6 +71,20 @@ type Client interface {
 	// this after each and persist the new value to the keychain (ADR-0013).
 	RefreshToken() string
 
+	// AppVersion returns the resolved x-pm-appversion string this client sends
+	// (e.g. "web-mail@5.0.121.4"). The CAPTCHA solver needs it as a request
+	// header when it loads Proton's server-rendered captcha wrapper in a
+	// controlled browser (ADR-0021): the wrapper is an API endpoint and Proton
+	// rejects a browser navigation that omits an acceptable app-version. Never
+	// empty — a client configured without one reports the detection fallback.
+	AppVersion() string
+
+	// Host returns the Proton API base URL this client targets (default
+	// "https://mail.proton.me/api"). The CAPTCHA solver builds the captcha
+	// wrapper URL ({host}/core/v4/captcha?…) from it so an operator host-URL
+	// override is honored (ADR-0021). Never empty.
+	Host() string
+
 	// Refresh rotates the session using the stored refresh token
 	// (SPEC-0007 REQ "Secret Write, Read, and Delete" — secrets read
 	// non-interactively at use time). RefreshToken reflects the rotated value

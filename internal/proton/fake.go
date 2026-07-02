@@ -48,6 +48,12 @@ type Fake struct {
 	// other yields ErrUnlockFailed. Empty accepts any passphrase.
 	Passphrase string
 
+	// AppVer / HostURL back AppVersion() / Host(). Empty reports the same
+	// defaults the real client uses (FallbackAppVersion / mail.proton.me API),
+	// so a test that doesn't care about the CAPTCHA solver need not set them.
+	AppVer  string
+	HostURL string
+
 	// LoginErr/UnlockErr/RefreshErr/SendErr, when set, are returned by the
 	// corresponding method instead of succeeding.
 	LoginErr   error
@@ -189,6 +195,24 @@ func (f *Fake) RefreshToken() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.Token
+}
+
+func (f *Fake) AppVersion() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.AppVer != "" {
+		return f.AppVer
+	}
+	return FallbackAppVersion
+}
+
+func (f *Fake) Host() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.HostURL != "" {
+		return f.HostURL
+	}
+	return "https://mail.proton.me/api"
 }
 
 func (f *Fake) Refresh(_ context.Context) error {
