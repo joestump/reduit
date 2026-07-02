@@ -31,23 +31,17 @@ type Client interface {
 	// not retain or log it.
 	Login(ctx context.Context, address string, password []byte) (AuthStatus, error)
 
-	// Captcha fetches the CAPTCHA challenge HTML for a human-verification token
-	// returned by a Login that failed with an *HVRequiredError (SPEC-0007
-	// scenario "Human verification / CAPTCHA is requested", ADR-0001). The
-	// returned bytes are Proton's self-contained captcha page; the CLI re-serves
-	// them from a loopback origin so the operator can solve the challenge in a
-	// browser and postMessage back the solved token.
-	Captcha(ctx context.Context, token string) ([]byte, error)
-
-	// LoginWithHV retries the SRP password exchange carrying a solved human-
-	// verification token, after Login returned an *HVRequiredError (SPEC-0007,
-	// ADR-0001). It mirrors Login: the returned AuthStatus reports the
-	// proton_user_id and any remaining 2FA challenge, so the flow continues into
-	// SubmitTOTP/Unlock exactly as a non-HV login would. If Proton still demands
-	// verification (an expired or rejected token) the returned error is again an
+	// LoginWithHV retries the SRP password exchange after Login returned an
+	// *HVRequiredError, passing back the SAME challenge (its Methods and Token)
+	// once the operator has completed Proton's hosted human-verification page —
+	// which verifies the token server-side (SPEC-0007, ADR-0001). It mirrors
+	// Login: the returned AuthStatus reports the proton_user_id and any remaining
+	// 2FA challenge, so the flow continues into SubmitTOTP/Unlock exactly as a
+	// non-HV login would. If Proton still demands verification (the operator did
+	// not complete it, or it did not register) the returned error is again an
 	// *HVRequiredError. password is the caller's buffer; it is not retained or
 	// logged.
-	LoginWithHV(ctx context.Context, address string, password []byte, hvToken string) (AuthStatus, error)
+	LoginWithHV(ctx context.Context, address string, password []byte, hv *HVRequiredError) (AuthStatus, error)
 
 	// SubmitTOTP submits a TOTP code to complete a login that reported
 	// TwoFATOTP (SPEC-0007 scenario "TOTP 2FA is required"). It is an error to
@@ -70,20 +64,6 @@ type Client interface {
 	// rotates the refresh token on Login and Refresh, the caller must re-read
 	// this after each and persist the new value to the keychain (ADR-0013).
 	RefreshToken() string
-
-	// AppVersion returns the resolved x-pm-appversion string this client sends
-	// (e.g. "web-mail@5.0.121.4"). The CAPTCHA solver needs it as a request
-	// header when it loads Proton's server-rendered captcha wrapper in a
-	// controlled browser (ADR-0021): the wrapper is an API endpoint and Proton
-	// rejects a browser navigation that omits an acceptable app-version. Never
-	// empty — a client configured without one reports the detection fallback.
-	AppVersion() string
-
-	// Host returns the Proton API base URL this client targets (default
-	// "https://mail.proton.me/api"). The CAPTCHA solver builds the captcha
-	// wrapper URL ({host}/core/v4/captcha?…) from it so an operator host-URL
-	// override is honored (ADR-0021). Never empty.
-	Host() string
 
 	// Refresh rotates the session using the stored refresh token
 	// (SPEC-0007 REQ "Secret Write, Read, and Delete" — secrets read

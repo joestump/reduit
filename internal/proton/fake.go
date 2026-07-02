@@ -27,16 +27,12 @@ type Fake struct {
 	TwoFA TwoFAState
 
 	// HVChallenge, when non-nil, makes the FIRST Login fail with it — modeling
-	// Proton's 9001 anti-abuse wall — so tests can drive the CAPTCHA solve →
-	// LoginWithHV → 2FA → unlock sequence. Later Logins (and a LoginWithHV with
+	// Proton's 9001 anti-abuse wall — so tests can drive the human-verification
+	// → LoginWithHV → 2FA → unlock sequence. Later Logins (and a LoginWithHV with
 	// an accepted token) succeed. A LoginWithHV whose token is rejected (see
-	// HVToken) fails with this same challenge again, modeling an expired/failed
-	// token.
+	// HVToken) fails with this same challenge again, modeling verification that
+	// did not register.
 	HVChallenge *HVRequiredError
-	// CaptchaHTML is returned by Captcha; CaptchaErr, when set, is returned
-	// instead.
-	CaptchaHTML []byte
-	CaptchaErr  error
 	// HVToken, when non-empty, is the only solved token LoginWithHV accepts; any
 	// other value re-issues HVChallenge (or ErrHumanVerification if none is set).
 	// Empty accepts any token.
@@ -47,12 +43,6 @@ type Fake struct {
 	// Passphrase, when non-empty, is the only passphrase Unlock accepts; any
 	// other yields ErrUnlockFailed. Empty accepts any passphrase.
 	Passphrase string
-
-	// AppVer / HostURL back AppVersion() / Host(). Empty reports the same
-	// defaults the real client uses (FallbackAppVersion / mail.proton.me API),
-	// so a test that doesn't care about the CAPTCHA solver need not set them.
-	AppVer  string
-	HostURL string
 
 	// LoginErr/UnlockErr/RefreshErr/SendErr, when set, are returned by the
 	// corresponding method instead of succeeding.
@@ -85,7 +75,6 @@ type Fake struct {
 
 	Sent          []OutgoingMessage
 	TOTPSubmitted []string
-	CaptchaTokens []string // tokens passed to Captcha
 	HVTokens      []string // solved tokens passed to LoginWithHV
 	RefreshCalls  int
 	Closed        bool
@@ -123,21 +112,11 @@ func (f *Fake) Login(_ context.Context, _ string, _ []byte) (AuthStatus, error) 
 	return AuthStatus{ProtonUserID: f.UserID, TwoFA: f.TwoFA}, nil
 }
 
-func (f *Fake) Captcha(_ context.Context, token string) ([]byte, error) {
+func (f *Fake) LoginWithHV(_ context.Context, _ string, _ []byte, hv *HVRequiredError) (AuthStatus, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.CaptchaTokens = append(f.CaptchaTokens, token)
-	if f.CaptchaErr != nil {
-		return nil, f.CaptchaErr
-	}
-	return f.CaptchaHTML, nil
-}
-
-func (f *Fake) LoginWithHV(_ context.Context, _ string, _ []byte, hvToken string) (AuthStatus, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.HVTokens = append(f.HVTokens, hvToken)
-	if f.HVToken != "" && hvToken != f.HVToken {
+	f.HVTokens = append(f.HVTokens, hv.Token)
+	if f.HVToken != "" && hv.Token != f.HVToken {
 		// Token rejected/expired: Proton re-issues the challenge.
 		if f.HVChallenge != nil {
 			return AuthStatus{}, f.HVChallenge
@@ -195,24 +174,6 @@ func (f *Fake) RefreshToken() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.Token
-}
-
-func (f *Fake) AppVersion() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.AppVer != "" {
-		return f.AppVer
-	}
-	return FallbackAppVersion
-}
-
-func (f *Fake) Host() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.HostURL != "" {
-		return f.HostURL
-	}
-	return "https://mail.proton.me/api"
 }
 
 func (f *Fake) Refresh(_ context.Context) error {
