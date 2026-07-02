@@ -213,7 +213,7 @@ func interactiveAuth(ctx context.Context, client proton.Client, p prompter, addr
 		if !ok {
 			return nil, fmt.Errorf("login failed: %w", err)
 		}
-		status, err = solveCaptchaHV(ctx, client, address, password, hv, out, p)
+		status, err = solveCaptchaHV(ctx, client, address, password, hv, out)
 		if err != nil {
 			return nil, err
 		}
