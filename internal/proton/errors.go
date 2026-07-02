@@ -100,6 +100,15 @@ var (
 	// maps this to the needs_reauth state.
 	ErrRefreshTokenInvalid = errors.New("proton: refresh token invalid")
 
+	// ErrHVValidationFailed means Proton rejected the presented
+	// human-verification token (code 12087, gpa.HumanValidationInvalidToken):
+	// the challenge was solved but scored as failed, expired, or was consumed.
+	// Proton Bridge surfaces this as "Human verification failed. Please try
+	// again." — the remedy is a FRESH challenge (a new Login → new 9001), not
+	// re-presenting the same token (SPEC-0007 scenario "Verification not
+	// completed before retry"; ADR-0021).
+	ErrHVValidationFailed = errors.New("proton: human verification failed validation")
+
 	// ErrAppVersionRejected means Proton rejected the client's app-version
 	// header (codes 5001 missing / 5003 bad). The fix is operator-actionable —
 	// set a value Proton accepts — so the message points at the config knob
@@ -191,6 +200,8 @@ func classifyAPICode(apiErr *gpa.APIError) error {
 		return fmt.Errorf("%w (code %d)", ErrRefreshTokenInvalid, apiErr.Code)
 	case gpa.AppVersionMissingCode, gpa.AppVersionBadCode:
 		return fmt.Errorf("%w (code %d)", ErrAppVersionRejected, apiErr.Code)
+	case gpa.HumanValidationInvalidToken:
+		return fmt.Errorf("%w (code %d)", ErrHVValidationFailed, apiErr.Code)
 	default:
 		// Preserve the upstream message and code without inventing a category.
 		return fmt.Errorf("proton: api error: %w", apiErr)

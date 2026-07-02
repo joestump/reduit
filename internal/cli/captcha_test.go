@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -149,9 +150,60 @@ func TestSolveCaptchaHV_GivesUpAfterSecondHV(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "did not register") {
 		t.Fatalf("expected give-up guidance, got %v", err)
 	}
-	if p.calls != 2 {
-		t.Errorf("prompt fired %d times, want 2 before giving up", p.calls)
+	if p.calls != 3 {
+		t.Errorf("prompt fired %d times, want 3 before giving up", p.calls)
 	}
+}
+
+// TestSolveCaptchaHV_ValidationFailedGetsFreshChallenge covers the 12087 path
+// seen live: the solve completes in the browser but Proton scores it as failed
+// (ErrHVValidationFailed). The loop must issue a brand-new Login to mint a
+// FRESH challenge (the rejected token is dead) and let the operator solve
+// again — not re-present the dead token, and not hard-fail.
+func TestSolveCaptchaHV_ValidationFailedGetsFreshChallenge(t *testing.T) {
+	stubOpenBrowser(t, nil)
+	f := &validationFailFake{Fake: proton.NewFake()}
+	f.UserID = "proton-user"
+	hv := &proton.HVRequiredError{Methods: []string{"captcha"}, Token: "chal-1"}
+
+	p := &enterPrompter{}
+	status, err := solveCaptchaHV(context.Background(), f, "joe@proton.test", []byte("pw"), hv, &bytes.Buffer{}, p)
+	if err != nil {
+		t.Fatalf("solveCaptchaHV after 12087: %v", err)
+	}
+	if status.ProtonUserID != "proton-user" {
+		t.Errorf("AuthStatus.ProtonUserID = %q, want the fresh solve's user", status.ProtonUserID)
+	}
+	if p.calls != 2 {
+		t.Errorf("prompt fired %d times, want 2 (initial + fresh-challenge solve)", p.calls)
+	}
+	if want := []string{"chal-1", "chal-2"}; len(f.HVTokens) != 2 || f.HVTokens[0] != want[0] || f.HVTokens[1] != want[1] {
+		t.Errorf("LoginWithHV tokens = %v, want %v (fresh challenge on the retry)", f.HVTokens, want)
+	}
+	if f.logins != 1 {
+		t.Errorf("fresh Login called %d times, want 1", f.logins)
+	}
+}
+
+// validationFailFake rejects the first LoginWithHV with 12087-style
+// ErrHVValidationFailed, hands out a fresh challenge on the next Login, and
+// accepts only the fresh token.
+type validationFailFake struct {
+	*proton.Fake
+	logins int
+}
+
+func (f *validationFailFake) Login(ctx context.Context, address string, password []byte) (proton.AuthStatus, error) {
+	f.logins++
+	return proton.AuthStatus{}, &proton.HVRequiredError{Methods: []string{"captcha"}, Token: "chal-2"}
+}
+
+func (f *validationFailFake) LoginWithHV(ctx context.Context, address string, password []byte, hv *proton.HVRequiredError) (proton.AuthStatus, error) {
+	f.HVTokens = append(f.HVTokens, hv.Token)
+	if hv.Token != "chal-2" {
+		return proton.AuthStatus{}, fmt.Errorf("%w (code 12087)", proton.ErrHVValidationFailed)
+	}
+	return proton.AuthStatus{ProtonUserID: "proton-user"}, nil
 }
 
 // TestSolveCaptchaHV_Cancel maps a "cancel" answer to a clean abort error, with

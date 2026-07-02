@@ -65,16 +65,22 @@ var openBrowser = func(url string) error {
 // to the TOTP + passphrase steps. password stays live for the retry; the caller
 // zeroes it. It never logs the password (only LoginWithHV receives it).
 //
-// If the retry still reports human verification (the operator did not actually
-// complete it, or Proton did not register it), the operator gets ONE more
-// attempt before a clear give-up error.
+// Two retryable outcomes are handled inside the loop (SPEC-0007 scenario
+// "Verification not completed before retry"):
 //
-// Governing: SPEC-0007 ("Human verification / CAPTCHA is requested").
+//   - Another 9001 (challenge re-issued): the operator likely pressed Enter
+//     before completing the solve. Adopt the FRESH challenge and re-prompt.
+//   - 12087 ErrHVValidationFailed (solved but scored failed/expired/consumed —
+//     the outcome Proton Bridge labels "Human verification failed. Please try
+//     again."): the presented token is dead, so a NEW Login is issued to mint
+//     a fresh challenge, and the operator solves again.
+//
+// Governing: SPEC-0007 ("Human verification / CAPTCHA is requested"), ADR-0021.
 func solveCaptchaHV(ctx context.Context, client proton.Client, address string, password []byte, hv *proton.HVRequiredError, out io.Writer, p prompter) (proton.AuthStatus, error) {
-	// The operator gets an initial attempt plus one retry: verification not
-	// registering on the first try is common (a closed tab, a missed step), so a
-	// single re-prompt saves a full command rerun before we give up.
-	const maxAttempts = 2
+	// The operator gets an initial attempt plus two retries: verification not
+	// registering (premature Enter) or not validating (12087, common on a first
+	// solve) shouldn't cost a full command rerun before we give up.
+	const maxAttempts = 3
 	for attempt := 1; ; attempt++ {
 		if err := promptVerification(ctx, verifyURL(hv), out, p, attempt); err != nil {
 			return proton.AuthStatus{}, err
@@ -84,20 +90,49 @@ func solveCaptchaHV(ctx context.Context, client proton.Client, address string, p
 		if err == nil {
 			return status, nil
 		}
-		fresh, ok := proton.AsHVRequired(err)
-		if !ok {
+
+		switch {
+		case errorIsHVRequired(err, &hv):
+			// Still an HV challenge: the verification did not register
+			// (premature Enter). Proton issues a FRESH token with each 9001 —
+			// errorIsHVRequired adopted it — re-solving the old (consumed)
+			// challenge would be futile.
+			if attempt >= maxAttempts {
+				return proton.AuthStatus{}, fmt.Errorf("human verification did not register after %d attempts; rerun 'reduit auth add' and complete the verification in your browser before pressing Enter", maxAttempts)
+			}
+			fmt.Fprintln(out, "\nThat verification didn't register with Proton — let's try once more.")
+
+		case errors.Is(err, proton.ErrHVValidationFailed):
+			// Solved but rejected (12087). The token is dead; only a brand-new
+			// Login yields a fresh challenge to solve.
+			if attempt >= maxAttempts {
+				return proton.AuthStatus{}, fmt.Errorf("human verification failed validation after %d attempts; wait a minute and rerun 'reduit auth add' (Proton scored the solves as failed)", maxAttempts)
+			}
+			fmt.Fprintln(out, "\nProton rejected that verification — requesting a fresh challenge to try again.")
+			freshStatus, lerr := client.Login(ctx, address, password)
+			if lerr == nil {
+				// The fresh login sailed through with no challenge at all.
+				return freshStatus, nil
+			}
+			if !errorIsHVRequired(lerr, &hv) {
+				return proton.AuthStatus{}, fmt.Errorf("login failed requesting a fresh verification challenge: %w", lerr)
+			}
+
+		default:
 			return proton.AuthStatus{}, fmt.Errorf("login failed after human verification: %w", err)
 		}
-		// Still an HV challenge: the verification did not register. Proton
-		// issues a FRESH token with each 9001, so the retry must solve and
-		// present the new challenge — re-solving the old (consumed) one would
-		// be futile.
-		if attempt >= maxAttempts {
-			return proton.AuthStatus{}, fmt.Errorf("human verification did not register after %d attempts; rerun 'reduit auth add' and complete the verification in your browser before pressing Enter", maxAttempts)
-		}
-		hv = fresh
-		fmt.Fprintln(out, "\nThat verification didn't register with Proton — let's try once more.")
 	}
+}
+
+// errorIsHVRequired reports whether err is an *HVRequiredError and, when it is,
+// stores the FRESH challenge into *hv so the caller retries the re-issued
+// token rather than the consumed one.
+func errorIsHVRequired(err error, hv **proton.HVRequiredError) bool {
+	fresh, ok := proton.AsHVRequired(err)
+	if ok {
+		*hv = fresh
+	}
+	return ok
 }
 
 // promptVerification opens (best-effort) the verify page, prints the URL for

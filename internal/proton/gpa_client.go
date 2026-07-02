@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"time"
 
 	"github.com/ProtonMail/gluon/async"
 	gpa "github.com/ProtonMail/go-proton-api"
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
+	"golang.org/x/net/publicsuffix"
 )
 
 // Config configures a GPADialer (and therefore the underlying go-proton-api
@@ -50,6 +52,23 @@ func NewDialer(cfg Config) *GPADialer {
 	// Leakage"). The logger here only receives resty's connection-level
 	// diagnostics, which carry no secret.
 	opts := []gpa.Option{gpa.WithLogger(newSlogLogger(cfg.Logger))}
+	// An in-memory cookie jar is REQUIRED for human verification: Proton sets
+	// a session cookie alongside the 9001 challenge that server-side ties the
+	// challenge token to THIS client session. Without the jar the cookie is
+	// dropped and the post-solve retry presents a verified token from what
+	// looks like a different session — Proton rejects it with 12087 "CAPTCHA
+	// validation failed" (observed live, twice, on clean solves). Proton
+	// Bridge sets a jar for the same reason (its internal/bridge/api.go).
+	// In-memory only: nothing persisted, secrets stay in the keychain
+	// (ADR-0013). Governing: ADR-0021, SPEC-0007 "SRP and 2FA Handling".
+	// cookiejar.New never returns an error for valid options (stdlib contract),
+	// but if it ever did, silently proceeding would regress HV to exactly the
+	// 12087 mystery this jar fixes — so log loudly rather than swallow it.
+	if jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List}); err == nil {
+		opts = append(opts, gpa.WithCookieJar(jar))
+	} else if cfg.Logger != nil {
+		cfg.Logger.Error("proton: cookie jar init failed; human verification will not validate", "error", err)
+	}
 	if cfg.HostURL != "" {
 		opts = append(opts, gpa.WithHostURL(cfg.HostURL))
 	}
