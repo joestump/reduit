@@ -1,6 +1,6 @@
 # ADR-0006: SQLite as the persistent store
 
-- **Status:** accepted (rewritten 2026-06-29 for the local-first pivot, [ADR-0012](ADR-0012-single-user-local-first.md); CGO-free posture amended 2026-07-01 by [ADR-0021](ADR-0021-native-webview-human-verification.md) — desktop auth build links CGO for the webview, headless build stays pure-Go)
+- **Status:** accepted (rewritten 2026-06-29 for the local-first pivot, [ADR-0012](ADR-0012-single-user-local-first.md); a 2026-07-01 CGO amendment via ADR-0021 rev 1 was withdrawn 2026-07-02 — [ADR-0021](ADR-0021-native-webview-human-verification.md) rev 2 needs no CGO, the pure-Go posture stands in full)
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
 

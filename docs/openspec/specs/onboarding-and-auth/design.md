@@ -31,14 +31,17 @@ sequenceDiagram
     CLI->>DB: INSERT row (pending_auth, no proton_user_id)
     CLI->>Op: prompt password (no echo)
     CLI->>GP: SRP login(email, password)
+    alt human verification (9001 — expected on fresh logins)
+        GP-->>CLI: HV challenge {methods, token}
+        CLI->>Op: open verify.proton.me/?methods=…&token=…
+        Op->>Op: solves on Proton's own page (token verified SERVER-SIDE)
+        Op->>CLI: presses Enter
+        CLI->>GP: retry SRP login with the SAME token
+    end
     alt 2FA required
         GP-->>CLI: 2FA required
         CLI->>Op: prompt TOTP (no echo)
         CLI->>GP: submit TOTP
-    end
-    alt human verification / CAPTCHA
-        GP-->>CLI: HV challenge
-        CLI->>Op: clear message + instructions
     end
     GP-->>CLI: session + proton_user_id
     CLI->>DB: check proton_user_id uniqueness
@@ -59,12 +62,23 @@ sequenceDiagram
 2. **SRP.** Prompt for the password with echo off; hand email+password
    to go-proton-api's SRP login. Reduit never sees a password hash it
    computes itself.
-3. **2FA.** If go-proton-api signals 2FA-required, prompt for the TOTP
-   code (no echo) and submit. Wrong codes re-prompt or abort with a
-   concise message.
-4. **Human verification.** If Proton returns an HV/CAPTCHA outcome,
-   translate it into a clear CLI message. This path is rare for password
-   logins but must not surface as an unhandled error or panic.
+3. **Human verification (the Bridge method — ADR-0021).** Proton
+   answers effectively every fresh third-party login with code 9001,
+   whose error details carry the offered `methods` and a verification
+   `token`. The token is **never captured client-side**: reduit prints
+   and opens `https://verify.proton.me/?methods=<offered>&token=<token>`
+   (Proton's standalone verification page, all offered methods passed
+   through), the operator solves it there — which verifies that token
+   **server-side** — presses Enter, and reduit retries the login
+   presenting the *same* token (`NewClientWithLoginWithHVToken`, the
+   `x-pm-human-verification-token` header). One extra solve-and-retry is
+   allowed before aborting. Do **not** attempt to render or embed the
+   challenge: its `frame-ancestors` CSP is first-party-only, and three
+   capture designs (loopback iframe, native webview, controlled Chrome)
+   were falsified live — see ADR-0021 rev 2 for the post-mortem.
+4. **2FA.** If go-proton-api signals 2FA-required (after HV, when
+   challenged), prompt for the TOTP code (no echo) and submit. Wrong
+   codes re-prompt or abort with a concise message.
 5. **Passphrase + key unlock.** Prompt for the mailbox passphrase (no
    echo); ask go-proton-api to unlock the OpenPGP private keys. Failure
    re-prompts or aborts.
@@ -139,7 +153,8 @@ needed, would be a new opt-in ADR, loudly caveated.
 | Condition | Behavior |
 | --- | --- |
 | Wrong password / TOTP | concise "authentication failed"; no secret echoed; row stays `pending_auth`/`needs_reauth` |
-| Human verification required | clear message + how to proceed; no raw payload dump |
+| Human verification required (9001) | open + print the verify.proton.me URL; wait; retry with the same token; one extra attempt, then a clear abort. No raw payload dump |
+| Verification retry still challenged | "verification didn't register — solve again"; second failure aborts cleanly |
 | Passphrase fails to unlock keys | re-prompt or abort; never advance to `active` |
 | Duplicate `proton_user_id` | "already configured" (or "re-auth it"); no second row |
 | `proton_user_id` mismatch on re-auth | error; stored value untouched |
@@ -150,5 +165,10 @@ needed, would be a new opt-in ADR, loudly caveated.
 - ADR-0001 (go-proton-api as Proton client — SRP, 2FA, OpenPGP unlock)
 - ADR-0012 (single-user, local-first — no web/OIDC/relay)
 - ADR-0013 (secrets in the OS keychain — keying, headless unlock)
+- ADR-0021 (human verification via verify.proton.me — the Bridge method;
+  server-side token verification; falsified capture approaches; headless
+  `handoff`/`import`)
+- proton-bridge `internal/hv/hv.go` — the reference implementation
+  (`FormatHvURL`)
 - SPEC-0001 (mailbox model — row, state machine, `proton_user_id`
   immutability and uniqueness)

@@ -76,9 +76,21 @@ to the keychain.
 
 Password authentication SHALL use go-proton-api's SRP exchange; Reduit
 SHALL NOT implement its own SRP. When the account requires TOTP 2FA, the
-flow SHALL prompt for the one-time code and submit it. When Proton
-returns a human-verification / CAPTCHA challenge, the flow SHALL surface
-it with a clear, actionable CLI message rather than failing opaquely.
+flow SHALL prompt for the one-time code and submit it.
+
+When Proton returns a human-verification challenge (API code 9001 —
+expected on effectively every fresh login from a third-party client),
+the flow SHALL resolve it the way Proton Bridge does (ADR-0021): open
+`https://verify.proton.me/?methods=<offered>&token=<token>` in the
+operator's browser (and print the URL for copy/paste), wait for the
+operator to complete the challenge on Proton's own page — which verifies
+the token **server-side** — then retry the login presenting the **same**
+token via go-proton-api's HV-token login. The flow SHALL pass through
+all offered methods (captcha, email, sms) and SHALL NOT attempt to
+render, embed, or capture the challenge itself: the challenge's
+`frame-ancestors` CSP is first-party-only, and no client-side token
+capture exists in this flow (see ADR-0021 for the falsified
+alternatives).
 
 #### Scenario: TOTP 2FA is required
 
@@ -90,10 +102,20 @@ it with a clear, actionable CLI message rather than failing opaquely.
 #### Scenario: Human verification / CAPTCHA is requested
 
 - **WHEN** Proton responds to the auth attempt with a human-verification
-  or CAPTCHA challenge
-- **THEN** the system SHALL surface a clear CLI message explaining that
-  Proton requires verification and how to proceed, and SHALL NOT crash,
-  loop, or print the raw challenge payload as an unhandled error
+  challenge (code 9001) carrying offered methods and a verification
+  token
+- **THEN** the system SHALL print and open
+  `https://verify.proton.me/?methods=<offered>&token=<token>`, wait for
+  the operator to confirm completion, and retry the login with the same
+  token; on success the flow SHALL continue to 2FA/passphrase as normal,
+  and it SHALL NOT crash, loop, or print the raw challenge payload
+
+#### Scenario: Verification not completed before retry
+
+- **WHEN** the operator confirms before the challenge is actually
+  completed and the retry returns another human-verification challenge
+- **THEN** the system SHALL allow at least one further solve-and-retry
+  attempt before aborting with a clear, actionable error
 
 #### Scenario: Wrong password or 2FA code
 
