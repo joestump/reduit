@@ -69,7 +69,7 @@ func newAuthCmd(cfgPath *string, verbose *bool) *cobra.Command {
 //   - the literal "auto" → auto-detect Proton's current "web-mail@<version>"
 //     (proton.DetectAppVersion). NOTE this presents as the web client, which
 //     Proton reliably challenges with a 9001 CAPTCHA — opt-in only.
-//   - unset (the default) → proton.DefaultAppVersion ("Bridge_3.0.0+reduit").
+//   - unset (the default) → proton.DefaultAppVersion ("macos-bridge@3.21.2").
 //     Proton's anti-abuse waves the Bridge client family through without a
 //     CAPTCHA (the mechanism the old relay Reduit relied on).
 //

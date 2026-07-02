@@ -100,7 +100,7 @@ type ProtonConfig struct {
 	// values (code 5001 missing, 5003 bad).
 	//
 	// It defaults to empty, which resolves to proton.DefaultAppVersion
-	// ("Bridge_3.0.0+reduit"). Identifying as a Bridge variant is deliberate:
+	// ("macos-bridge@3.21.2"). Identifying as a Bridge variant is deliberate:
 	// Proton's anti-abuse challenges the web client with a CAPTCHA but waves the
 	// Bridge family through, so this avoids human verification (see
 	// proton.DefaultAppVersion / ADR-0021). The literal "auto" instead
@@ -148,7 +148,7 @@ func Defaults() Config {
 			// operator deliberately points it somewhere.
 		},
 		Proton: ProtonConfig{
-			// Empty resolves to proton.DefaultAppVersion ("Bridge_3.0.0+reduit")
+			// Empty resolves to proton.DefaultAppVersion ("macos-bridge@3.21.2")
 			// in protonConfig() — the Bridge client family avoids Proton's
 			// CAPTCHA. The literal "auto" instead detects "web-mail@<version>"
 			// (opt-in; Proton challenges the web client). An explicit value wins.

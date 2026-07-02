@@ -31,15 +31,20 @@ const (
 	// This is deliberate, not cosmetic: Proton's anti-abuse challenges the web
 	// client ("web-mail@…") with a 9001 CAPTCHA on effectively every fresh
 	// login, but waves the Bridge client family through — so a Bridge app-version
-	// avoids human verification entirely (confirmed live, and the mechanism the
-	// old relay Reduit relied on). Proton requires the shape "Bridge_<semver>+
-	// <suffix>": it regex-matches the semver, then checks the platform prefix is
-	// known — "go-proton-api" → code 2064, a bare "Bridge_<sha>" → 5002. The
-	// semver is pinned (Proton doesn't accept arbitrary versions anyway, so
-	// bumping per release is pointless); "+reduit" records the client identity.
-	// Identifying as bridge-like is honest: reduit relays a Proton mailbox to a
-	// local user, exactly Bridge's role. Governing: ADR-0001, ADR-0021.
-	DefaultAppVersion = "Bridge_3.0.0+reduit"
+	// avoids human verification entirely (confirmed live).
+	//
+	// Value: the modern Bridge-on-macOS client identifier, "<platform>@<semver>".
+	// This is the one value confirmed working end-to-end on the current code
+	// (clean login, no CAPTCHA, password accepted). The old relay Reduit used the
+	// legacy "Bridge_<semver>+<suffix>" shape ("Bridge_3.0.0+reduit"); Proton
+	// still accepts that format too, but the modern platform@semver identifier is
+	// what current Bridge sends and is less likely to be aged out. Proton
+	// validates the shape (go-proton-api → code 2064; a bare "Bridge_<sha>" →
+	// 5002) and a too-old semver is eventually rejected (5003), so the operator
+	// can override via proton.app_version / REDUIT_PROTON_APP_VERSION and we bump
+	// this constant if Proton ever stops accepting it. Governing: ADR-0001,
+	// ADR-0021.
+	DefaultAppVersion = "macos-bridge@3.21.2"
 
 	// versionURL is Proton's published web-mail version manifest.
 	versionURL = "https://mail.proton.me/assets/version.json"
