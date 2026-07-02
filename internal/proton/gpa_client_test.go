@@ -55,6 +55,9 @@ func TestGPAClient_AccessorsZeroValue(t *testing.T) {
 	if c.RefreshToken() != "" {
 		t.Error("RefreshToken should be empty before auth")
 	}
+	if c.SessionUID() != "" {
+		t.Error("SessionUID should be empty before auth")
+	}
 	c.Close() // must not panic with nil cli
 }
 

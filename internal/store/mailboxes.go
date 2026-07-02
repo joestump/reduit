@@ -36,6 +36,12 @@ type Mailbox struct {
 	State        MailboxState `db:"state"`
 	AddedAt      time.Time    `db:"added_at"`
 	LastSyncAt   *time.Time   `db:"last_sync_at"` // nil if never synced
+	// SessionUID is the go-proton-api session UID captured at Login. Proton's
+	// refresh endpoint requires it to identify the session; resuming without it
+	// yields 10013 "Invalid refresh token". It is non-secret session state, so
+	// it lives here rather than the keychain (ADR-0013). nil for pre-migration
+	// rows and until the first successful auth.
+	SessionUID *string `db:"session_uid"`
 }
 
 // ErrMailboxNotFound is returned when a mailbox row is not found.
@@ -61,7 +67,7 @@ func (s *Store) InsertMailbox(ctx context.Context, id, address string) error {
 // GetMailbox returns the mailbox row for the given id.
 func (s *Store) GetMailbox(ctx context.Context, id string) (Mailbox, error) {
 	var m Mailbox
-	const q = `SELECT id, proton_user_id, address, state, added_at, last_sync_at FROM mailboxes WHERE id = ?`
+	const q = `SELECT id, proton_user_id, address, state, added_at, last_sync_at, session_uid FROM mailboxes WHERE id = ?`
 	if err := s.DB.GetContext(ctx, &m, q, id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Mailbox{}, ErrMailboxNotFound
@@ -74,7 +80,7 @@ func (s *Store) GetMailbox(ctx context.Context, id string) (Mailbox, error) {
 // GetMailboxByAddress returns the mailbox row for the given Proton address.
 func (s *Store) GetMailboxByAddress(ctx context.Context, address string) (Mailbox, error) {
 	var m Mailbox
-	const q = `SELECT id, proton_user_id, address, state, added_at, last_sync_at FROM mailboxes WHERE address = ?`
+	const q = `SELECT id, proton_user_id, address, state, added_at, last_sync_at, session_uid FROM mailboxes WHERE address = ?`
 	if err := s.DB.GetContext(ctx, &m, q, address); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Mailbox{}, ErrMailboxNotFound
@@ -87,7 +93,7 @@ func (s *Store) GetMailboxByAddress(ctx context.Context, address string) (Mailbo
 // ListMailboxes returns all configured mailboxes.
 func (s *Store) ListMailboxes(ctx context.Context) ([]Mailbox, error) {
 	var rows []Mailbox
-	const q = `SELECT id, proton_user_id, address, state, added_at, last_sync_at FROM mailboxes ORDER BY added_at ASC`
+	const q = `SELECT id, proton_user_id, address, state, added_at, last_sync_at, session_uid FROM mailboxes ORDER BY added_at ASC`
 	if err := s.DB.SelectContext(ctx, &rows, q); err != nil {
 		return nil, fmt.Errorf("store: list mailboxes: %w", err)
 	}
@@ -116,6 +122,26 @@ func (s *Store) SetProtonUserID(ctx context.Context, id, protonUserID string) er
 	const q = `UPDATE mailboxes SET proton_user_id = ?, state = 'active' WHERE id = ?`
 	if _, err := s.DB.ExecContext(ctx, q, protonUserID, id); err != nil {
 		return fmt.Errorf("store: set proton_user_id: %w", err)
+	}
+	return nil
+}
+
+// SetSessionUID records the go-proton-api session UID on the mailbox row. It is
+// written on first auth (alongside proton_user_id and the keychain secrets) and
+// rewritten whenever a resume rotates the UID, so the next cross-process resume
+// can identify the session (without it Proton's refresh returns 10013). The UID
+// is non-secret session state, so it lives in the store, not the keychain
+// (ADR-0013). Governing: SPEC-0007 "Re-Auth Flow", "Secrets read
+// non-interactively at use time".
+func (s *Store) SetSessionUID(ctx context.Context, id, uid string) error {
+	const q = `UPDATE mailboxes SET session_uid = ? WHERE id = ?`
+	res, err := s.DB.ExecContext(ctx, q, uid, id)
+	if err != nil {
+		return fmt.Errorf("store: set session_uid: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrMailboxNotFound
 	}
 	return nil
 }

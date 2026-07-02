@@ -67,7 +67,16 @@ func runLabels(ctx context.Context, st *store.Store, ks keychain.Store, dialer p
 		return fmt.Errorf("read refresh token: %w", actionableKeyringErr(err))
 	}
 
-	client, err := dialer.Resume(ctx, *m.ProtonUserID, refreshToken)
+	// The session UID is required to resume — Proton identifies the session by it,
+	// and resuming without it yields a raw 10013 "Invalid refresh token". A row
+	// added before session-uid tracking has none; `labels` cannot re-login, so
+	// surface an actionable message instead of that opaque code.
+	if m.SessionUID == nil || *m.SessionUID == "" {
+		return fmt.Errorf("mailbox %q predates session-uid tracking and cannot resume; re-add it: 'reduit auth remove %s' then 'reduit auth add %s'", m.Address, m.Address, m.Address)
+	}
+	storedUID := *m.SessionUID
+
+	client, err := dialer.Resume(ctx, *m.ProtonUserID, storedUID, refreshToken)
 	if err != nil {
 		return fmt.Errorf("resume session: %w", err)
 	}
@@ -77,6 +86,11 @@ func runLabels(ctx context.Context, st *store.Store, ks keychain.Store, dialer p
 	// failed write flags the mailbox needs_reauth (the old token is now spent).
 	if err := persistRotatedTokenOrFlag(ctx, st, ks, m.ID, refreshToken, client.RefreshToken()); err != nil {
 		return fmt.Errorf("store rotated token: %w", err)
+	}
+	// Resume may also rotate the session UID; persist it so the next resume
+	// presents the current one.
+	if err := persistRotatedSessionUID(ctx, st, m.ID, storedUID, client.SessionUID()); err != nil {
+		return fmt.Errorf("store rotated session uid: %w", err)
 	}
 
 	labels, err := client.Labels(ctx)

@@ -65,6 +65,15 @@ type Client interface {
 	// this after each and persist the new value to the keychain (ADR-0013).
 	RefreshToken() string
 
+	// SessionUID returns the go-proton-api session UID captured at Login and
+	// re-read after Refresh/Resume. Proton's /auth/v4/refresh requires this UID
+	// to identify the session; resuming without it yields 10013 "Invalid refresh
+	// token". It is non-secret session state that the auth layer persists on the
+	// mailbox row (ADR-0013) so a later cross-process Resume can supply it. Like
+	// the refresh token it may rotate on Refresh, so the caller re-reads and
+	// re-persists it after each resume. It is "" before authentication.
+	SessionUID() string
+
 	// Refresh rotates the session using the stored refresh token
 	// (SPEC-0007 REQ "Secret Write, Read, and Delete" — secrets read
 	// non-interactively at use time). RefreshToken reflects the rotated value
@@ -121,11 +130,14 @@ type Dialer interface {
 	// Login flow.
 	NewClient() Client
 
-	// Resume reconstructs an authenticated client from a stored refresh token
-	// (SPEC-0007 "Secrets read non-interactively at use time"). The token may
-	// be rotated by the resume; read RefreshToken afterward and persist it. The
+	// Resume reconstructs an authenticated client from a stored session UID and
+	// refresh token (SPEC-0007 "Secrets read non-interactively at use time").
+	// Both are required: Proton's /auth/v4/refresh identifies the session by its
+	// UID, so resuming with an empty sessionUID yields 10013 "Invalid refresh
+	// token". The refresh token (and possibly the UID) may be rotated by the
+	// resume; read RefreshToken and SessionUID afterward and persist them. The
 	// returned client is authenticated but not unlocked.
-	Resume(ctx context.Context, protonUserID, refreshToken string) (Client, error)
+	Resume(ctx context.Context, protonUserID, sessionUID, refreshToken string) (Client, error)
 }
 
 // TwoFAState reports what, if anything, must happen after the password step of

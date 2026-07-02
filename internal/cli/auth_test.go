@@ -21,15 +21,17 @@ import (
 // CLI auth/labels flow runs without a live account. NewClient hands out the
 // pre-scripted Fake; Resume marks it authenticated like the real cold-resume.
 type fakeDialer struct {
-	client    *proton.Fake
-	resumeErr error
-	resumed   bool
+	client     *proton.Fake
+	resumeErr  error
+	resumed    bool
+	resumedUID string // the session UID the last Resume received
 }
 
 func (d *fakeDialer) NewClient() proton.Client { return d.client }
 
-func (d *fakeDialer) Resume(ctx context.Context, protonUserID, token string) (proton.Client, error) {
+func (d *fakeDialer) Resume(ctx context.Context, protonUserID, sessionUID, token string) (proton.Client, error) {
 	_, _ = protonUserID, token
+	d.resumedUID = sessionUID
 	if d.resumeErr != nil {
 		return nil, d.resumeErr
 	}
@@ -98,6 +100,7 @@ func TestAuthAdd_HappyPath(t *testing.T) {
 	fake := proton.NewFake()
 	fake.UserID = "proton-user-1"
 	fake.Token = "refresh-token-1"
+	fake.UID = "session-uid-1"
 	dialer := &fakeDialer{client: fake}
 	p := &scriptPrompter{secrets: []string{"hunter2", "mailbox-pass"}}
 
@@ -115,6 +118,11 @@ func TestAuthAdd_HappyPath(t *testing.T) {
 	}
 	if m.ProtonUserID == nil || *m.ProtonUserID != "proton-user-1" {
 		t.Errorf("proton_user_id = %v, want proton-user-1", m.ProtonUserID)
+	}
+	// The session UID captured at Login must be persisted (non-empty) so a later
+	// cross-process resume can identify the session.
+	if m.SessionUID == nil || *m.SessionUID != "session-uid-1" {
+		t.Errorf("session_uid = %v, want session-uid-1", m.SessionUID)
 	}
 	if got, _ := ks.Get(m.ID, keychain.RefreshToken); got != "refresh-token-1" {
 		t.Errorf("stored refresh token = %q", got)
@@ -286,6 +294,7 @@ func TestRunLabels_ViaFake(t *testing.T) {
 	fake := proton.NewFake()
 	fake.UserID = "u6"
 	fake.Token = "rt-6"
+	fake.UID = "session-uid-6"
 	fake.LabelList = []proton.Label{
 		{ID: "0", Name: "Inbox", Type: proton.LabelTypeSystem},
 		{ID: "x1", Name: "Receipts", Type: proton.LabelTypeLabel, Color: "#c44800"},
@@ -304,6 +313,12 @@ func TestRunLabels_ViaFake(t *testing.T) {
 	}
 	if !dialer.resumed {
 		t.Error("expected Resume to be called")
+	}
+	// Regression (the 10013 bug): the STORED session UID — not "" — must be what
+	// resume presents. Before the fix, `labels` resumed with an empty UID and
+	// Proton rejected it with 10013 "Invalid refresh token".
+	if dialer.resumedUID != "session-uid-6" {
+		t.Errorf("Resume got session UID %q, want session-uid-6 (empty UID is the bug)", dialer.resumedUID)
 	}
 	for _, want := range []string{"Inbox", "system", "Receipts", "label"} {
 		if !strings.Contains(out.String(), want) {
@@ -329,6 +344,38 @@ func TestRunLabels_MultipleMailboxesNeedsFlag(t *testing.T) {
 	}
 }
 
+// TestRunLabels_EmptySessionUID covers the pre-migration row: a mailbox with a
+// proton_user_id and a stored refresh token but NO session_uid must not attempt
+// a resume (which Proton rejects with a raw 10013). It returns an actionable
+// re-add message instead.
+func TestRunLabels_EmptySessionUID(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newTestKeychain(t)
+
+	// Seed an "active" mailbox the way a pre-migration row looks: identity +
+	// token present, session_uid left NULL.
+	if err := st.InsertMailbox(ctx, "old-id", "old@proton.test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetProtonUserID(ctx, "old-id", "proton-user-old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ks.Set("old-id", keychain.RefreshToken, "rt-old"); err != nil {
+		t.Fatal(err)
+	}
+
+	dialer := &fakeDialer{client: proton.NewFake()}
+	err := runLabels(ctx, st, ks, dialer, "", &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "predates session-uid tracking") {
+		t.Fatalf("expected clear re-add error, got %v", err)
+	}
+	// Crucially, resume must NOT have been attempted with an empty UID.
+	if dialer.resumed {
+		t.Error("resume should not be attempted when the session UID is missing")
+	}
+}
+
 // --- auth refresh -----------------------------------------------------------
 
 func TestAuthRefresh(t *testing.T) {
@@ -338,7 +385,9 @@ func TestAuthRefresh(t *testing.T) {
 	fake := proton.NewFake()
 	fake.UserID = "u7"
 	fake.Token = "rt-7"
-	fake.RefreshTokens = []string{"rt-7-rotated"} // resume rotates the token
+	fake.UID = "session-uid-7"
+	fake.RefreshTokens = []string{"rt-7-rotated"}    // resume rotates the token
+	fake.SessionUIDs = []string{"session-uid-7-rot"} // ...and the session UID
 	dialer := &fakeDialer{client: fake}
 
 	p := &scriptPrompter{secrets: []string{"pw", "pass"}}
@@ -346,14 +395,26 @@ func TestAuthRefresh(t *testing.T) {
 		t.Fatalf("seed add: %v", err)
 	}
 	m, _ := st.GetMailboxByAddress(ctx, "refresh@proton.test")
+	// The add must have persisted the UID the session was minted with.
+	if m.SessionUID == nil || *m.SessionUID != "session-uid-7" {
+		t.Fatalf("session_uid not persisted on add: %v", m.SessionUID)
+	}
 
 	p2 := &scriptPrompter{} // resume path succeeds; no prompts consumed
 	if err := authRefresh(ctx, st, ks, dialer, p2, "refresh@proton.test", &bytes.Buffer{}); err != nil {
 		t.Fatalf("authRefresh: %v", err)
 	}
-	// The rotated token must have been persisted.
+	// The stored UID (not "") must have reached the dialer's Resume.
+	if dialer.resumedUID != "session-uid-7" {
+		t.Errorf("Resume got session UID %q, want session-uid-7", dialer.resumedUID)
+	}
+	// The rotated token and rotated session UID must both have been persisted.
 	if got, _ := ks.Get(m.ID, keychain.RefreshToken); got != "rt-7-rotated" {
 		t.Errorf("rotated token not persisted: %q", got)
+	}
+	m2, _ := st.GetMailboxByAddress(ctx, "refresh@proton.test")
+	if m2.SessionUID == nil || *m2.SessionUID != "session-uid-7-rot" {
+		t.Errorf("rotated session_uid not persisted: %v", m2.SessionUID)
 	}
 }
 
@@ -368,6 +429,7 @@ func TestAuthRefresh_DeadTokenReLogin(t *testing.T) {
 	fake := proton.NewFake()
 	fake.UserID = "user-recover"
 	fake.Token = "rt-original"
+	fake.UID = "uid-recover"
 	dialer := &fakeDialer{client: fake}
 
 	// Seed an active mailbox.

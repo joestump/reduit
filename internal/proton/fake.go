@@ -23,6 +23,9 @@ type Fake struct {
 	// Token is the current refresh token; rotated values can be scripted via
 	// RefreshTokens.
 	Token string
+	// UID is the current session UID reported by SessionUID; rotated values can
+	// be scripted via SessionUIDs (applied on Refresh, mirroring Token).
+	UID string
 	// TwoFA is the 2FA state Login (or LoginWithHV, once HV is passed) reports.
 	TwoFA TwoFAState
 
@@ -68,6 +71,9 @@ type Fake struct {
 	// RefreshTokens are handed out (FIFO) on successive Refresh calls to
 	// simulate rotation; when drained, Token is left unchanged.
 	RefreshTokens []string
+	// SessionUIDs are handed out (FIFO) on successive Refresh calls to simulate
+	// UID rotation; when drained, UID is left unchanged.
+	SessionUIDs []string
 	// SentID is the message id returned by a successful Send.
 	SentID string
 
@@ -176,6 +182,12 @@ func (f *Fake) RefreshToken() string {
 	return f.Token
 }
 
+func (f *Fake) SessionUID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.UID
+}
+
 func (f *Fake) Refresh(_ context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -187,6 +199,10 @@ func (f *Fake) Refresh(_ context.Context) error {
 	if len(f.RefreshTokens) > 0 {
 		f.Token = f.RefreshTokens[0]
 		f.RefreshTokens = f.RefreshTokens[1:]
+	}
+	if len(f.SessionUIDs) > 0 {
+		f.UID = f.SessionUIDs[0]
+		f.SessionUIDs = f.SessionUIDs[1:]
 	}
 	return nil
 }

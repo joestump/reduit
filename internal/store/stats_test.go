@@ -170,9 +170,9 @@ func TestSchemaVersionReportsHead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	// The initial migration is timestamped 20260629000001; after Migrate the
-	// current version must equal it (the only migration on disk today).
-	if want := int64(20260629000001); v != want {
+	// After Migrate the current version must equal the newest migration on disk,
+	// which is the session_uid column add (20260702000001).
+	if want := int64(20260702000001); v != want {
 		t.Errorf("SchemaVersion() = %d, want %d", v, want)
 	}
 }

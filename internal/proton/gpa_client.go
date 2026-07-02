@@ -89,18 +89,22 @@ func (d *GPADialer) NewClient() Client {
 	return &gpaClient{mgr: d.mgr}
 }
 
-// Resume reconstructs an authenticated client from a stored refresh token
-// (SPEC-0007 "Secrets read non-interactively at use time"). go-proton-api may
-// rotate the token; the caller reads RefreshToken afterward and persists it
-// (ADR-0013). The returned client is authenticated but not unlocked; the caller
-// supplies the passphrase to Unlock. The expected proton user id is verified to
-// catch a token that resolves a different account (SPEC-0007 "Re-Auth Flow").
-func (d *GPADialer) Resume(ctx context.Context, protonUserID, refreshToken string) (Client, error) {
-	c := &gpaClient{mgr: d.mgr, userID: protonUserID, refreshToken: refreshToken}
-	// A resume needs a session UID; NewClientWithRefresh derives a fresh one
-	// from the refresh token. We have no stored UID here, so pass "" — the
-	// upstream auth-refresh path re-establishes the session from the token.
-	if err := c.refreshWithUID(ctx, ""); err != nil {
+// Resume reconstructs an authenticated client from a stored session UID and
+// refresh token (SPEC-0007 "Secrets read non-interactively at use time").
+// go-proton-api may rotate the token (and UID); the caller reads RefreshToken
+// and SessionUID afterward and persists them (ADR-0013). The returned client is
+// authenticated but not unlocked; the caller supplies the passphrase to Unlock.
+// The expected proton user id is verified to catch a token that resolves a
+// different account (SPEC-0007 "Re-Auth Flow").
+//
+// sessionUID is REQUIRED. Proton's /auth/v4/refresh identifies the session by
+// its UID (AuthRefreshReq.UID), NOT by the refresh token alone; refreshing with
+// UID="" yields 10013 "Invalid refresh token". reduit persists the UID captured
+// at Login on the mailbox row precisely so this cross-process resume can supply
+// it.
+func (d *GPADialer) Resume(ctx context.Context, protonUserID, sessionUID, refreshToken string) (Client, error) {
+	c := &gpaClient{mgr: d.mgr, userID: protonUserID, uid: sessionUID, refreshToken: refreshToken}
+	if err := c.refreshWithUID(ctx, sessionUID); err != nil {
 		return nil, err
 	}
 	if protonUserID != "" && c.userID != protonUserID {
@@ -244,13 +248,21 @@ func (c *gpaClient) Unlock(ctx context.Context, passphrase []byte) error {
 func (c *gpaClient) ProtonUserID() string { return c.userID }
 func (c *gpaClient) RefreshToken() string { return c.refreshToken }
 
+// SessionUID returns the go-proton-api session UID. It is captured at Login
+// (applyAuth) and re-read after every Refresh/Resume, so a rotated UID is
+// observable here and can be re-persisted.
+func (c *gpaClient) SessionUID() string { return c.uid }
+
 // Refresh rotates the session from the stored refresh token.
 func (c *gpaClient) Refresh(ctx context.Context) error {
 	return c.refreshWithUID(ctx, c.uid)
 }
 
-// refreshWithUID performs the refresh-token rotation. uid may be "" on a cold
-// resume, where go-proton-api re-derives the session from the refresh token.
+// refreshWithUID performs the refresh-token rotation. uid identifies the session
+// to Proton's /auth/v4/refresh (AuthRefreshReq.UID) and is required — Proton
+// does NOT derive it from the refresh token, so passing "" yields 10013 "Invalid
+// refresh token". The rotated UID from the response is stored back on c.uid so a
+// rotated UID is observable via SessionUID().
 func (c *gpaClient) refreshWithUID(ctx context.Context, uid string) error {
 	if c.refreshToken == "" {
 		return ErrNotAuthenticated

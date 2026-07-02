@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -65,6 +66,59 @@ func TestMailboxLifecycle(t *testing.T) {
 	}
 	if _, err := st.GetMailbox(ctx, m.ID); err == nil {
 		t.Error("GetMailbox after DeleteMailbox: expected not found error")
+	}
+}
+
+func TestMailboxSessionUID(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(""); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	ctx := context.Background()
+
+	if err := st.InsertMailbox(ctx, "01234567-test-uuid-v7-000000000001", "joe@example.com"); err != nil {
+		t.Fatalf("InsertMailbox: %v", err)
+	}
+	// A fresh row (like a pre-migration one) has no session UID.
+	m, _ := st.GetMailbox(ctx, "01234567-test-uuid-v7-000000000001")
+	if m.SessionUID != nil {
+		t.Errorf("SessionUID should be nil before it is set, got %v", *m.SessionUID)
+	}
+
+	// Set, then read back through every accessor.
+	if err := st.SetSessionUID(ctx, m.ID, "session-uid-abc"); err != nil {
+		t.Fatalf("SetSessionUID: %v", err)
+	}
+	got, _ := st.GetMailbox(ctx, m.ID)
+	if got.SessionUID == nil || *got.SessionUID != "session-uid-abc" {
+		t.Errorf("GetMailbox SessionUID = %v, want session-uid-abc", got.SessionUID)
+	}
+	byAddr, _ := st.GetMailboxByAddress(ctx, "joe@example.com")
+	if byAddr.SessionUID == nil || *byAddr.SessionUID != "session-uid-abc" {
+		t.Errorf("GetMailboxByAddress SessionUID = %v, want session-uid-abc", byAddr.SessionUID)
+	}
+	list, _ := st.ListMailboxes(ctx)
+	if len(list) != 1 || list[0].SessionUID == nil || *list[0].SessionUID != "session-uid-abc" {
+		t.Errorf("ListMailboxes SessionUID = %v, want session-uid-abc", list)
+	}
+
+	// Rotation: a later resume overwrites it.
+	if err := st.SetSessionUID(ctx, m.ID, "session-uid-rotated"); err != nil {
+		t.Fatalf("SetSessionUID rotate: %v", err)
+	}
+	rot, _ := st.GetMailbox(ctx, m.ID)
+	if rot.SessionUID == nil || *rot.SessionUID != "session-uid-rotated" {
+		t.Errorf("rotated SessionUID = %v, want session-uid-rotated", rot.SessionUID)
+	}
+
+	// Unknown id is a clear not-found, not a silent no-op.
+	if err := st.SetSessionUID(ctx, "no-such-id", "x"); !errors.Is(err, ErrMailboxNotFound) {
+		t.Errorf("SetSessionUID on unknown id = %v, want ErrMailboxNotFound", err)
 	}
 }
 

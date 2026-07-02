@@ -189,6 +189,14 @@ func authAdd(ctx context.Context, st *store.Store, ks keychain.Store, dialer pro
 		cleanup()
 		return fmt.Errorf("store secrets: %w", err)
 	}
+	// Persist the session UID (non-secret session state → the store, ADR-0013)
+	// in the same cleanup-guarded region as the secrets. Without it a later
+	// cross-process Resume has no UID to identify the session and Proton returns
+	// 10013 (the bug this fixes) — so a failure here must roll the add back too.
+	if err := st.SetSessionUID(ctx, mailboxID, client.SessionUID()); err != nil {
+		cleanup()
+		return err
+	}
 	if err := st.SetMailboxState(ctx, mailboxID, store.MailboxStateActive); err != nil {
 		cleanup()
 		return err
@@ -434,18 +442,32 @@ func authRefresh(ctx context.Context, st *store.Store, ks keychain.Store, dialer
 		return fmt.Errorf("mailbox %q has never authenticated; run 'reduit auth add %s'", address, address)
 	}
 
-	// Cheap path: resume from the stored token if we have one.
+	// Cheap path: resume from the stored token if we have BOTH a token and the
+	// session UID it was minted with. A pre-migration row has no session_uid;
+	// resuming without it yields 10013, so treat a missing UID like a missing
+	// token and fall through to the interactive re-login — which rewrites both
+	// secrets AND the session_uid, self-healing the row (no remove/re-add needed).
 	refreshToken, err := ks.Get(m.ID, keychain.RefreshToken)
+	storedUID := ""
+	if m.SessionUID != nil {
+		storedUID = *m.SessionUID
+	}
 	switch {
 	case errors.Is(err, keychain.ErrNotFound):
 		// No token to resume from — go straight to interactive re-login.
 	case err != nil:
 		return actionableKeyringErr(err)
+	case storedUID == "":
+		// No stored session UID (pre-migration row) — go straight to re-login.
 	default:
-		if client, rerr := dialer.Resume(ctx, *m.ProtonUserID, refreshToken); rerr == nil {
+		if client, rerr := dialer.Resume(ctx, *m.ProtonUserID, storedUID, refreshToken); rerr == nil {
 			defer client.Close()
 			if err := persistRotatedTokenOrFlag(ctx, st, ks, m.ID, refreshToken, client.RefreshToken()); err != nil {
 				return fmt.Errorf("store rotated token: %w", err)
+			}
+			// Resume may rotate the UID too; persist it so the next resume matches.
+			if err := persistRotatedSessionUID(ctx, st, m.ID, storedUID, client.SessionUID()); err != nil {
+				return fmt.Errorf("store rotated session uid: %w", err)
 			}
 			if err := st.SetMailboxState(ctx, m.ID, store.MailboxStateActive); err != nil {
 				return err
@@ -478,6 +500,12 @@ func authRefresh(ctx context.Context, st *store.Store, ks keychain.Store, dialer
 	if err := writeMailboxSecrets(ks, m.ID, client.RefreshToken(), string(passphrase)); err != nil {
 		return fmt.Errorf("store secrets: %w", err)
 	}
+	// Record the session UID minted by this re-login so the next Resume can
+	// identify the session (ADR-0013). This also repairs a pre-migration row
+	// whose session_uid was NULL.
+	if err := st.SetSessionUID(ctx, m.ID, client.SessionUID()); err != nil {
+		return err
+	}
 	if err := st.SetMailboxState(ctx, m.ID, store.MailboxStateActive); err != nil {
 		return err
 	}
@@ -506,6 +534,19 @@ func persistRotatedTokenOrFlag(ctx context.Context, st *store.Store, ks keychain
 		return err
 	}
 	return nil
+}
+
+// persistRotatedSessionUID writes the session UID back to the mailbox row only
+// when a resume actually rotated it, avoiding a needless write when it is
+// unchanged. Unlike the refresh token, the UID lives in the store (non-secret
+// session state, ADR-0013), so no keychain write is involved. An empty current
+// value is ignored — a resume that did not surface a UID must not clobber the
+// stored one to "".
+func persistRotatedSessionUID(ctx context.Context, st *store.Store, mailboxID, old, current string) error {
+	if current == "" || current == old {
+		return nil
+	}
+	return st.SetSessionUID(ctx, mailboxID, current)
 }
 
 // resolveMailbox selects the mailbox to operate on. When address is non-empty
