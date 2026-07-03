@@ -49,4 +49,5 @@ jobs:
           AIBOT_LITELLM_API_KEY:  ${{ secrets.AIBOT_LITELLM_API_KEY }}
           AIBOT_GITEA_HOST:  ${{ github.server_url }}
           AIBOT_GITEA_TOKEN: ${{ github.token }}
+          AIBOT_MERGE_TOKEN: ${{ secrets.AIBOT_MERGE_TOKEN }}
           AIBOT_BOT_LOGIN:   ${{ vars.AIBOT_BOT_LOGIN }}
