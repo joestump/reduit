@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -191,6 +192,93 @@ func TestGPADialer_ResumeReusesCachedSession(t *testing.T) {
 	}
 	if first.uid != "uid-1" {
 		t.Errorf("first call x-pm-uid = %q, want uid-1", first.uid)
+	}
+}
+
+// TestGPAClient_UnlockWithKeyPassSkipsSalts is the regression guard for the
+// 9101-on-resume fix: UnlockWithKeyPass MUST NOT call the salts endpoint
+// (/core/v4/keys/salts) — that endpoint needs the 2FA-elevated scope a
+// lazily-refreshed session loses. It fetches user + address metadata (both work
+// on the reduced mail scope) and runs the local crypto unlock from the persisted
+// key pass. We assert the salts path is absent from the recorded requests, the
+// two metadata paths are present, and the key pass is retained for persistence.
+func TestGPAClient_UnlockWithKeyPassSkipsSalts(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRT{body: `{"Code":1000}`}
+	d := NewDialer(Config{HostURL: "https://proton.invalid", AppVersion: "reduit@test", Transport: rt})
+	defer d.Close()
+
+	c, err := d.Resume(ctx, "user-1", "uid-1", "acc-1", "ref-1")
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	defer c.Close()
+
+	keyPass := []byte("salted-key-pass")
+	// The canned envelope yields an empty key set, so the local gpa.Unlock cannot
+	// build a keyring and returns ErrUnlockFailed — but ONLY after GetUser and
+	// GetAddresses ran and WITHOUT ever calling the salts endpoint, which is the
+	// property under test. (A real account's keys would unlock; here we only
+	// assert the request shape, not the crypto outcome.)
+	if err := c.UnlockWithKeyPass(ctx, keyPass); !errors.Is(err, ErrUnlockFailed) {
+		t.Fatalf("UnlockWithKeyPass = %v, want ErrUnlockFailed on the empty-key envelope", err)
+	}
+
+	var sawUsers, sawAddresses, sawSalts bool
+	for _, r := range rt.snapshot() {
+		switch r.path {
+		case "/core/v4/keys/salts":
+			sawSalts = true
+		case "/core/v4/users":
+			sawUsers = true
+		case "/core/v4/addresses":
+			sawAddresses = true
+		}
+	}
+	if sawSalts {
+		t.Error("UnlockWithKeyPass called /core/v4/keys/salts; it must skip the salts endpoint on a resume")
+	}
+	if !sawUsers {
+		t.Error("UnlockWithKeyPass did not fetch /core/v4/users")
+	}
+	if !sawAddresses {
+		t.Error("UnlockWithKeyPass did not fetch /core/v4/addresses")
+	}
+}
+
+// TestGPAClient_UnlockWithKeyPassGuardsBeforeAuth verifies the nil-session guard.
+func TestGPAClient_UnlockWithKeyPassGuardsBeforeAuth(t *testing.T) {
+	c := &gpaClient{}
+	if err := c.UnlockWithKeyPass(context.Background(), []byte("kp")); !errors.Is(err, ErrNotAuthenticated) {
+		t.Errorf("UnlockWithKeyPass before auth = %v, want ErrNotAuthenticated", err)
+	}
+	if c.SaltedKeyPass() != nil {
+		t.Error("SaltedKeyPass should be nil before any unlock")
+	}
+}
+
+// TestGPAClient_UnlockWithKeyPassErrorHasNoKeyPass guards SPEC-0007 "No Secret
+// Leakage" for the new path: an ErrUnlockFailed from a stale/wrong key pass must
+// not embed the key pass bytes. gpa.Unlock's error carries a crypto message, not
+// the secret, and the wrap adds only that.
+func TestGPAClient_UnlockWithKeyPassErrorHasNoKeyPass(t *testing.T) {
+	ctx := context.Background()
+	rt := &recordingRT{body: `{"Code":1000}`}
+	d := NewDialer(Config{HostURL: "https://proton.invalid", AppVersion: "reduit@test", Transport: rt})
+	defer d.Close()
+	c, err := d.Resume(ctx, "u", "uid", "acc", "ref")
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	defer c.Close()
+
+	const secret = "SUPER-SECRET-KEY-PASS-BYTES"
+	uerr := c.UnlockWithKeyPass(ctx, []byte(secret))
+	if uerr == nil {
+		t.Fatal("expected an unlock error on the empty-key envelope")
+	}
+	if strings.Contains(uerr.Error(), secret) {
+		t.Errorf("UnlockWithKeyPass error leaked the key pass: %q", uerr.Error())
 	}
 }
 

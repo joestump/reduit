@@ -100,16 +100,18 @@ type resumeSeed struct {
 }
 
 // resumeClient reconstructs an authenticated, unlocked Proton client for the
-// mailbox from its stored secrets, mirroring how `reduit labels` resumes:
-// keychain access + refresh token + stored session UID → Dialer.Resume (session
-// REUSE, no network) → Unlock with the keychain passphrase. Reusing the cached
-// access token preserves the 2FA-elevated scope key/salt access needs; an eager
-// refresh would reduce it and fail Unlock's GetSalts with 403 code 9101. It
-// returns the seed values so the caller can persist any tokens a lazy refresh
-// rotates during the run, and reports whether the failure warrants flipping the
-// mailbox to needs_reauth (bad/absent credentials) versus a transient failure
-// retried next run. Nothing is persisted here: Resume makes no network call, so
-// no rotation has happened yet.
+// mailbox from its stored secrets: keychain access + refresh token + stored
+// session UID → Dialer.Resume (session REUSE, no network) → unlock. Unlock
+// prefers the persisted salted key passphrase (UnlockWithKeyPass), which does
+// NOT call the salts endpoint, so a session whose scope a lazy refresh
+// downgraded can still unlock and sync — the fix for the 403 code 9101 that a
+// resume-time GetSalts hits on a downgraded session. See unlockResumed for the
+// present/absent/stale decision tree and the self-heal that seeds the key pass
+// for a pre-fix mailbox. It returns the seed values so the caller can persist
+// any tokens a lazy refresh rotates during the run, and reports whether the
+// failure warrants flipping the mailbox to needs_reauth (bad/absent credentials)
+// versus a transient failure retried next run. No session tokens are persisted
+// here: Resume makes no network call, so no rotation has happened yet.
 func (e *Engine) resumeClient(ctx context.Context, m store.Mailbox) (client proton.Client, seed resumeSeed, reauth bool, err error) {
 	if m.ProtonUserID == nil {
 		return nil, seed, true, errors.New("mailbox has never authenticated")
@@ -149,20 +151,104 @@ func (e *Engine) resumeClient(ctx context.Context, m store.Mailbox) (client prot
 		return nil, seed, errors.Is(err, proton.ErrRefreshTokenInvalid), fmt.Errorf("resume session: %w", err)
 	}
 
+	if err := e.unlockResumed(ctx, m, client); err != nil {
+		client.Close()
+		// A rejected passphrase/keypass means the stored secrets no longer unlock
+		// the keys — a re-auth condition. As before this fix, any unlock failure on
+		// resume flags needs_reauth (unlock is outside the retry loop); the change
+		// here is only WHICH unlock is attempted (key pass first, then passphrase),
+		// so a scope-downgraded session that previously 9101'd on GetSalts now
+		// unlocks from the persisted key pass instead of reaching this branch.
+		return nil, seed, true, err
+	}
+	return client, seed, false, nil
+}
+
+// unlockResumed unlocks an already-resumed client, preferring the persisted
+// salted key passphrase so the salts endpoint is NEVER called on a resume — the
+// crux of the 9101 fix. Because a lazily-refreshed session is scope-downgraded,
+// GetSalts (which only Unlock calls) would 403 with code 9101; UnlockWithKeyPass
+// avoids it entirely (SPEC-0007 "Cross-Process Session Resume"). The decision
+// tree:
+//
+//   - salted_key_pass present → UnlockWithKeyPass. Success: done, no re-derive.
+//     A stale key pass (ErrUnlockFailed, e.g. after a password change) → try the
+//     passphrase Unlock ONCE (a still-full-scope session can salvage it and
+//     re-derive), and on success re-persist the fresh key pass.
+//   - salted_key_pass absent (pre-fix mailbox) → passphrase Unlock, then persist
+//     the freshly-derived key pass so the NEXT resume skips salts (self-heal).
+//     NOTE the self-heal Unlock calls GetSalts, which a scope-downgraded resume
+//     cannot; a pre-fix mailbox on a downgraded session therefore fails here and
+//     needs one `reduit auth refresh` to seed the key pass — it cannot self-heal
+//     from a downgraded session alone.
+//
+// The passphrase and key pass are read from the keychain, used, and zeroed; they
+// are never logged (SPEC-0007 "No Secret Leakage").
+func (e *Engine) unlockResumed(ctx context.Context, m store.Mailbox, client proton.Client) error {
+	encoded, err := e.keychain.Get(m.ID, keychain.SaltedKeyPass)
+	switch {
+	case err == nil && encoded != "":
+		keyPass, derr := keychain.DecodeSaltedKeyPass(encoded)
+		if derr != nil {
+			// A corrupt stored value is not a secret-leak risk (the error carries
+			// the malformed input's decode failure, not key bytes); treat it like a
+			// stale key pass and fall back to the passphrase path.
+			e.log.Warn("stored salted key pass is malformed; falling back to passphrase unlock",
+				"mailbox_id", m.ID)
+			return e.unlockWithPassphrase(ctx, m, client)
+		}
+		defer zeroBytes(keyPass)
+		if uerr := client.UnlockWithKeyPass(ctx, keyPass); uerr == nil {
+			return nil
+		} else if !errors.Is(uerr, proton.ErrUnlockFailed) {
+			// A network or other non-crypto failure: not a stale-keypass condition,
+			// so do not spend a passphrase attempt on it — surface it.
+			return fmt.Errorf("unlock mailbox (key pass): %w", uerr)
+		}
+		// Stale key pass: fall back to a full-scope passphrase unlock once, which
+		// re-derives and re-persists a fresh key pass on success.
+		e.log.Info("stored salted key pass is stale; retrying with passphrase (will re-derive)",
+			"mailbox_id", m.ID)
+		return e.unlockWithPassphrase(ctx, m, client)
+	case err == nil:
+		// Empty stored value (defensive): treat as absent.
+		return e.unlockWithPassphrase(ctx, m, client)
+	case errors.Is(err, keychain.ErrNotFound):
+		// Pre-fix mailbox: no key pass yet. Unlock via passphrase and self-heal.
+		return e.unlockWithPassphrase(ctx, m, client)
+	default:
+		return fmt.Errorf("read salted key pass: %w", err)
+	}
+}
+
+// unlockWithPassphrase unlocks via the stored mailbox passphrase (the salts
+// path) and persists the freshly-derived salted key pass so the next resume can
+// skip the salts endpoint (self-heal). On a scope-downgraded session GetSalts
+// fails with 403 code 9101 and this returns an actionable re-auth error.
+func (e *Engine) unlockWithPassphrase(ctx context.Context, m store.Mailbox, client proton.Client) error {
 	passphrase, err := e.keychain.Get(m.ID, keychain.MailboxPassphrase)
 	if err != nil {
-		client.Close()
-		return nil, seed, errors.Is(err, keychain.ErrNotFound), fmt.Errorf("read passphrase: %w", err)
+		return fmt.Errorf("read passphrase: %w", err)
 	}
 	pb := []byte(passphrase)
 	defer zeroBytes(pb)
 	if err := client.Unlock(ctx, pb); err != nil {
-		client.Close()
-		// A rejected passphrase means the stored secret no longer unlocks the
-		// keys — a re-auth condition.
-		return nil, seed, true, fmt.Errorf("unlock mailbox: %w", err)
+		// GetSalts on a scope-downgraded session returns 403 code 9101; make the
+		// remedy explicit since retrying/refreshing can never re-elevate scope.
+		return fmt.Errorf("unlock mailbox: %w — re-authenticate with 'reduit auth refresh %s'", err, m.Address)
 	}
-	return client, seed, false, nil
+	// Self-heal: persist the freshly-derived key pass so the next resume unlocks
+	// without the salts endpoint. A failed write is non-fatal — the mailbox is
+	// unlocked and syncs this run; it just re-derives next run.
+	if kp := client.SaltedKeyPass(); len(kp) > 0 {
+		if werr := e.keychain.Set(m.ID, keychain.SaltedKeyPass, keychain.EncodeSaltedKeyPass(kp)); werr != nil {
+			e.log.Warn("persist self-healed salted key pass failed; will re-derive next run",
+				"mailbox_id", m.ID, "error", werr)
+		} else {
+			e.log.Debug("self-healed salted key pass persisted", "mailbox_id", m.ID)
+		}
+	}
+	return nil
 }
 
 // persistRotatedSession writes back any session value a lazy refresh rotated

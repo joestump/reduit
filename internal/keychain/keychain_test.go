@@ -112,6 +112,9 @@ func TestDeleteAll(t *testing.T) {
 		if err := s.Set(id, MailboxPassphrase, "pp-"+id); err != nil {
 			t.Fatalf("Set MailboxPassphrase %s: %v", id, err)
 		}
+		if err := s.Set(id, SaltedKeyPass, EncodeSaltedKeyPass([]byte("skp-"+id))); err != nil {
+			t.Fatalf("Set SaltedKeyPass %s: %v", id, err)
+		}
 	}
 
 	if err := s.DeleteAll(testMailboxID); err != nil {
@@ -135,6 +138,31 @@ func TestDeleteAll(t *testing.T) {
 	}
 }
 
+// TestSaltedKeyPassRoundTrip covers the base64 encode/decode transform used to
+// stuff arbitrary key-pass bytes through the string-typed keyring API, including
+// bytes that are not valid UTF-8.
+func TestSaltedKeyPassRoundTrip(t *testing.T) {
+	cases := [][]byte{
+		nil,
+		{},
+		[]byte("plain-ascii"),
+		{0x00, 0xff, 0x10, 0x80, 0x7f, 0xfe}, // binary, non-UTF-8
+	}
+	for _, kp := range cases {
+		enc := EncodeSaltedKeyPass(kp)
+		got, err := DecodeSaltedKeyPass(enc)
+		if err != nil {
+			t.Fatalf("DecodeSaltedKeyPass(%q): %v", enc, err)
+		}
+		if string(got) != string(kp) {
+			t.Errorf("roundtrip = %x, want %x", got, kp)
+		}
+	}
+	if _, err := DecodeSaltedKeyPass("not!valid!base64!"); err == nil {
+		t.Error("DecodeSaltedKeyPass(malformed) = nil error, want decode error")
+	}
+}
+
 // TestAccountKeyFormat pins the exact "mailbox/<id>/<kind>" layout from
 // ADR-0013 — a regression here would silently orphan or mis-route every
 // secret.
@@ -145,6 +173,7 @@ func TestAccountKeyFormat(t *testing.T) {
 	}{
 		{RefreshToken, "mailbox/" + testMailboxID + "/refresh_token"},
 		{MailboxPassphrase, "mailbox/" + testMailboxID + "/mailbox_passphrase"},
+		{SaltedKeyPass, "mailbox/" + testMailboxID + "/salted_key_pass"},
 	}
 	for _, c := range cases {
 		got, err := accountKey(testMailboxID, c.kind)

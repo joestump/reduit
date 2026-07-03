@@ -185,7 +185,7 @@ func authAdd(ctx context.Context, st *store.Store, ks keychain.Store, dialer pro
 		cleanup()
 		return err
 	}
-	if err := writeMailboxSecrets(ks, mailboxID, client.RefreshToken(), client.AccessToken(), string(passphrase)); err != nil {
+	if err := writeMailboxSecrets(ks, mailboxID, client.RefreshToken(), client.AccessToken(), string(passphrase), client.SaltedKeyPass()); err != nil {
 		cleanup()
 		return fmt.Errorf("store secrets: %w", err)
 	}
@@ -266,9 +266,13 @@ func interactiveAuth(ctx context.Context, client proton.Client, p prompter, addr
 // writeMailboxSecrets persists a mailbox's live secrets to the keychain, keyed
 // by mailbox id (#85, the store↔keychain seam). It never logs the values. The
 // access token is persisted alongside the refresh token so a later cross-process
-// Resume can reuse the cached session and keep the 2FA-elevated scope (SPEC-0007
-// "Cross-Process Session Resume").
-func writeMailboxSecrets(ks keychain.Store, mailboxID, refreshToken, accessToken, passphrase string) error {
+// Resume can reuse the cached session and keep the 2FA-elevated scope; the
+// salted key passphrase is persisted so a scope-DOWNGRADED resume can still
+// unlock the OpenPGP keys without the salts endpoint (SPEC-0007 "Cross-Process
+// Session Resume"). saltedKeyPass is base64-encoded because the key bytes are
+// binary and the keychain API is string-typed; an empty slice writes an empty
+// value (the caller passes the just-unlocked client's SaltedKeyPass()).
+func writeMailboxSecrets(ks keychain.Store, mailboxID, refreshToken, accessToken, passphrase string, saltedKeyPass []byte) error {
 	if err := ks.Set(mailboxID, keychain.RefreshToken, refreshToken); err != nil {
 		return actionableKeyringErr(err)
 	}
@@ -276,6 +280,9 @@ func writeMailboxSecrets(ks keychain.Store, mailboxID, refreshToken, accessToken
 		return actionableKeyringErr(err)
 	}
 	if err := ks.Set(mailboxID, keychain.MailboxPassphrase, passphrase); err != nil {
+		return actionableKeyringErr(err)
+	}
+	if err := ks.Set(mailboxID, keychain.SaltedKeyPass, keychain.EncodeSaltedKeyPass(saltedKeyPass)); err != nil {
 		return actionableKeyringErr(err)
 	}
 	return nil
@@ -496,7 +503,7 @@ func authRefresh(ctx context.Context, st *store.Store, ks keychain.Store, dialer
 		return fmt.Errorf("this address now maps to a different Proton account than before; remove and re-add it ('reduit auth remove %s' then 'reduit auth add %s')", address, address)
 	}
 
-	if err := writeMailboxSecrets(ks, m.ID, client.RefreshToken(), client.AccessToken(), string(passphrase)); err != nil {
+	if err := writeMailboxSecrets(ks, m.ID, client.RefreshToken(), client.AccessToken(), string(passphrase), client.SaltedKeyPass()); err != nil {
 		return fmt.Errorf("store secrets: %w", err)
 	}
 	// Record the session UID minted by this re-login so the next Resume can
@@ -561,10 +568,11 @@ func persistRotatedAccessToken(ks keychain.Store, mailboxID, old, current string
 
 // tryCheapResume is the cheap path of `auth refresh`: reuse the stored session
 // (Resume) and prove it still works before declaring the mailbox active. It
-// returns done=true only when the mailbox was refreshed and reactivated; a
-// done=false, err=nil result means the caller SHOULD fall through to the
-// interactive re-login (dead session, or a pre-fix row with no stored access
-// token). A non-nil err is a hard failure the caller returns as-is.
+// returns done=true only when the mailbox was refreshed, VERIFIED unlockable,
+// and reactivated; a done=false, err=nil result means the caller SHOULD fall
+// through to the interactive re-login (dead session, a pre-fix row with no
+// stored access token, or a resumed session that can no longer unlock). A
+// non-nil err is a hard failure the caller returns as-is.
 //
 // Because Resume now reuses the cached session (NewClient) and makes no network
 // call, this path must issue a real API call to validate it. Labels is that
@@ -572,6 +580,15 @@ func persistRotatedAccessToken(ks keychain.Store, mailboxID, old, current string
 // live connection test — and it is where a lazy refresh (if the cached access
 // token has expired) rotates the tokens. The rotated access/refresh/UID are
 // persisted AFTER the probe so the next resume matches.
+//
+// Critically, a passing Labels probe is NOT sufficient: a lazily-refreshed
+// session can label mail but be scope-downgraded so it cannot GetSalts — the
+// exact 9101 that leaves sync broken while `auth refresh` used to print
+// "Refreshed". So this ALSO verifies the session can actually unlock (via the
+// persisted key pass, preferred, or the passphrase); if it cannot, it returns
+// done=false to escalate to the full interactive re-login, which re-elevates
+// scope and re-persists every secret. This is what makes `auth refresh` the
+// reliable one-command fix (SPEC-0007 "Re-Auth Flow").
 func tryCheapResume(ctx context.Context, st *store.Store, ks keychain.Store, dialer proton.Dialer, m store.Mailbox, storedUID, refreshToken, address string, out io.Writer) (done bool, err error) {
 	accessToken, aerr := ks.Get(m.ID, keychain.AccessToken)
 	switch {
@@ -596,6 +613,16 @@ func tryCheapResume(ctx context.Context, st *store.Store, ks keychain.Store, dia
 		return false, nil // dead session — re-login
 	}
 
+	// Verify the resumed session can UNLOCK, not just label. A scope-downgraded
+	// session passes Labels but fails the salts endpoint (9101); if unlock is
+	// impossible here, escalate to the full re-login rather than declaring the
+	// mailbox active with sync still broken.
+	if ok, verr := verifyResumedUnlock(ctx, ks, client, m); verr != nil {
+		return false, verr
+	} else if !ok {
+		return false, nil // cannot unlock on this session — re-login re-elevates scope
+	}
+
 	if err := persistRotatedAccessToken(ks, m.ID, accessToken, client.AccessToken()); err != nil {
 		return false, fmt.Errorf("store rotated access token: %w", err)
 	}
@@ -609,6 +636,68 @@ func tryCheapResume(ctx context.Context, st *store.Store, ks keychain.Store, dia
 		return false, err
 	}
 	fmt.Fprintf(out, "Refreshed mailbox %s\n", address)
+	return true, nil
+}
+
+// verifyResumedUnlock proves a resumed session can unlock the mailbox keys,
+// mirroring the sync engine's resume-time unlock so `auth refresh`'s cheap path
+// declares success only when sync will actually work. It prefers the persisted
+// salted key pass (UnlockWithKeyPass — no salts endpoint, works on a downgraded
+// session); on a stale key pass it retries the passphrase once; with no stored
+// key pass it unlocks via passphrase and self-heals by persisting the freshly
+// derived key pass. It returns ok=false (not an error) when the session cannot
+// unlock — a wrong/stale credential OR the 9101 a scope-downgraded GetSalts
+// hits — so the caller escalates to the full re-login. A non-nil error is a hard
+// keychain failure. Secrets are read, used, and zeroed; never logged.
+func verifyResumedUnlock(ctx context.Context, ks keychain.Store, client proton.Client, m store.Mailbox) (ok bool, err error) {
+	encoded, kerr := ks.Get(m.ID, keychain.SaltedKeyPass)
+	switch {
+	case kerr == nil && encoded != "":
+		keyPass, derr := keychain.DecodeSaltedKeyPass(encoded)
+		if derr == nil {
+			defer zero(keyPass)
+			if uerr := client.UnlockWithKeyPass(ctx, keyPass); uerr == nil {
+				return true, nil
+			} else if !errors.Is(uerr, proton.ErrUnlockFailed) {
+				// Network/other non-crypto failure: not a re-login trigger by itself,
+				// but the cheap path cannot confirm unlockability — escalate.
+				return false, nil
+			}
+			// Stale key pass: fall through to the passphrase attempt.
+		}
+		return verifyUnlockWithPassphrase(ctx, ks, client, m)
+	case kerr == nil, errors.Is(kerr, keychain.ErrNotFound):
+		// Empty (defensive) or absent (pre-fix row): unlock via passphrase.
+		return verifyUnlockWithPassphrase(ctx, ks, client, m)
+	default:
+		return false, actionableKeyringErr(kerr)
+	}
+}
+
+// verifyUnlockWithPassphrase unlocks the resumed client via the stored
+// passphrase (the salts path) and, on success, persists the freshly-derived key
+// pass so the next resume skips salts. On a scope-downgraded session GetSalts
+// 9101s and Unlock fails → ok=false → escalate to re-login. A missing passphrase
+// is treated as "cannot unlock cheaply" (ok=false), not a hard error, so the
+// re-login can recover it.
+func verifyUnlockWithPassphrase(ctx context.Context, ks keychain.Store, client proton.Client, m store.Mailbox) (ok bool, err error) {
+	passphrase, perr := ks.Get(m.ID, keychain.MailboxPassphrase)
+	if perr != nil {
+		if errors.Is(perr, keychain.ErrNotFound) {
+			return false, nil // no passphrase to try — re-login prompts for it
+		}
+		return false, actionableKeyringErr(perr)
+	}
+	pb := []byte(passphrase)
+	defer zero(pb)
+	if uerr := client.Unlock(ctx, pb); uerr != nil {
+		return false, nil // wrong/stale passphrase or 9101 on a downgraded session — re-login
+	}
+	if kp := client.SaltedKeyPass(); len(kp) > 0 {
+		// Self-heal: seed the key pass so the next resume unlocks without salts. A
+		// failed write is non-fatal — the session unlocked fine this run.
+		_ = ks.Set(m.ID, keychain.SaltedKeyPass, keychain.EncodeSaltedKeyPass(kp))
+	}
 	return true, nil
 }
 

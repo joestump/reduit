@@ -110,6 +110,7 @@ func TestAuthAdd_HappyPath(t *testing.T) {
 	fake.UserID = "proton-user-1"
 	fake.Token = "refresh-token-1"
 	fake.UID = "session-uid-1"
+	fake.SaltedKeyPassValue = []byte("salted-key-pass-secret")
 	dialer := &fakeDialer{client: fake}
 	p := &scriptPrompter{secrets: []string{"hunter2", "mailbox-pass"}}
 
@@ -144,7 +145,7 @@ func TestAuthAdd_HappyPath(t *testing.T) {
 	if !strings.Contains(out.String(), "joe@proton.test") {
 		t.Errorf("success line missing address: %q", out.String())
 	}
-	for _, secret := range []string{"hunter2", "refresh-token-1", "mailbox-pass"} {
+	for _, secret := range []string{"hunter2", "refresh-token-1", "mailbox-pass", "salted-key-pass-secret"} {
 		if strings.Contains(out.String(), secret) {
 			t.Errorf("secret %q leaked to output: %q", secret, out.String())
 		}
@@ -517,6 +518,106 @@ func TestAuthRefresh(t *testing.T) {
 	m2, _ := st.GetMailboxByAddress(ctx, "refresh@proton.test")
 	if m2.SessionUID == nil || *m2.SessionUID != "session-uid-7-rot" {
 		t.Errorf("rotated session_uid not persisted: %v", m2.SessionUID)
+	}
+}
+
+// TestAuthAdd_PersistsSaltedKeyPass asserts the salted key passphrase derived at
+// login is persisted (base64-encoded) alongside the other secrets, so a later
+// scope-downgraded resume can unlock without the salts endpoint (SPEC-0007
+// "Cross-Process Session Resume").
+func TestAuthAdd_PersistsSaltedKeyPass(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newTestKeychain(t)
+	fake := proton.NewFake()
+	fake.UserID = "u-skp"
+	fake.Token = "rt-skp"
+	fake.UID = "uid-skp"
+	fake.Access = "acc-skp"
+	fake.SaltedKeyPassValue = []byte("derived-key-pass")
+	dialer := &fakeDialer{client: fake}
+
+	if err := authAdd(ctx, st, ks, dialer, &scriptPrompter{secrets: []string{"pw", "pass"}}, "skp@proton.test", &bytes.Buffer{}); err != nil {
+		t.Fatalf("authAdd: %v", err)
+	}
+	m, _ := st.GetMailboxByAddress(ctx, "skp@proton.test")
+	enc, err := ks.Get(m.ID, keychain.SaltedKeyPass)
+	if err != nil {
+		t.Fatalf("salted key pass not stored: %v", err)
+	}
+	got, derr := keychain.DecodeSaltedKeyPass(enc)
+	if derr != nil {
+		t.Fatalf("stored key pass not decodable: %v", derr)
+	}
+	if string(got) != "derived-key-pass" {
+		t.Errorf("stored key pass = %q, want derived-key-pass", got)
+	}
+}
+
+// TestAuthRefresh_EscalatesWhenResumeCannotUnlock is the owner's direct
+// complaint: a resumed session that can LABEL but is scope-downgraded so it
+// cannot GetSalts (the 9101) must NOT be reported "Refreshed" while sync stays
+// broken. The cheap path verifies unlockability; when unlock is impossible it
+// escalates to the FULL interactive re-login (password + TOTP), which
+// re-elevates scope and re-persists every secret — making `auth refresh` the
+// reliable one-command fix.
+func TestAuthRefresh_EscalatesWhenResumeCannotUnlock(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newTestKeychain(t)
+	fake := proton.NewFake()
+	fake.UserID = "u-esc"
+	fake.Token = "rt-esc"
+	fake.UID = "uid-esc"
+	fake.Access = "acc-esc"
+	fake.LabelList = []proton.Label{{ID: "0", Name: "Inbox", Type: proton.LabelTypeSystem}}
+	dialer := &fakeDialer{client: fake}
+
+	// Seed via a normal add (persists a key pass = nil → empty stored value).
+	if err := authAdd(ctx, st, ks, dialer, &scriptPrompter{secrets: []string{"pw", "pass"}}, "esc@proton.test", &bytes.Buffer{}); err != nil {
+		t.Fatalf("seed add: %v", err)
+	}
+	m, _ := st.GetMailboxByAddress(ctx, "esc@proton.test")
+	// Store a (now stale) key pass and model a scope-downgraded session: the key
+	// pass no longer matches AND the passphrase Unlock also fails on this session
+	// (its GetSalts would 9101). Both cheap unlock attempts fail → escalate.
+	if err := ks.Set(m.ID, keychain.SaltedKeyPass, keychain.EncodeSaltedKeyPass([]byte("stale"))); err != nil {
+		t.Fatal(err)
+	}
+	fake.UnlockWithKeyPassErr = proton.ErrUnlockFailed // stale key pass rejected
+	fake.Passphrase = "correct-pass"                   // stored "pass" fails the cheap Unlock
+
+	// The re-login supplies fresh creds ("correct-pass") the session accepts, and
+	// mints new session state the escalation re-persists.
+	fake.Token = "rt-esc-relogin"
+	fake.UID = "uid-esc-relogin"
+	fake.Access = "acc-esc-relogin"
+	fake.SaltedKeyPassValue = []byte("relogin-key-pass")
+
+	var out bytes.Buffer
+	p := &scriptPrompter{secrets: []string{"new-pw", "correct-pass"}}
+	if err := authRefresh(ctx, st, ks, dialer, p, "esc@proton.test", &out); err != nil {
+		t.Fatalf("authRefresh: %v", err)
+	}
+	// It must have ESCALATED, not printed "Refreshed".
+	if strings.Contains(out.String(), "Refreshed") {
+		t.Errorf("cheap path wrongly declared success on a session it could not unlock: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "Re-authenticated") {
+		t.Errorf("expected full re-login, got: %q", out.String())
+	}
+	// The re-login re-persisted every secret, including a fresh key pass.
+	if tok, _ := ks.Get(m.ID, keychain.RefreshToken); tok != "rt-esc-relogin" {
+		t.Errorf("refresh token not rewritten by escalation: %q", tok)
+	}
+	enc, _ := ks.Get(m.ID, keychain.SaltedKeyPass)
+	if got, _ := keychain.DecodeSaltedKeyPass(enc); string(got) != "relogin-key-pass" {
+		t.Errorf("key pass not re-persisted by escalation: %q, want relogin-key-pass", got)
+	}
+	// And the mailbox is active again.
+	got, _ := st.GetMailboxByAddress(ctx, "esc@proton.test")
+	if got.State != store.MailboxStateActive {
+		t.Errorf("state = %q, want active", got.State)
 	}
 }
 

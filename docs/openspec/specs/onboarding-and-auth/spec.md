@@ -19,11 +19,15 @@ rather than solved: reduit identifies as a Proton Bridge client
 (app-version), which Proton waves through with no CAPTCHA, so there is no
 in-app challenge solver (ADR-0021). The live secrets
 produced by a successful auth — the Proton refresh token, the Proton
-access token, and the mailbox passphrase — are written to the OS keychain
+access token, the mailbox passphrase, and the derived salted key
+passphrase — are written to the OS keychain
 (ADR-0013) under service `reduit` at keys `mailbox/<id>/refresh_token`,
-`mailbox/<id>/access_token`, and `mailbox/<id>/mailbox_passphrase`. The
+`mailbox/<id>/access_token`, `mailbox/<id>/mailbox_passphrase`, and
+`mailbox/<id>/salted_key_pass`. The
 access token is persisted so a cross-process resume can reuse the cached
-session and preserve the 2FA-elevated scope (see "Cross-Process Session
+session and preserve the 2FA-elevated scope; the salted key passphrase is
+persisted so a scope-DOWNGRADED resume can still unlock the OpenPGP keys
+without the (scope-elevated) salts endpoint (see "Cross-Process Session
 Resume"). They MUST NOT be written to disk,
 logs, the SQLite store, error messages, or shell history. The same flow
 re-authenticates a mailbox in `needs_reauth` and supports adding a second
@@ -141,6 +145,16 @@ written to keychain key `mailbox/<id>/mailbox_passphrase`. The
 passphrase MUST NOT be written to disk, to logs, to the SQLite store, or
 to any error message.
 
+Unlocking derives a *salted key passphrase* from the passphrase and the
+primary key's salt (fetched from the salts endpoint, which requires the
+2FA-elevated scope). This derived value SHALL be retained and persisted to
+keychain key `mailbox/<id>/salted_key_pass` so a later resume can unlock the
+OpenPGP keys directly from it WITHOUT calling the salts endpoint — the
+mechanism that lets a scope-downgraded refreshed session still sync (see
+"Cross-Process Session Resume"). It is a secret (it grants mailbox key
+access) and MUST NOT be written to disk, to logs, to the SQLite store, or to
+any error message.
+
 #### Scenario: Passphrase is read without echo
 
 - **WHEN** the flow prompts for the mailbox passphrase
@@ -166,21 +180,25 @@ to any error message.
 Per-mailbox secrets SHALL be created in the OS keychain at auth time,
 read non-interactively at sync and send time, and deleted when the
 mailbox is removed. The keys SHALL be `mailbox/<id>/refresh_token`,
-`mailbox/<id>/access_token`, and `mailbox/<id>/mailbox_passphrase` under
+`mailbox/<id>/access_token`, `mailbox/<id>/mailbox_passphrase`, and
+`mailbox/<id>/salted_key_pass` under
 service `reduit`; the database SHALL hold only the `mailbox_id` reference.
+The salted key passphrase is raw key bytes, so it SHALL be stored
+base64-encoded (the keychain API is string-typed).
 
 #### Scenario: Secrets created on successful auth
 
 - **WHEN** `reduit auth` completes for a mailbox
 - **THEN** the system SHALL write the Proton refresh token to
   `mailbox/<id>/refresh_token`, the Proton access token to
-  `mailbox/<id>/access_token`, and the mailbox passphrase to
-  `mailbox/<id>/mailbox_passphrase`
+  `mailbox/<id>/access_token`, the mailbox passphrase to
+  `mailbox/<id>/mailbox_passphrase`, and the derived salted key passphrase
+  (base64-encoded) to `mailbox/<id>/salted_key_pass`
 
 #### Scenario: Secrets read non-interactively at use time
 
 - **WHEN** a sync or send operation needs the refresh token, access token,
-  or passphrase for an `active` mailbox
+  passphrase, or salted key passphrase for an `active` mailbox
 - **THEN** the system SHALL read it from the keychain by the
   `mailbox/<id>/<kind>` key without prompting the operator, subject only
   to the OS keyring being unlocked
@@ -189,7 +207,8 @@ service `reduit`; the database SHALL hold only the `mailbox_id` reference.
 
 - **WHEN** a mailbox is removed
 - **THEN** the system SHALL delete `mailbox/<id>/refresh_token`,
-  `mailbox/<id>/access_token`, and `mailbox/<id>/mailbox_passphrase`; no
+  `mailbox/<id>/access_token`, `mailbox/<id>/mailbox_passphrase`, and
+  `mailbox/<id>/salted_key_pass`; no
   orphaned secret SHALL remain in the keychain
 
 ### Requirement: Re-Auth Flow
@@ -201,13 +220,33 @@ secrets, and preserve the existing `mailbox_id`-scoped cache. A re-auth
 that resolves a different `proton_user_id` than the row already holds
 SHALL be an error and SHALL NOT overwrite the stored value.
 
+`reduit auth refresh` SHALL be the reliable one-command fix. Its cheap
+path (resume the stored session and rotate tokens) SHALL NOT declare
+success on a Labels probe alone: a lazily-refreshed session can label mail
+yet be scope-downgraded so it cannot unlock (403 code 9101 on the salts
+endpoint). The cheap path SHALL therefore VERIFY the resumed session can
+actually unlock the OpenPGP keys (via the persisted salted key passphrase,
+or the passphrase fallback); when unlock is impossible on the resumed
+session, it SHALL fall through to the FULL interactive re-login (password +
+TOTP), which re-elevates scope and re-persists every secret.
+
 #### Scenario: Re-auth restores an invalidated mailbox
 
 - **WHEN** the operator runs `reduit auth` for a mailbox whose `state`
   is `needs_reauth`
 - **THEN** the system SHALL re-run the auth flow against the same row,
-  rewrite the refresh token, access token, and passphrase in the keychain,
-  and transition the mailbox back to `active`
+  rewrite the refresh token, access token, passphrase, and salted key
+  passphrase in the keychain, and transition the mailbox back to `active`
+
+#### Scenario: auth refresh escalates when the resumed session cannot unlock
+
+- **WHEN** `auth refresh`'s cheap resume succeeds and even passes a Labels
+  probe, but the resumed session is scope-downgraded so it cannot unlock the
+  OpenPGP keys (the salts endpoint would 9101)
+- **THEN** the system SHALL NOT report the mailbox "Refreshed"; it SHALL
+  escalate to the full interactive re-login, which re-elevates the session
+  scope and re-persists the refresh token, access token, passphrase, salted
+  key passphrase, and session UID, returning the mailbox to `active`
 
 #### Scenario: Re-auth preserves the existing cache
 
@@ -227,7 +266,7 @@ SHALL be an error and SHALL NOT overwrite the stored value.
 ### Requirement: Cross-Process Session Resume
 
 A session minted by `reduit auth` SHALL be resumable from a separate
-process (a sync or send run) without re-prompting. Three pieces of session
+process (a sync or send run) without re-prompting. Four pieces of persisted
 state make this correct, and all SHALL be honored (ADR-0001, ADR-0013,
 ADR-0021):
 
@@ -259,6 +298,54 @@ ADR-0021):
   app-version (`proton.DefaultAppVersion`) satisfies this for the normal
   path; an operator who overrides `proton.app_version` SHALL do so
   consistently across `auth`, `labels`, and `sync`.
+- **Salted key passphrase (unlock without the salts endpoint).** The salted
+  key passphrase is derived ONCE at login — while the session still holds the
+  full 2FA-elevated scope the salts endpoint (`GetSalts`) requires — and
+  persisted per mailbox (keychain). A resume SHALL unlock the OpenPGP keys
+  from this persisted value and SHALL NOT call the salts endpoint, so a
+  scope-DOWNGRADED refreshed session can still unlock and sync. This closes
+  the live failure mode where, after the original access token's TTL expires,
+  go-proton-api's lazy `/auth/v4/refresh` returns a scope-downgraded token:
+  low-scope calls (`labels`) still succeed, but a resume-time `GetSalts`
+  returns **403 code 9101** ("Access token does not have sufficient scope"),
+  permanently breaking `sync` until a full re-login. Retrying or refreshing
+  again can never re-elevate scope; only a full re-login can, and the
+  persisted salted key passphrase avoids needing the elevated-scope call on
+  resume at all (Proton Bridge's pattern). A mailbox that has no persisted
+  salted key passphrase (a pre-fix row) SHALL fall back to a passphrase
+  unlock and, on success, persist the freshly-derived value so the next
+  resume skips the salts endpoint (self-heal); note the self-heal's passphrase
+  unlock itself calls `GetSalts`, so a pre-fix row on an already-downgraded
+  session CANNOT self-heal without one full re-login. A persisted salted key
+  passphrase that no longer decrypts (e.g. after a password change) SHALL fall
+  back to a passphrase unlock once (a still-full-scope session may salvage it
+  and re-persist a fresh value); if that also fails, the mailbox SHALL go to
+  `needs_reauth` with an actionable "re-authenticate" message.
+
+#### Scenario: Resume unlocks from the persisted salted key passphrase without the salts endpoint
+
+- **WHEN** a sync or send process resumes an `active` mailbox that has a
+  persisted salted key passphrase
+- **THEN** the system SHALL unlock the OpenPGP keys from the persisted salted
+  key passphrase WITHOUT calling the salts endpoint, so a scope-downgraded
+  refreshed session unlocks successfully and syncs
+
+#### Scenario: Pre-fix mailbox self-heals the salted key passphrase
+
+- **WHEN** a resume finds no persisted salted key passphrase (a pre-fix row)
+  and the resumed session still has full scope
+- **THEN** the system SHALL unlock via the stored passphrase (which calls the
+  salts endpoint) and SHALL persist the freshly-derived salted key passphrase,
+  so the next resume unlocks without the salts endpoint
+
+#### Scenario: Stale salted key passphrase falls back then re-persists
+
+- **WHEN** a resume's persisted salted key passphrase no longer decrypts the
+  keys (e.g. after a password change)
+- **THEN** the system SHALL fall back to a passphrase unlock once; on success
+  it SHALL re-persist the freshly-derived salted key passphrase, and on
+  failure of both it SHALL transition the mailbox to `needs_reauth` with an
+  actionable re-authenticate message
 
 #### Scenario: Resume reuses the cached access token to preserve scope
 

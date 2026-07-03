@@ -58,7 +58,7 @@ func (k *memKeychain) Delete(id string, kind keychain.Kind) error {
 func (k *memKeychain) DeleteAll(id string) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	for _, kind := range []keychain.Kind{keychain.RefreshToken, keychain.AccessToken, keychain.MailboxPassphrase} {
+	for _, kind := range []keychain.Kind{keychain.RefreshToken, keychain.AccessToken, keychain.MailboxPassphrase, keychain.SaltedKeyPass} {
 		delete(k.m, k.key(id, kind))
 	}
 	return nil
@@ -834,5 +834,154 @@ func TestSync_PersistsRotatedAccessToken(t *testing.T) {
 	}
 	if got, _ := ks.Get("mb-1", keychain.AccessToken); got != "acc-rotated" {
 		t.Errorf("rotated access token not persisted: %q, want acc-rotated", got)
+	}
+}
+
+// TestSync_ResumeUsesKeyPassAndSkipsSalts is the core of the 9101-on-resume fix:
+// when a salted key pass is stored, the resume unlocks via UnlockWithKeyPass and
+// NEVER takes the salts-fetching Unlock path — so a scope-downgraded session can
+// still sync. The Fake's call counters stand in for "GetSalts was not called"
+// (only Unlock reaches GetSalts on the real client).
+func TestSync_ResumeUsesKeyPassAndSkipsSalts(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newMemKeychain()
+	seedActiveMailbox(t, st, ks, "mb-1", "joe@proton.test", "user-1", "uid-1", "tok-1", "pass-1")
+	keyPass := []byte("salted-key-pass")
+	if err := ks.Set("mb-1", keychain.SaltedKeyPass, keychain.EncodeSaltedKeyPass(keyPass)); err != nil {
+		t.Fatalf("seed salted key pass: %v", err)
+	}
+
+	fake := authedFake("tok-1", "uid-1")
+	fake.LabelList = inboxLabels()
+	fake.LatestEvent = "ev-1"
+	fake.SaltedKeyPassValue = keyPass // UnlockWithKeyPass accepts exactly this
+	eng := newEngine(st, ks, &fakeDialer{clients: map[string]proton.Client{"user-1": fake}}, Config{})
+
+	if _, err := eng.SyncMailbox(ctx, "mb-1"); err != nil {
+		t.Fatalf("SyncMailbox: %v", err)
+	}
+	if fake.UnlockWithKeyPassCalls != 1 {
+		t.Errorf("UnlockWithKeyPass calls = %d, want 1", fake.UnlockWithKeyPassCalls)
+	}
+	if fake.UnlockCalls != 0 {
+		t.Errorf("Unlock (salts path) calls = %d, want 0 — the salts endpoint must not be hit on resume", fake.UnlockCalls)
+	}
+}
+
+// TestSync_PreFixMailboxSelfHeals covers a mailbox with no stored key pass (the
+// state right after this fix ships): the resume falls back to the passphrase
+// Unlock and persists the freshly-derived key pass, so the NEXT resume skips the
+// salts endpoint (self-heal). Requires a FULL-scope session for the first
+// unlock; the fallback Unlock succeeds here (the fake models a full-scope
+// session).
+func TestSync_PreFixMailboxSelfHeals(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newMemKeychain()
+	seedActiveMailbox(t, st, ks, "mb-1", "joe@proton.test", "user-1", "uid-1", "tok-1", "pass-1")
+	// No salted_key_pass stored (pre-fix row).
+	derived := []byte("derived-key-pass")
+
+	fake := authedFake("tok-1", "uid-1")
+	fake.LabelList = inboxLabels()
+	fake.LatestEvent = "ev-1"
+	fake.Passphrase = "pass-1"        // full-scope Unlock accepts the passphrase
+	fake.SaltedKeyPassValue = derived // Unlock derives and retains this
+	eng := newEngine(st, ks, &fakeDialer{clients: map[string]proton.Client{"user-1": fake}}, Config{})
+
+	if _, err := eng.SyncMailbox(ctx, "mb-1"); err != nil {
+		t.Fatalf("first SyncMailbox (self-heal): %v", err)
+	}
+	if fake.UnlockCalls != 1 {
+		t.Errorf("first run Unlock calls = %d, want 1 (fallback derives the key pass)", fake.UnlockCalls)
+	}
+	// The freshly-derived key pass was persisted.
+	enc, err := ks.Get("mb-1", keychain.SaltedKeyPass)
+	if err != nil {
+		t.Fatalf("self-healed key pass not persisted: %v", err)
+	}
+	if got, _ := keychain.DecodeSaltedKeyPass(enc); string(got) != string(derived) {
+		t.Errorf("persisted key pass = %q, want %q", got, derived)
+	}
+
+	// Next resume: a fresh client for the same user, now with the key pass stored.
+	fake2 := authedFake("tok-1", "uid-1")
+	fake2.LabelList = inboxLabels()
+	fake2.LatestEvent = "ev-1"
+	fake2.SaltedKeyPassValue = derived
+	eng.dialer = &fakeDialer{clients: map[string]proton.Client{"user-1": fake2}}
+	if _, err := eng.SyncMailbox(ctx, "mb-1"); err != nil {
+		t.Fatalf("second SyncMailbox: %v", err)
+	}
+	if fake2.UnlockWithKeyPassCalls != 1 || fake2.UnlockCalls != 0 {
+		t.Errorf("second run used salts path: UnlockWithKeyPass=%d Unlock=%d, want 1/0",
+			fake2.UnlockWithKeyPassCalls, fake2.UnlockCalls)
+	}
+}
+
+// TestSync_StaleKeyPassFallsBackAndRepersists covers a password change: the
+// stored key pass no longer decrypts (UnlockWithKeyPass → ErrUnlockFailed), so
+// the resume retries the passphrase Unlock ONCE (a still-full-scope session
+// salvages it) and re-persists the newly-derived key pass.
+func TestSync_StaleKeyPassFallsBackAndRepersists(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newMemKeychain()
+	seedActiveMailbox(t, st, ks, "mb-1", "joe@proton.test", "user-1", "uid-1", "tok-1", "pass-1")
+	if err := ks.Set("mb-1", keychain.SaltedKeyPass, keychain.EncodeSaltedKeyPass([]byte("STALE"))); err != nil {
+		t.Fatalf("seed stale key pass: %v", err)
+	}
+	fresh := []byte("fresh-key-pass")
+
+	fake := authedFake("tok-1", "uid-1")
+	fake.LabelList = inboxLabels()
+	fake.LatestEvent = "ev-1"
+	fake.Passphrase = "pass-1"      // full-scope passphrase Unlock succeeds
+	fake.SaltedKeyPassValue = fresh // UnlockWithKeyPass("STALE") != fresh → ErrUnlockFailed; Unlock derives fresh
+	eng := newEngine(st, ks, &fakeDialer{clients: map[string]proton.Client{"user-1": fake}}, Config{})
+
+	if _, err := eng.SyncMailbox(ctx, "mb-1"); err != nil {
+		t.Fatalf("SyncMailbox: %v", err)
+	}
+	if fake.UnlockWithKeyPassCalls != 1 || fake.UnlockCalls != 1 {
+		t.Errorf("expected stale-then-fallback: UnlockWithKeyPass=%d Unlock=%d, want 1/1",
+			fake.UnlockWithKeyPassCalls, fake.UnlockCalls)
+	}
+	enc, _ := ks.Get("mb-1", keychain.SaltedKeyPass)
+	if got, _ := keychain.DecodeSaltedKeyPass(enc); string(got) != string(fresh) {
+		t.Errorf("stale key pass not replaced: %q, want %q", got, fresh)
+	}
+}
+
+// TestSync_StaleKeyPassAndBadPassphraseNeedsReauth covers both unlock paths
+// failing (key pass stale AND the passphrase no longer unlocks — e.g. after a
+// password change the stored passphrase is also wrong): the mailbox flips to
+// needs_reauth with the actionable "auth refresh" cause.
+func TestSync_StaleKeyPassAndBadPassphraseNeedsReauth(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newMemKeychain()
+	seedActiveMailbox(t, st, ks, "mb-1", "joe@proton.test", "user-1", "uid-1", "tok-1", "wrong-pass")
+	if err := ks.Set("mb-1", keychain.SaltedKeyPass, keychain.EncodeSaltedKeyPass([]byte("STALE"))); err != nil {
+		t.Fatalf("seed stale key pass: %v", err)
+	}
+
+	fake := authedFake("tok-1", "uid-1")
+	fake.LabelList = inboxLabels()
+	fake.Passphrase = "correct-pass"         // stored "wrong-pass" fails Unlock
+	fake.SaltedKeyPassValue = []byte("real") // "STALE" fails UnlockWithKeyPass
+	eng := newEngine(st, ks, &fakeDialer{clients: map[string]proton.Client{"user-1": fake}}, Config{})
+
+	sum, err := eng.SyncMailbox(ctx, "mb-1")
+	if err == nil || sum.Err == nil {
+		t.Fatal("sync must fail when neither unlock path works")
+	}
+	if !strings.Contains(sum.Err.Error(), "auth refresh") {
+		t.Errorf("error = %v, want the actionable 'auth refresh' hint", sum.Err)
+	}
+	m, _ := st.GetMailbox(ctx, "mb-1")
+	if m.State != store.MailboxStateNeedsReauth {
+		t.Errorf("state = %q, want needs_reauth", m.State)
 	}
 }

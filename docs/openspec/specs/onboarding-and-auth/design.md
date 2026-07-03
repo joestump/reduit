@@ -82,9 +82,12 @@ sequenceDiagram
    code (no echo) and submit. Wrong codes re-prompt or abort with a
    concise message.
 5. **Passphrase + key unlock.** Prompt for the mailbox passphrase (no
-   echo); ask go-proton-api to unlock the OpenPGP private keys. Failure
-   re-prompts or aborts.
-6. **Persist.** Write the refresh token, access token, and passphrase to
+   echo); ask go-proton-api to unlock the OpenPGP private keys. Unlock
+   derives a salted key passphrase (from the passphrase + the primary key's
+   salt, fetched from the scope-elevated salts endpoint) and retains it.
+   Failure re-prompts or aborts.
+6. **Persist.** Write the refresh token, access token, passphrase, and the
+   derived salted key passphrase to
    the keychain, record `proton_user_id` and session UID, flip state to
    `active`. Keychain writes are last so a failure before them leaves
    nothing to clean up.
@@ -115,6 +118,7 @@ with guidance ("already configured" for `active`, "re-auth it" for
 | Mailbox passphrase | no-echo prompt | go-proton-api unlock + `mailbox/<id>/mailbox_passphrase` | disk, logs, DB |
 | Refresh token | go-proton-api session | `mailbox/<id>/refresh_token` | disk, logs, DB |
 | Access token | go-proton-api session | `mailbox/<id>/access_token` | disk, logs, DB |
+| Salted key passphrase | derived at `Unlock` (passphrase + primary-key salt) | `mailbox/<id>/salted_key_pass` (base64) | disk, logs, DB |
 
 - **No flags, no env.** Password and passphrase are read only via
   no-echo terminal prompts (`golang.org/x/term`), never CLI flags or
@@ -128,27 +132,43 @@ with guidance ("already configured" for `active`, "re-auth it" for
   and this redaction discipline are backend-agnostic and unchanged. Logs
   go to stderr.
 - **Keychain keys.** Service `reduit`; account keys
-  `mailbox/<id>/refresh_token`, `mailbox/<id>/access_token`, and
-  `mailbox/<id>/mailbox_passphrase` (ADR-0013). The DB stores only the
+  `mailbox/<id>/refresh_token`, `mailbox/<id>/access_token`,
+  `mailbox/<id>/mailbox_passphrase`, and `mailbox/<id>/salted_key_pass`
+  (ADR-0013). The DB stores only the
   `mailbox_id` reference. The access token is a session secret persisted
   alongside the refresh token so a cross-process resume can reuse the cached
-  session (see "Cross-process session resume").
+  session; the salted key passphrase is persisted (base64-encoded, since it
+  is raw key bytes and the keychain API is string-typed) so a
+  scope-downgraded resume can unlock without the salts endpoint (see
+  "Cross-process session resume").
 
 ## Re-auth and cache preservation
 
 A `needs_reauth` mailbox arises when sync/send observes an invalid or
 revoked refresh token (SPEC-0001 lifecycle). Re-auth is the same command
-on the same row: it overwrites the two keychain entries and flips the
+on the same row: it overwrites the keychain entries (refresh token, access
+token, passphrase, salted key passphrase) and flips the
 state back to `active`. It deliberately does **not** touch the
 `mailbox_id`-scoped cache (messages, attachments, sync cursors, FTS5):
 the credentials were stale, the derived data was not. Preserving the
 cache means re-auth is cheap and does not trigger a full re-sync.
 
+`auth refresh` is designed to be the reliable one-command fix. Its cheap
+path resumes the stored session and rotates tokens, but a passing `labels`
+probe is **not** proof of health: a lazily-refreshed session can be
+scope-downgraded so it labels mail yet 9101s on the salts endpoint. So the
+cheap path also **verifies it can unlock** (via the persisted salted key
+passphrase, or the passphrase fallback) before declaring "Refreshed"; if the
+resumed session cannot unlock, it falls through to the full interactive
+re-login, which re-elevates scope and re-persists every secret. Without this
+check a user who just hit 9101 would run `auth refresh`, see success, and
+find sync still broken.
+
 ## Cross-process session resume
 
 A session minted by `reduit auth` in one process must resume in another
 (a `labels`, `sync`, or `send` run, or the cheap path of `auth refresh`)
-without re-prompting. Three pieces of session state make that work, and all
+without re-prompting. Four pieces of persisted state make that work, and all
 are load-bearing (ADR-0001, ADR-0013, ADR-0021):
 
 - **Access token (session reuse, not eager refresh).** Resume rebuilds the
@@ -191,6 +211,36 @@ are load-bearing (ADR-0001, ADR-0013, ADR-0021):
   satisfies this for the normal path; an operator who overrides
   `proton.app_version` must do so consistently across `auth`, `labels`,
   and `sync`.
+- **Salted key passphrase (unlock without the salts endpoint).** The access
+  token bullet keeps `labels` working across resumes, but it does **not**
+  fully protect `Unlock`: once the *original* access token's TTL expires,
+  go-proton-api's lazy `/auth/v4/refresh` returns a scope-DOWNGRADED token —
+  low-scope calls (`labels`) still succeed, but a resume-time `GetSalts`
+  (which `Unlock` calls to derive the key passphrase) 9101s, and no amount of
+  retrying/refreshing re-elevates scope. This was the last live break: any
+  resumed session older than the access-token TTL could label mail but never
+  sync. Proton Bridge avoids the call entirely by deriving the *salted key
+  passphrase* ONCE at login (full scope) and persisting it. Reduit does the
+  same: `Unlock` retains the derived value (`SaltedKeyPass()`), it is persisted
+  to the keychain, and every resume unlocks via `UnlockWithKeyPass` —
+  `GetUser` + `GetAddresses` (both fine on the reduced mail scope, as `labels`
+  proves) + a local `gpa.Unlock`, with **no** salts call. A pre-fix mailbox
+  with no persisted value falls back to a passphrase `Unlock` and, on success,
+  persists the freshly-derived value (self-heal) so the next resume skips
+  salts. A stale value (password change) fails `UnlockWithKeyPass` with
+  `ErrUnlockFailed`; the resume retries a passphrase `Unlock` once (a
+  still-full-scope session salvages it and re-persists), else goes to
+  `needs_reauth` with an actionable message.
+
+The resume-time unlock decision tree (sync engine, and `auth refresh`'s
+cheap-path verification) is therefore: **key pass present** → `UnlockWithKeyPass`
+(no salts); **key pass absent** (pre-fix) → passphrase `Unlock` + self-heal
+persist; **key pass stale** → passphrase `Unlock` once, re-persist on success,
+`needs_reauth` if both fail. Note the self-heal's passphrase `Unlock` itself
+calls `GetSalts`, so a pre-fix mailbox on an already-downgraded session cannot
+self-heal without one full re-login — the owner's current mailbox (valid
+passphrase in keychain, but a downgraded session) is exactly this case and must
+run `auth refresh` (which now escalates properly) once.
 
 ## Keyring availability
 
@@ -218,7 +268,9 @@ needed, would be a new opt-in ADR, loudly caveated.
 | `proton_user_id` mismatch on re-auth | error; stored value untouched |
 | Resume with missing/rotated session UID or mismatched app-version (10013) | missing UID → fall back to interactive re-login (self-heals the row); rotated UID/token → re-persist after resume |
 | Resume of a pre-fix row with no stored access token | `labels`/`sync` → actionable "no stored access token; re-authenticate" (never an eager refresh that would 9101); `auth refresh` → interactive re-login stores a fresh access token |
-| Key/salt access returns 403 code 9101 ("insufficient scope") | prevented by reusing the cached access token on resume (session reuse, not eager refresh); a pre-fix row without one is sent to re-auth instead of resuming into a reduced scope |
+| Key/salt access returns 403 code 9101 ("insufficient scope") on `GetSalts` during a resume-time `Unlock` (the token TTL expired and the lazy refresh downgraded scope) | prevented outright by unlocking from the persisted salted key passphrase (`UnlockWithKeyPass`) instead of calling `GetSalts` on resume; a pre-fix mailbox self-heals on a still-full-scope session, and a downgraded one is sent to `auth refresh` (which verifies unlockability and escalates to full re-login) |
+| Persisted salted key passphrase no longer decrypts (password change) | `UnlockWithKeyPass` → `ErrUnlockFailed` → retry passphrase `Unlock` once (full-scope session re-derives + re-persists); both fail → `needs_reauth` with actionable message |
+| `auth refresh` cheap path passes `labels` but the session cannot unlock (scope-downgraded) | do NOT report "Refreshed"; escalate to full interactive re-login, which re-elevates scope and re-persists every secret |
 | Keyring unavailable/locked | abort with provisioning/unlock guidance; no fallback store |
 
 ## References

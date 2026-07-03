@@ -45,6 +45,16 @@ type Fake struct {
 	// other yields ErrUnlockFailed. Empty accepts any passphrase.
 	Passphrase string
 
+	// SaltedKeyPassValue is the salted key passphrase a successful Unlock derives
+	// and SaltedKeyPass reports — the value the auth layer persists to the
+	// keychain. UnlockWithKeyPass succeeds iff its argument matches this value
+	// (when it is non-empty), so tests can drive a stale-keypass → ErrUnlockFailed
+	// fallback. Empty accepts any key pass.
+	SaltedKeyPassValue []byte
+	// UnlockWithKeyPassErr, when set, is returned by UnlockWithKeyPass instead of
+	// the match check — used to model a scope-independent unlock failure.
+	UnlockWithKeyPassErr error
+
 	// LoginErr/UnlockErr/RefreshErr/SendErr, when set, are returned by the
 	// corresponding method instead of succeeding.
 	LoginErr   error
@@ -90,11 +100,19 @@ type Fake struct {
 	RefreshCalls  int
 	Closed        bool
 
+	// UnlockCalls / UnlockWithKeyPassCalls count the two unlock entry points so a
+	// test can assert a resume used the persisted key pass (UnlockWithKeyPass) and
+	// did NOT take the salts-fetching Unlock path — the Fake's stand-in for
+	// "GetSalts was not called" (only Unlock reaches GetSalts on the real client).
+	UnlockCalls            int
+	UnlockWithKeyPassCalls int
+
 	// internal lifecycle state
-	authed   bool
-	unlocked bool
-	pending  bool // 2FA outstanding
-	batchIdx int
+	authed        bool
+	unlocked      bool
+	pending       bool // 2FA outstanding
+	batchIdx      int
+	saltedKeyPass []byte // set on a successful Unlock/UnlockWithKeyPass
 }
 
 var _ Client = (*Fake)(nil)
@@ -141,6 +159,7 @@ func (f *Fake) SubmitTOTP(_ context.Context, code string) error {
 func (f *Fake) Unlock(_ context.Context, passphrase []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.UnlockCalls++
 	if !f.authed {
 		return ErrNotAuthenticated
 	}
@@ -154,7 +173,40 @@ func (f *Fake) Unlock(_ context.Context, passphrase []byte) error {
 		return ErrUnlockFailed
 	}
 	f.unlocked = true
+	f.saltedKeyPass = f.SaltedKeyPassValue
 	return nil
+}
+
+// UnlockWithKeyPass models the resume-time unlock that skips the salts endpoint:
+// it never consults f.Passphrase (the salts path is not taken) and succeeds iff
+// the supplied key pass matches the scripted SaltedKeyPassValue.
+func (f *Fake) UnlockWithKeyPass(_ context.Context, keyPass []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.UnlockWithKeyPassCalls++
+	if !f.authed {
+		return ErrNotAuthenticated
+	}
+	if f.pending {
+		return ErrAuthFailed
+	}
+	if f.UnlockWithKeyPassErr != nil {
+		return f.UnlockWithKeyPassErr
+	}
+	if len(f.SaltedKeyPassValue) != 0 && string(keyPass) != string(f.SaltedKeyPassValue) {
+		return ErrUnlockFailed
+	}
+	f.unlocked = true
+	f.saltedKeyPass = keyPass
+	return nil
+}
+
+// SaltedKeyPass reports the key pass a successful unlock retained, mirroring the
+// real client so the auth layer can persist it.
+func (f *Fake) SaltedKeyPass() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.saltedKeyPass
 }
 
 func (f *Fake) ProtonUserID() string {

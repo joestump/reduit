@@ -147,6 +147,16 @@ type gpaClient struct {
 	// Unlock state. Populated by Unlock, used by decrypt/send.
 	addrKRs   map[string]*crypto.KeyRing // address id -> unlocked keyring
 	addresses []gpa.Address              // address metadata (id -> email)
+
+	// saltedKeyPass is the salted key passphrase derived once by Unlock from the
+	// mailbox passphrase + the primary key's salt (GetSalts requires the
+	// 2FA-elevated scope). It is retained so a resumed session — whose scope a
+	// lazy /auth/v4/refresh may have downgraded — can re-unlock via
+	// UnlockWithKeyPass WITHOUT calling GetSalts again, mirroring Proton Bridge's
+	// persisted key-pass. It is a SECRET (it grants mailbox key access); it is
+	// exposed only via SaltedKeyPass() for persistence to the keychain and is
+	// never logged (SPEC-0007 "No Secret Leakage").
+	saltedKeyPass []byte
 }
 
 var _ Client = (*gpaClient)(nil)
@@ -269,8 +279,54 @@ func (c *gpaClient) Unlock(ctx context.Context, passphrase []byte) error {
 	c.userID = user.ID
 	c.addresses = addrs
 	c.addrKRs = addrKRs
+	// Retain the derived salted key passphrase so a later resume can unlock via
+	// UnlockWithKeyPass without the scope-elevated GetSalts call. The caller
+	// reads it via SaltedKeyPass() and persists it (SPEC-0007 "Cross-Process
+	// Session Resume").
+	c.saltedKeyPass = keyPass
 	return nil
 }
+
+// UnlockWithKeyPass unlocks the mailbox from an already-derived salted key
+// passphrase (as returned by SaltedKeyPass after a full-scope Unlock and
+// persisted to the keychain), SKIPPING the salts endpoint. GetSalts requires
+// the 2FA-elevated scope that a lazily-refreshed session loses (403 code 9101),
+// so a resumed session can only re-unlock this way — GetUser and GetAddresses
+// both work on the reduced mail scope (the same class of call `reduit labels`
+// proves), and gpa.Unlock is a pure local crypto step needing no network. This
+// is Proton Bridge's persisted-key-pass pattern (SPEC-0007 "Cross-Process
+// Session Resume"). A stale keyPass (e.g. after a password change) fails the
+// local decrypt and surfaces as ErrUnlockFailed, identically to a wrong
+// passphrase in Unlock. keyPass is the caller's buffer; it is not logged.
+func (c *gpaClient) UnlockWithKeyPass(ctx context.Context, keyPass []byte) error {
+	if c.cli == nil {
+		return ErrNotAuthenticated
+	}
+	user, err := c.cli.GetUser(ctx)
+	if err != nil {
+		return classifyError(err)
+	}
+	addrs, err := c.cli.GetAddresses(ctx)
+	if err != nil {
+		return classifyError(err)
+	}
+	_, addrKRs, err := gpa.Unlock(user, addrs, keyPass, async.NoopPanicHandler{})
+	if err != nil {
+		// A stale/wrong salted key pass; the error carries no secret.
+		return fmt.Errorf("%w: %v", ErrUnlockFailed, err)
+	}
+	c.userID = user.ID
+	c.addresses = addrs
+	c.addrKRs = addrKRs
+	c.saltedKeyPass = keyPass
+	return nil
+}
+
+// SaltedKeyPass returns the salted key passphrase derived by a successful
+// Unlock (or UnlockWithKeyPass), for the caller to persist to the keychain. It
+// is "" (nil) before any unlock. It is a SECRET and must never be logged
+// (SPEC-0007 "No Secret Leakage").
+func (c *gpaClient) SaltedKeyPass() []byte { return c.saltedKeyPass }
 
 func (c *gpaClient) ProtonUserID() string { return c.userID }
 func (c *gpaClient) RefreshToken() string { return c.refreshToken }

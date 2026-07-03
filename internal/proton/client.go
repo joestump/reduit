@@ -44,9 +44,31 @@ type Client interface {
 
 	// Unlock decrypts the mailbox's OpenPGP private keys with the mailbox
 	// passphrase (SPEC-0007 REQ "Mailbox Passphrase Capture and Key Unlock").
-	// On success the per-address keyrings are held in memory for decrypt/send.
+	// On success the per-address keyrings are held in memory for decrypt/send,
+	// and the derived salted key passphrase is retained for SaltedKeyPass.
+	// Because deriving it calls the salts endpoint (GetSalts), which requires the
+	// 2FA-elevated scope, Unlock is the LOGIN-time path; a resumed session whose
+	// scope a lazy refresh downgraded uses UnlockWithKeyPass instead.
 	// passphrase is the caller's buffer; it is not retained or logged.
 	Unlock(ctx context.Context, passphrase []byte) error
+
+	// UnlockWithKeyPass decrypts the mailbox's OpenPGP private keys from an
+	// already-derived salted key passphrase (SaltedKeyPass, persisted to the
+	// keychain at login), SKIPPING the scope-elevated salts endpoint. This is the
+	// resume-time unlock: a lazily-refreshed session is scope-downgraded and
+	// cannot call GetSalts (403 code 9101), but it can still unlock from the
+	// persisted key pass — Proton Bridge's pattern (SPEC-0007 "Cross-Process
+	// Session Resume"). A stale key pass (e.g. after a password change) yields
+	// ErrUnlockFailed, like a wrong passphrase. keyPass is the caller's buffer;
+	// it is not logged.
+	UnlockWithKeyPass(ctx context.Context, keyPass []byte) error
+
+	// SaltedKeyPass returns the salted key passphrase derived by a successful
+	// Unlock or UnlockWithKeyPass, for the caller to persist to the keychain so a
+	// scope-downgraded resume can unlock without the salts endpoint. It is nil
+	// before any unlock. It is a SECRET and must never be logged (SPEC-0007 "No
+	// Secret Leakage").
+	SaltedKeyPass() []byte
 
 	// ProtonUserID returns the account's immutable Proton user id, available
 	// after a successful Login. It is "" before authentication. The auth layer

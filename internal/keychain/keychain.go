@@ -1,15 +1,15 @@
 // Package keychain stores and retrieves a mailbox's live secrets — the Proton
-// refresh token, the Proton access token, and the mailbox passphrase — in the
-// operating system's secret service: macOS Keychain, Linux Secret Service
-// (libsecret / GNOME Keyring / KWallet via D-Bus), or Windows Credential
-// Manager. It is the only component permitted to hold those secret values;
-// everything else in Reduit references a mailbox by its local UUIDv7 and asks
-// this package for the secret at use time.
+// refresh token, the Proton access token, the mailbox passphrase, and the
+// derived salted key passphrase — in the operating system's secret service:
+// macOS Keychain, Linux Secret Service (libsecret / GNOME Keyring / KWallet via
+// D-Bus), or Windows Credential Manager. It is the only component permitted to
+// hold those secret values; everything else in Reduit references a mailbox by
+// its local UUIDv7 and asks this package for the secret at use time.
 //
 // Keying (ADR-0013): every entry is written under service name "reduit" with
 // account key "mailbox/<mailbox_id>/<kind>" where <kind> is one of
-// "refresh_token", "access_token", or "mailbox_passphrase". Secrets are per
-// mailbox; there is
+// "refresh_token", "access_token", "mailbox_passphrase", or "salted_key_pass".
+// Secrets are per mailbox; there is
 // no shared key spanning mailboxes, so removing one mailbox's secrets never
 // touches another's. The SQLite store holds only the <mailbox_id> reference
 // (SPEC-0001 REQ "Secret References, Not Secrets"); no secret, ciphertext, or
@@ -36,6 +36,7 @@
 package keychain
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"strings"
@@ -65,16 +66,26 @@ const (
 	AccessToken Kind = "access_token"
 	// MailboxPassphrase unlocks the mailbox's OpenPGP private keys.
 	MailboxPassphrase Kind = "mailbox_passphrase"
+	// SaltedKeyPass is the salted key passphrase derived once at login from the
+	// mailbox passphrase and the primary key's salt (the salts endpoint requires
+	// the 2FA-elevated scope). Persisting it lets a resumed session — whose scope
+	// a lazy refresh may have downgraded — unlock the OpenPGP keys WITHOUT calling
+	// the salts endpoint (403 code 9101), mirroring Proton Bridge. It is a SECRET
+	// (it grants mailbox key access), so it lives only in the keychain, never the
+	// store, and is never logged (SPEC-0007 "No Secret Leakage"). It is raw key
+	// bytes, so callers store it base64-encoded via EncodeSaltedKeyPass (the
+	// go-keyring API is string-typed).
+	SaltedKeyPass Kind = "salted_key_pass"
 )
 
 // allKinds lists every secret kind a mailbox can own. DeleteAll iterates it so
 // that adding a future kind automatically extends mailbox teardown.
-var allKinds = []Kind{RefreshToken, AccessToken, MailboxPassphrase}
+var allKinds = []Kind{RefreshToken, AccessToken, MailboxPassphrase, SaltedKeyPass}
 
 // valid reports whether k is a recognised secret kind.
 func (k Kind) valid() bool {
 	switch k {
-	case RefreshToken, AccessToken, MailboxPassphrase:
+	case RefreshToken, AccessToken, MailboxPassphrase, SaltedKeyPass:
 		return true
 	default:
 		return false
@@ -107,6 +118,21 @@ var (
 	// a path separator that would make the account key ambiguous.
 	ErrInvalidMailboxID = errors.New("keychain: invalid mailbox id")
 )
+
+// EncodeSaltedKeyPass encodes raw salted-key-pass bytes for storage under the
+// SaltedKeyPass kind. The go-keyring API is string-typed and the key pass is
+// arbitrary binary, so it is standard-base64 encoded; DecodeSaltedKeyPass is the
+// inverse. This is a pure transform — no secret is logged.
+func EncodeSaltedKeyPass(keyPass []byte) string {
+	return base64.StdEncoding.EncodeToString(keyPass)
+}
+
+// DecodeSaltedKeyPass decodes a value written by EncodeSaltedKeyPass back to raw
+// key-pass bytes. A malformed encoding returns the base64 error unchanged; it
+// carries no secret (the input, not the decoded value, is at fault).
+func DecodeSaltedKeyPass(encoded string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(encoded)
+}
 
 // Store is the typed secret API over the OS keychain. All methods are keyed by
 // the local UUIDv7 mailbox id and a Kind; no method accepts or returns a raw
