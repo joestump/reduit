@@ -13,15 +13,64 @@ The TUI extends that foundation into a full-screen application. mutt is
 the design north star: information-dense, keyboard-only, instantly
 legible to a terminal-native operator.
 
-## Style reference
+## Style reference — "Bubbletea TUI Design System"
 
-The normative visual/interaction reference is the owner's **Bubble Tea
-design system** (Claude Design) — palette, typography-in-monospace
-conventions, component idioms (index rows, status bar, help footer,
-prompts), focus and spacing rules. *(Link to be embedded here when
-shared; until then, mutt's own index/pager/status-bar layout is the
-fallback reference.)* Where the design system and this spec conflict,
-the spec's requirements win; the design system governs look and feel.
+The normative visual reference is the owner's **Bubble Tea design system**
+(Claude Design, "Bubbletea TUI Design System" —
+<https://claude.ai/design/p/5c2f3709-9093-45fd-9762-fbe0a39b6c7b>). Where
+the design system and this spec conflict, the spec's *requirements* win
+(behavior, security, scope); the design system governs *look and feel*.
+
+**Aesthetic direction (owner brief):** cutesy-cyberpunk / Tron — imagine a
+genius 13-year-old Japanese gamer/coder girl built this homage to `mutt` in
+Bubble Tea. Kawaii-cyberpunk meets anime: neon phosphor on a blue-black
+void, a faint Tron grid floor, a blinking block cursor as the UI's
+heartbeat, playful lowercase voice, tasteful boba/tea flourishes — dense
+and keyboard-first like mutt, but *alive* and glowing rather than austere.
+It must never read as corporate or flat.
+
+### Tokens (from the design system — treat as the source of truth)
+
+- **Palette.** Void/surfaces `#08080F → #1E1E38`; brand Charm purple
+  `#7D56F4` + hot pink `#FF5FA2`; Tron accents cyan `#4EE6FF` + mint
+  `#00F0A8`; phosphor text `#F4F4FF` fading to dim indigo-grey; gold/coral
+  for warn/danger. Foreground is neon on blue-black; elevation is expressed
+  as **glow** (a `0 0 12px` colored halo per accent), not grey drop-shadow.
+- **Type.** Monospace-first. Body/UI **JetBrains Mono**; chunky display/
+  wordmarks **Space Mono** (tracking ~-0.04em, often gradient-filled);
+  pixel eyebrows/badges **Silkscreen**. Hierarchy comes from weight/size/
+  color, not font family. ⚠️ These are free substitutes for Charm's
+  commercial faces; swap to licensed faces via the token aliases if desired.
+- **Borders & layout.** Lip Gloss rounded border (`╭ ╮ ╰ ╯`) is the
+  signature; DOM/TUI chrome mirrors it. Focus shifts the border to cyan; the
+  active index/table row carries an inset colored rail (`inset 3px 0 0`
+  pink) — the analog of mutt's `>` cursor. Spacing is cell-aware on a 4px
+  base.
+- **Motion.** Quick and springy (Harmonica-style), 120–340ms; braille/dots/
+  moon **spinners**; the **cyan block cursor** blinks `steps(1)` ~1.06s.
+  Everything MUST honor `prefers-reduced-motion` (cursor/spinners freeze,
+  progress jumps to end) — the reduced-motion equivalent in a TUI is
+  `lipgloss`/`bubbletea` rendering without the blink/spin tick.
+- **Iconography.** Unicode + box-drawing glyphs, never a web icon set:
+  nav `↑↓←→`, status `✓ ✗ ◆ ● ○ •`, prompts `❯ › $`, spinners
+  `⣾⣽⣻⢿⡿⣟⣯⣷` / `⠋⠙⠹⠸`, progress `█ ▓ ▒ ░`, borders `─ │ ╭ ╮ ╰ ╯ ├ ┤`.
+  Emoji only as sparing flourishes (never in dense UI). This is exactly how
+  mutt + Charm render — type the glyph.
+- **Voice.** Playful, warm, lowercase; address the user as "you"; a load-
+  bearing dim **help footer** of `key • action` pairs on every view
+  (`↑/↓ navigate • enter select • / search • q quit`); shell-flavored
+  prompt glyph + blinking cursor.
+
+The design system ships 15 Bubble Tea-shaped component idioms (TerminalWindow,
+StatusBar, Kbd, List, Table, Tabs, Badge, Spinner, Progress, KeyHint, Dialog,
+Button, TextInput, Checkbox, Toggle) and two reference kits (a scaffolder flow
+and a two-pane markdown reader) — the TUI's index/pager/status-bar/help
+composition maps directly onto these idioms.
+
+> The design system is a *web recreation* (React/CSS) of the aesthetic; this
+> spec's implementation is real bubbletea/bubbles/lipgloss Go. The tokens
+> (colors, glyphs, motion timing, voice) transfer; the React components are
+> visual references, not code to port.
 
 ## Architecture
 

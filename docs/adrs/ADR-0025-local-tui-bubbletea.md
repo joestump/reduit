@@ -160,6 +160,10 @@ flowchart LR
   **ADR-0017** (shared store, MCP primary), **ADR-0012** (single-user
   local-first). **ADR-0011** narrows to serve's reserved non-UI role.
 - Normative style reference: the owner's Bubble Tea design system
-  (Claude Design) — to be linked in SPEC-0005 design.md when shared.
+  ("Bubbletea TUI Design System", Claude Design:
+  https://claude.ai/design/p/5c2f3709-9093-45fd-9762-fbe0a39b6c7b) —
+  a cutesy-cyberpunk/Tron kawaii aesthetic (neon phosphor on blue-black,
+  Tron grid, blinking cursor, boba flourishes). Embedded in SPEC-0005
+  design.md.
 - Owner decisions (2026-07-03): mutt as design language; keep `serve`
   for MCP/media possibilities; keyword/FTS-only search in v1.
