@@ -9,7 +9,7 @@ go 1.26.1
 //   - GO-2025-3955 / CVE-2025-58188 (crypto/x509 NotAfter time DoS)
 // All three are fixed in 1.26.2. The `go 1.26.1` line above is the
 // language-version floor; `toolchain` pins the actual compiler.
-toolchain go1.26.2
+toolchain go1.26.4
 
 require (
 	github.com/ProtonMail/gluon v0.17.1-0.20260225115619-c0f05c033a4a
@@ -48,7 +48,7 @@ require (
 	github.com/clipperhouse/displaywidth v0.9.0 // indirect
 	github.com/clipperhouse/stringish v0.1.1 // indirect
 	github.com/clipperhouse/uax29/v2 v2.5.0 // indirect
-	github.com/cloudflare/circl v1.6.2 // indirect
+	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/cronokirby/saferith v0.33.0 // indirect
 	github.com/danieljoos/wincred v1.2.3 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
