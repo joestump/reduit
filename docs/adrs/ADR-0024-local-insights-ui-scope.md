@@ -1,6 +1,11 @@
 # ADR-0024: Drop the browse/search web UI; scope the local UI to insights (attachments, facts, metadata, stats)
 
-- **Status:** proposed
+> **Superseded 2026-07-03 by [ADR-0025](ADR-0025-local-tui-bubbletea.md).** The web
+> UI is abandoned entirely; the human surface is a Bubble Tea TUI in a
+> mutt-inspired design language. The won't-fix closures this ADR records
+> (#75, #102–#105) stand.
+
+- **Status:** superseded by [ADR-0025](ADR-0025-local-tui-bubbletea.md) (2026-07-03)
 - **Date:** 2026-07-03
 - **Deciders:** Joe Stump
 

@@ -1,6 +1,6 @@
 # ADR-0005: Frontend stack — HTMX, SSE, Tailwind 4, DaisyUI, Hero Icons
 
-- **Status:** accepted (reframed 2026-06-29 by [ADR-0012](ADR-0012-single-user-local-first.md); scope narrowed 2026-07-03 by [ADR-0024](ADR-0024-local-insights-ui-scope.md))
+- **Status:** accepted (reframed 2026-06-29 by [ADR-0012](ADR-0012-single-user-local-first.md); scope narrowed 2026-07-03 by [ADR-0024](ADR-0024-local-insights-ui-scope.md); stack retired 2026-07-03 by [ADR-0025](ADR-0025-local-tui-bubbletea.md))
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
 
@@ -15,10 +15,11 @@
 > updates (e.g. sync progress); it is no longer load-bearing. See the rewritten
 > Local UI spec (SPEC-0005).
 >
-> **Scope narrowed 2026-07-03 by [ADR-0024](ADR-0024-local-insights-ui-scope.md).**
-> The browse/search UI is withdrawn entirely; the stack decided here now applies
-> only to the lightweight **Local Insights UI** (attachments, contact facts,
-> metadata, stats). SSE is out of scope.
+> **Scope narrowed 2026-07-03 by [ADR-0024](ADR-0024-local-insights-ui-scope.md);
+> stack retired 2026-07-03 by [ADR-0025](ADR-0025-local-tui-bubbletea.md).**
+> The web UI is abandoned entirely — reduit ships no HTML surface. The human
+> surface is a Bubble Tea TUI (mutt-inspired design language); this stack
+> decision is retired, kept for the record.
 
 ## Context and Problem Statement
 

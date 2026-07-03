@@ -1,86 +1,121 @@
-# Design: Local Insights UI (SPEC-0005)
+# Design: Local TUI (SPEC-0005)
 
-> **Scope note.** Rewritten 2026-07-03 per ADR-0024: the browse/search UI is
-> withdrawn; this design covers only the insights surface (attachments,
-> contact facts, metadata, stats).
+> Rewritten 2026-07-03 per ADR-0025: the web UI is abandoned; the human
+> surface is a Bubble Tea TUI in a mutt-inspired design language.
+
+## Context
+
+reduit already ships the charm stack: charmbracelet/log renders all logs
+(ADR-0022) and bubbletea/bubbles/lipgloss arrived with the sync progress
+bar (ADR-0023), which also established the house TTY discipline (gate on
+a real terminal, clean teardown, never corrupt the exit-code contract).
+The TUI extends that foundation into a full-screen application. mutt is
+the design north star: information-dense, keyboard-only, instantly
+legible to a terminal-native operator.
+
+## Style reference
+
+The normative visual/interaction reference is the owner's **Bubble Tea
+design system** (Claude Design) — palette, typography-in-monospace
+conventions, component idioms (index rows, status bar, help footer,
+prompts), focus and spacing rules. *(Link to be embedded here when
+shared; until then, mutt's own index/pager/status-bar layout is the
+fallback reference.)* Where the design system and this spec conflict,
+the spec's requirements win; the design system governs look and feel.
 
 ## Architecture
 
-An optional `reduit serve` loopback HTTP server rendering a handful of
-read-only, server-side pages (ADR-0005 stack: HTMX + Tailwind 4 + DaisyUI,
-`html/template`, no runtime build step, all assets self-hosted). Every
-handler reads through the same `store` methods the MCP tools use
-(ADR-0017's no-drift rule); the UI holds no state, performs no writes, and
-never calls Proton.
+One Bubble Tea program (`reduit tui`), a root model routing among view
+models (search index, message pager, attachments, contact facts,
+metadata, stats). All data access goes through a thin read-only facade
+over the shared `store` (ADR-0017 no-drift: the MCP and TUI call the
+same methods; new aggregates land in `store` first).
 
 ```mermaid
-flowchart LR
-    B[Browser] -->|loopback HTTP| S[reduit serve]
-    S --> T["html/template\n(auto-escape)"]
-    S --> ST[(shared store)]
-    MCP[stdio MCP] --> ST
-    subgraph pages [Pages]
-        P1[attachments]
-        P2[contact facts]
-        P3[metadata coverage]
-        P4[sync / embedding stats]
+flowchart TB
+    subgraph program [reduit tui — Bubble Tea program]
+        ROOT[root model\nkeymap + status line + help]
+        S[search prompt + results index]
+        P[message pager]
+        A[attachments index]
+        F[contact facts]
+        M[metadata coverage]
+        ST2[stats]
+        ROOT --> S --> P
+        ROOT --> A
+        ROOT --> F
+        ROOT --> M
+        ROOT --> ST2
     end
-    S --- pages
+    program -->|read-only facade| STORE[(shared store)]
+    MCP[stdio MCP] --> STORE
 ```
 
-## Page set (informative)
+## Key decisions
 
-| Page | Reads | Notes |
-| --- | --- | --- |
-| Attachments | attachments + owning message metadata | list, view/download via path-contained serving |
-| Contact facts | contacts, contact_identifiers, contact_facts (+ citation metadata) | read-only; mutations stay CLI/MCP (SPEC-0011) |
-| Metadata coverage | messages (counts, date ranges, folders per mailbox) | "what does the cache hold" |
-| Stats | sync_runs, embeddings coverage, extraction coverage, store size | "how healthy is the cache" |
+### Views are bubbles-composed models behind one keymap
 
-There are deliberately **no** conversation, message, or search routes
-(SPEC-0005 REQ "Withdrawn Surfaces Stay Withdrawn").
+**Choice**: each view is its own model composing bubbles components
+(list, viewport, textinput, help); the root owns global keys (`?`, `q`,
+view switching) and the status line; view models own local keys (`j/k`,
+`/`, enter).
+**Rationale**: matches the progress bar's established model-testing
+pattern (Update/View unit tests, no terminal needed) and keeps the mutt
+keymap coherent in one place.
 
-## Security posture (unchanged from the withdrawn spec)
+### Search is FTS-only in v1
 
-- **Loopback by default, no auth** (ADR-0012): the OS user is the identity;
-  non-loopback binds warn loudly and never grow a login.
-- **Strict CSP, self-only assets**: no off-origin request of any kind; no
-  inline script; at most hash-allowed inline style.
-- **Everything mail-derived is escaped**: fact text, filenames, contact
-  names, subjects, and label names are attacker-influenced strings and pass
-  through contextual auto-escaping; nothing is ever marked safe HTML.
-- **Path-contained media serving**: resolved attachment paths are verified
-  inside reduit's data root; traversal is rejected before any file I/O.
+**Choice**: `/` runs the store's FTS5 keyword search; the results index
+and pager read the cached plaintext.
+**Rationale**: owner decision; semantic/hybrid joins when SPEC-0008
+lands, as a new search mode behind the same prompt.
 
-The insights pages render far less raw mail content than the withdrawn
-browse UI (no bodies), but the threat model is identical — a crafted
-message controls filenames and extracted facts — so the posture is kept
-at full strength.
+### Attachments hand off to the OS
 
-## Shared-store contract (no drift)
+**Choice**: opening an attachment writes/locates the cached file and
+hands it to the platform opener; no in-terminal preview in v1.
+**Rationale**: terminal image protocols (Kitty/iTerm2/Sixel) are
+fragmented (Terminal.app: none). v2 MAY render images inline on
+supporting terminals (ADR-0025); a future `serve` media companion is
+another path. Executable-ish MIME types are never auto-opened without
+confirmation.
 
-UI handlers call the same store methods as the MCP's stats/facts/
-attachment tools and add none of their own SQL beyond what the store
-exposes. If a page needs a new aggregate, the method lands in `store`
-first and both surfaces get it (ADR-0017).
+### Hostile-string sanitation at the render boundary
 
-## Offline behavior
+**Choice**: one sanitizer strips C0/C1 controls and escape sequences
+from every mail-derived string before it reaches lipgloss.
+**Rationale**: the web UI's XSS budget becomes the TUI's
+escape-injection budget; centralizing it makes it testable (the analog
+of the old CSP grep-test).
 
-All pages render from the cache with no network (SPEC-0002 "Offline
-Behavior" reads). A cold cache renders empty states, not errors.
+### TTY discipline inherited from ADR-0023
+
+**Choice**: refuse non-TTY with a clear error; alt-screen; restore on
+exit/suspend/signal.
+**Rationale**: same discipline the progress bar shipped; a TUI has no
+meaningful non-TTY fallback (unlike sync, whose fallback is logs).
+
+## Risks / Trade-offs
+
+- **Bubble Tea full-screen apps are harder to test than handlers** →
+  model-level Update/View tests (established pattern) + the sanitizer
+  unit-tested exhaustively.
+- **Large result sets/pagers** → store queries paginate; the viewport
+  virtualizes; no unbounded loads.
+- **Design-system drift** → the style reference is versioned in the
+  design doc; visual changes cite it.
 
 ## Open questions
 
-- Whether the stats page warrants a small time-series (sync_runs history
-  sparkline) or stays tabular in v1.
-- Whether attachment viewing should stream inline (Content-Disposition
-  inline for safe MIME types) or force download for everything; the safe
-  default is download-only for any type the browser could execute.
+- Command name: `reduit tui` vs taking over bare `reduit`.
+- Whether the message pager offers `v` to view a hit's thread siblings
+  (nice mutt touch) in v1 or v2.
+- Design-system link pending from the owner.
 
 ## References
 
-- ADR-0024 (insights scope — governing), ADR-0005 (frontend stack,
-  narrowed), ADR-0012 (single-user local-first), ADR-0017 (stdio MCP +
-  shared store), ADR-0006 (SQLite cache)
-- SPEC-0011 (contact facts), SPEC-0002 (sync bookkeeping/offline),
-  SPEC-0009 (attachment extraction)
+- ADR-0025 (governing), ADR-0023 (Bubble Tea + TTY discipline),
+  ADR-0022 (charm log), ADR-0017 (shared store), ADR-0012 (single-user),
+  ADR-0006 (cache); SPEC-0002 (offline reads), SPEC-0008 (future
+  semantic search), SPEC-0011 (facts read-only surface)
+- mutt (design language); owner's Bubble Tea design system (pending link)
