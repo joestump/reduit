@@ -49,7 +49,10 @@ carries only the JSON-RPC protocol stream.`,
 			defer st.Close()
 
 			// Bring the cache to HEAD before serving so `status` reports a
-			// healthy, migrated schema on a first run.
+			// healthy, migrated schema on a first run. Route goose's migration
+			// output through reduit's logger (ADR-0022) so it lands on stderr in
+			// the same format — never on stdout, which carries JSON-RPC.
+			st.SetLogger(logger)
 			if err := st.Migrate(""); err != nil {
 				return fmt.Errorf("migrate: %w", err)
 			}

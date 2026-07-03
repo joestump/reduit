@@ -77,6 +77,8 @@ suitable for cron, a systemd timer, or launchd.
 
 			// Bring the cache to HEAD before syncing so a fresh or stale DB does
 			// not error out mid-run (the auto-migrate gap, #140) — mirrors `mcp`.
+			// Route goose's migration output through reduit's logger (ADR-0022).
+			st.SetLogger(logger)
 			if err := st.Migrate(""); err != nil {
 				return fmt.Errorf("migrate: %w", err)
 			}

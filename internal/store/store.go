@@ -29,8 +29,10 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/jmoiron/sqlx"
@@ -76,6 +78,7 @@ type Store struct {
 	DB     *sqlx.DB
 	writer *sqlx.DB
 	path   string
+	logger *slog.Logger
 }
 
 // Open dials the SQLite database at `path`. The connection string
@@ -129,11 +132,29 @@ func Open(path string) (*Store, error) {
 	}
 	writer := sqlx.NewDb(writerRaw, "sqlite")
 
-	return &Store{DB: db, writer: writer, path: abs}, nil
+	// Default to a discarding logger so migration output (routed through
+	// goose.SetLogger in Migrate) is silently dropped until a caller wires
+	// in a real logger via SetLogger. This keeps `go test` runs — which open
+	// stores without a logger — free of stray goose/stdlib log noise.
+	return &Store{DB: db, writer: writer, path: abs, logger: slog.New(slog.DiscardHandler)}, nil
 }
 
 // Path returns the absolute path the database is open against.
 func (s *Store) Path() string { return s.path }
+
+// SetLogger sets the structured logger used for store-level diagnostics,
+// most notably the goose migration output routed through Migrate. Commands
+// that already build the root *slog.Logger (mcp, sync, migrate) call this
+// before Migrate so goose's "OK <migration>" / "successfully migrated" lines
+// flow through reduit's charmbracelet/log handler (ADR-0022) on stderr
+// instead of goose's stdlib log default. A nil logger is ignored so the
+// discarding default set at Open is preserved.
+func (s *Store) SetLogger(l *slog.Logger) {
+	if s == nil || l == nil {
+		return
+	}
+	s.logger = l
+}
 
 // WriterDB returns the single-connection writer pool. Callers whose
 // writes would otherwise contend on SQLITE_BUSY at BEGIN IMMEDIATE
@@ -182,6 +203,16 @@ func (s *Store) Migrate(dirOverride string) error {
 	}
 	migrateMu.Lock()
 	defer migrateMu.Unlock()
+	// goose.SetLogger is process-global, but migrateMu already serialises
+	// every Migrate call in-process (it guards goose's other package globals
+	// too), so setting it here — right before Up, under the lock — is
+	// deterministic and cannot race a concurrent Migrate. Each call installs
+	// its own store's logger, so parallel `go test` stores never leak one
+	// another's sink. Migrations are routine bookkeeping, so their output logs
+	// at DEBUG: a normal `reduit sync`/`mcp` run at the default info level stays
+	// quiet, while `--verbose` (debug) surfaces the "OK <migration>" lines in
+	// charm format on stderr.
+	goose.SetLogger(gooseSlogLogger{logger: s.logger})
 	goose.SetBaseFS(nil)
 	goose.SetTableName("goose_db_version")
 	if err := goose.SetDialect("sqlite3"); err != nil {
@@ -200,6 +231,41 @@ func (s *Store) Migrate(dirOverride string) error {
 		return fmt.Errorf("store: goose up: %w", err)
 	}
 	return nil
+}
+
+// gooseSlogLogger adapts an *slog.Logger to goose's Logger interface
+// (Printf/Fatalf) so goose's migration output joins the rest of reduit's
+// structured logging (charmbracelet/log via slog, ADR-0022) on one stream
+// instead of goose's stdlib `log` default. goose passes printf-style,
+// newline-terminated strings; we render them and trim the trailing newline
+// so the message reads cleanly through the slog handler.
+type gooseSlogLogger struct {
+	logger *slog.Logger
+}
+
+var _ goose.Logger = gooseSlogLogger{}
+
+// Printf handles goose's routine progress output ("OK <migration>",
+// "successfully migrated database ..."). Migrations are routine bookkeeping,
+// so this logs at DEBUG — a normal run at the default info level stays quiet.
+func (g gooseSlogLogger) Printf(format string, v ...any) {
+	if g.logger == nil {
+		return
+	}
+	g.logger.Debug(strings.TrimRight(fmt.Sprintf(format, v...), "\n"))
+}
+
+// Fatalf matches goose's interface faithfully but does NOT os.Exit: goose only
+// calls Fatalf on a fatal internal error, and the Up error it accompanies is
+// already returned up the stack (Migrate wraps it). We log it at ERROR so the
+// detail is not swallowed, then let the surrounding error return drive control
+// flow — killing the process here would strip callers of that error and their
+// deferred cleanup.
+func (g gooseSlogLogger) Fatalf(format string, v ...any) {
+	if g.logger == nil {
+		return
+	}
+	g.logger.Error(strings.TrimRight(fmt.Sprintf(format, v...), "\n"))
 }
 
 // buildDSN returns the modernc.org/sqlite DSN with our standard

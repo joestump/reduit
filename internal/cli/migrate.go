@@ -26,6 +26,8 @@ migrations. Idempotent — safe to run on every deploy.`,
 				return err
 			}
 			defer st.Close()
+			// Route goose's migration output through reduit's logger (ADR-0022).
+			st.SetLogger(logger)
 			if err := st.Migrate(""); err != nil {
 				return fmt.Errorf("migrate: %w", err)
 			}
