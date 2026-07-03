@@ -1,252 +1,166 @@
-# SPEC-0005: Local Browse & Search UI
+# SPEC-0005: Local Insights UI
 
 ## Overview
 
-The Reduit **local UI** is an optional, server-rendered HTMX surface
-for a human to browse and search the local cache (ADR-0006) with their
-own eyes: mailboxes → conversations → messages, plus keyword and
-semantic search, attachments, and per-contact facts. It is
-**secondary to the stdio MCP** (ADR-0017), which is the primary
-agent-facing surface; the UI exists only so a person can read what the
-agent reads. There is no relay, no network listener beyond an optional
-loopback HTTP server, and the cache is derived state — Proton remains
-the source of truth (ADR-0014).
+The Reduit **local insights UI** is an optional, server-rendered HTMX
+surface for a human to inspect what the cache has **derived** — extracted
+attachments, per-contact facts, message/mailbox metadata coverage, and
+cache/sync/embedding statistics. It is deliberately **not** a mail reader:
+there is no mailbox → conversation → message browsing, no keyword or
+semantic search UI, and no live-update stream. The stdio MCP (SPEC-0006,
+ADR-0017) is the primary read surface for the cache; Proton's own clients
+are where mail is read; this UI exists only for the glanceable,
+web-shaped views an agent chat is bad at (ADR-0024).
 
-Posture is local-first and least-privilege, mirroring the sibling
-`msgbrowse` project. The UI **binds loopback by default and has no
-authentication** (ADR-0012): the single OS user *is* the identity,
-so there is no login, no OIDC, no session or user concept. Because
-cached mail is hostile input (a crafted message can carry script or a
-traversal payload), the UI is built to need nothing off-origin — a
-strict CSP over self-hosted assets, `html/template` auto-escaping on
-every untrusted string, and path-contained media serving. To prevent
-behavioral drift, the UI calls the **same `store` methods as the MCP
-tools** (ADR-0017): search, transcript/context, attachments, and
-contact facts share one implementation.
+> **Scope note.** This spec previously described a full Local Browse &
+> Search UI. That scope was withdrawn by ADR-0024 (2026-07-03; epic #75 and
+> issues #102–#105 closed won't-fix). The security posture below carries
+> over from the withdrawn spec unchanged.
 
-Governing: ADR-0005 (frontend stack, reframed), ADR-0012 (single-user
-local-first), ADR-0006 (SQLite cache), ADR-0017 (stdio MCP + shared
-store, no drift).
+Posture is local-first and least-privilege. The UI **binds loopback by
+default and has no authentication** (ADR-0012): the single OS user *is*
+the identity. Cached data is still hostile-influenced input (facts and
+metadata derive from attacker-authored mail; attachments are
+attacker-authored bytes), so the UI needs nothing off-origin — a strict
+CSP over self-hosted assets, `html/template` auto-escaping on every
+untrusted string, and path-contained media serving. To prevent behavioral
+drift, the UI reads through the **same `store` methods as the MCP tools**
+(ADR-0017); it is read-only end to end.
+
+Governing: ADR-0024 (insights scope), ADR-0005 (frontend stack, narrowed),
+ADR-0012 (single-user local-first), ADR-0006 (SQLite cache), ADR-0017
+(stdio MCP + shared store, no drift).
 
 ## Requirements
 
 ### Requirement: Loopback Default With Non-Loopback Warning
 
-The UI's listen address MUST default to a loopback address. A bind to
-any non-loopback address MUST be permitted but MUST emit a prominent
-startup warning, because the UI has no authentication.
+The UI server MUST bind `127.0.0.1` by default. When configured to bind a
+non-loopback address, it MUST log a prominent warning naming the exposure
+and MUST NOT add authentication to compensate (ADR-0011 fronting guidance
+applies instead).
 
 #### Scenario: Default bind is loopback
 
-- **WHEN** the UI server is started without an explicit listen address
-- **THEN** the system SHALL bind `127.0.0.1` (default
-  `127.0.0.1:8787`) and SHALL serve only connections that reach that
-  interface
+- **WHEN** `reduit serve` starts with no bind configuration
+- **THEN** the server SHALL listen on a loopback address only
 
-#### Scenario: Non-loopback bind logs a prominent warning
+#### Scenario: Non-loopback bind warns
 
-- **WHEN** the operator configures a listen address whose host is not
-  a loopback address (e.g. `0.0.0.0` or a routable interface)
-- **THEN** the system SHALL still bind as requested AND SHALL log a
-  prominent warning at startup stating that the UI has no
-  authentication and that any wider exposure is the operator's
-  deliberate choice behind their own access control
+- **WHEN** the operator configures a non-loopback bind address
+- **THEN** the server SHALL start but SHALL log a prominent warning that
+  the insights UI is unauthenticated and now network-exposed
 
 ### Requirement: No Authentication
 
-The UI MUST NOT implement authentication, authorization, login,
-session, or any multi-user concept. It trusts the local OS user.
+The UI MUST NOT implement authentication, sessions, or user identity: the
+operating-system user is the identity (ADR-0012). There is no login page,
+no token, and no cookie-based state.
 
-#### Scenario: Every route serves without a login
+#### Scenario: No auth surface exists
 
-- **WHEN** a request reaches any UI route
-- **THEN** the system SHALL serve it without any login redirect,
-  credential check, session lookup, or per-user scoping, AND SHALL NOT
-  set or require any authentication cookie or bearer token
-
-#### Scenario: No OIDC, session, or user surface exists
-
-- **WHEN** the UI is inspected for authentication machinery
-- **THEN** there SHALL be no OIDC client, no session store, no
-  `users` concept, and no admin/allowlist gate; the single OS user is
-  the identity per ADR-0012
+- **WHEN** any UI route is requested
+- **THEN** the response SHALL NOT redirect to a login flow, set an
+  identity cookie, or vary on any credential
 
 ### Requirement: Strict Content-Security-Policy, Self-Only Assets
 
-The UI MUST send a strict CSP and hardening headers on every HTML
-response, and MUST load every asset from its own origin with no CDN.
+Every HTML response MUST carry a strict CSP permitting only self-hosted
+assets; the UI MUST function with no off-origin request of any kind
+(styles, scripts, fonts, images). Inline script MUST NOT be used.
 
-#### Scenario: Strict CSP and hardening headers on HTML responses
+#### Scenario: CSP on every page
 
-- **WHEN** the server returns an HTML response (full page or HTMX
-  fragment)
-- **THEN** the response SHALL carry
-  `Content-Security-Policy: default-src 'none'` with `script-src
-  'self'`, `style-src 'self'`, `img-src 'self' data:`, `connect-src
-  'self'`, `font-src 'self'`, `base-uri 'none'`, `form-action 'self'`,
-  and `frame-ancestors 'none'`, plus `X-Content-Type-Options:
-  nosniff`, `Referrer-Policy: no-referrer`, and `X-Frame-Options:
-  DENY`
-
-#### Scenario: All assets are same-origin and self-hosted
-
-- **WHEN** a page references htmx, the stylesheet, the theme script,
-  or icons
-- **THEN** htmx (and its SSE extension where used), the built
-  Tailwind 4 + DaisyUI stylesheet, the theme-toggle script, and the
-  Hero Icons SHALL all be vendored or inlined and served from the UI's
-  own origin, with no CDN, external font, or off-origin script, so the
-  strict CSP holds without exception
+- **WHEN** any UI page is served
+- **THEN** it SHALL include a CSP restricting sources to `'self'` (with at
+  most hash-allowed inline style), and the page SHALL render fully with the
+  network blocked to all non-loopback hosts
 
 ### Requirement: Untrusted Content Is Escaped
 
-All message-derived content rendered by the UI MUST be treated as
-untrusted and escaped, since the cache is populated from crafted
-external mail.
+Every string that derives from mail content — attachment filenames, fact
+text, contact names/addresses, subjects, label names — MUST pass through
+`html/template` contextual auto-escaping. The UI MUST NOT mark any
+mail-derived value as safe HTML.
 
-#### Scenario: Bodies, subjects, and extracted text are auto-escaped
+#### Scenario: Hostile fact text is inert
 
-- **WHEN** the UI renders a message body, subject, sender, or
-  attachment-extracted text
-- **THEN** the system SHALL render it through `html/template`
-  auto-escaping so no embedded markup is interpreted as HTML
+- **WHEN** a contact fact whose text contains `<script>` markup is rendered
+- **THEN** the markup SHALL be displayed as text, not executed or
+  interpreted
 
-#### Scenario: URLs are linkified safely
+### Requirement: Attachment Listing And Path-Contained Serving
 
-- **WHEN** the UI linkifies a URL found in escaped message text
-- **THEN** the generated anchor SHALL carry `rel="noopener noreferrer
-  nofollow"`, and the surrounding text SHALL remain escaped
+The UI SHALL list cached attachments (filename, MIME type, size, owning
+message metadata) and serve extracted attachment content for viewing or
+download. Serving MUST be path-contained: only files within reduit's own
+data directory are servable, resolved paths MUST be verified inside that
+root, and traversal attempts MUST be rejected.
 
-#### Scenario: Search snippets are escaped before highlighting
+#### Scenario: Attachment listing
 
-- **WHEN** the UI renders a search snippet with matched-term
-  highlights
-- **THEN** the system SHALL escape the snippet text first and apply
-  highlight markers (`<mark>`) only afterward, and SHALL strip any
-  stray highlight sentinels so injected markup cannot survive
+- **WHEN** the attachments view is requested
+- **THEN** the UI SHALL render the cached attachments with filename, MIME
+  type, size, and owning-message metadata, read via the shared store
 
-### Requirement: Browse Mailboxes, Conversations, and Messages
+#### Scenario: Traversal is rejected
 
-The UI MUST let the user navigate the cache hierarchy and MUST be
-multi-mailbox aware.
+- **WHEN** an attachment request resolves outside reduit's data root
+  (e.g. via `..` or an absolute path)
+- **THEN** the server SHALL refuse it without touching the file
 
-#### Scenario: Drill from mailboxes to a message
+### Requirement: Contact Facts With Citations
 
-- **WHEN** the user opens the browse surface
-- **THEN** the UI SHALL list the configured mailboxes, allow
-  selecting one to list its conversations/threads, and allow selecting
-  a conversation to read its messages in order, rendering each through
-  the escaping rules above
+The UI SHALL render per-contact extracted facts with their citations
+(the source message's metadata), read via the same store methods as the
+MCP's fact tools (SPEC-0011). The view is read-only: fact editing, merging,
+and denylisting remain CLI/MCP operations.
 
-#### Scenario: Filter to one mailbox or view across all
+#### Scenario: Facts with citations
 
-- **WHEN** the user has more than one mailbox configured
-- **THEN** the UI SHALL allow scoping the view to a single mailbox AND
-  SHALL allow a combined view across all mailboxes, scoping handled by
-  the `mailbox_id` filter on the shared store query (ADR-0006)
+- **WHEN** a contact's view is requested
+- **THEN** the UI SHALL render that contact's facts each with its source
+  citation, and SHALL NOT offer mutation controls
 
-### Requirement: Keyword and Semantic Search Over the Shared Store
+### Requirement: Metadata And Stats
 
-The UI MUST offer keyword (FTS5) and semantic search that call the
-**same `store` methods as the MCP search tool** (ADR-0017), and MUST
-degrade gracefully when embeddings are unavailable.
+The UI SHALL render cache-level insight pages: per-mailbox message counts
+and date coverage, sync run history (from `sync_runs`), attachment
+extraction coverage, embedding/indexing progress, and storage size — the
+operational "how healthy and complete is my cache" view. All values come
+from the shared store; the UI computes nothing the store cannot answer.
 
-#### Scenario: Search calls the same store methods as MCP
+#### Scenario: Stats page
 
-- **WHEN** the user submits a search query
-- **THEN** the UI SHALL invoke the same hybrid `store` search method
-  the MCP `search_messages` tool uses (FTS5 keyword + best-effort
-  vector, fused by reciprocal-rank fusion), so keyword and semantic
-  behavior cannot drift between surfaces
+- **WHEN** the stats view is requested
+- **THEN** it SHALL render per-mailbox counts, date coverage, last sync
+  runs with their summaries, extraction/embedding coverage, and store size
 
-#### Scenario: Degrades to keyword-only without embeddings
+### Requirement: Read-Only Shared-Store Access
 
-- **WHEN** the embedding endpoint or stored vectors are unavailable
-- **THEN** the search SHALL degrade to keyword-only results rather
-  than failing, consistent with the MCP tool's degradation (ADR-0017)
+Every UI handler MUST read through the same `store` methods the MCP tools
+use and MUST NOT write to the store, call Proton, or trigger sync/extract
+work. The UI SHALL degrade gracefully offline: it renders whatever the
+cache holds (SPEC-0002 offline behavior).
 
-#### Scenario: Results link back to the source message
+#### Scenario: No writes, no network
 
-- **WHEN** search results render
-- **THEN** each result SHALL carry enough provenance (mailbox,
-  conversation/sender, timestamp, message identity) to open the exact
-  source message in the browse surface
+- **WHEN** any UI request is handled
+- **THEN** it SHALL perform no store writes and no Proton API calls
 
-### Requirement: Attachment and Media Serving
+#### Scenario: Works offline
 
-The UI MUST serve attachments and media with correct headers and MUST
-contain path traversal; script-capable formats MUST NOT be inlined.
+- **WHEN** the machine has no network connectivity
+- **THEN** all insights pages SHALL render from the cache
 
-#### Scenario: Correct content type and disposition
+### Requirement: Withdrawn Surfaces Stay Withdrawn
 
-- **WHEN** the UI serves an attachment or media file
-- **THEN** the response SHALL set a correct `Content-Type` and an
-  appropriate `Content-Disposition` for the file
+The UI MUST NOT grow message browsing, conversation views, a search UI, or
+live-update streams (SSE/WebSocket) without a superseding ADR revisiting
+ADR-0024.
 
-#### Scenario: Path traversal is contained
+#### Scenario: No browse or search routes
 
-- **WHEN** a media path is resolved
-- **THEN** the system SHALL clean the path, anchor it (strip leading
-  separators), and verify the result stays within the per-source base
-  directory; a path escaping that base SHALL be rejected and the file
-  SHALL NOT be served
-
-#### Scenario: SVG is forced to download, never inlined
-
-- **WHEN** the requested attachment is an SVG (or another
-  script-capable format)
-- **THEN** the system SHALL serve it with a download disposition and
-  SHALL NOT render it inline, since SVG can carry script
-
-### Requirement: Contact View With Cited Facts
-
-The UI MUST present a contact's identifiers and the cited facts
-accrued for that contact (SPEC-0011).
-
-#### Scenario: Contact page shows identifiers and cited facts
-
-- **WHEN** the user opens a contact
-- **THEN** the UI SHALL render the contact's identifiers (the
-  addresses that resolve to that person) AND the cited
-  `contact_facts` for that contact, each fact showing its citation to
-  the source message so the user can open the cited message
-
-#### Scenario: Facts come from the shared store
-
-- **WHEN** the contact page loads facts
-- **THEN** it SHALL read them via the same `store` method the MCP
-  contact-facts tool uses (ADR-0017), so facts cannot drift between
-  surfaces
-
-### Requirement: Optional Live Updates via SSE
-
-The UI MAY use SSE where a screen genuinely needs live updates, but
-SSE MUST NOT be load-bearing for core browse/search.
-
-#### Scenario: SSE only where a screen needs it
-
-- **WHEN** a screen benefits from live updates (e.g. sync progress)
-- **THEN** the UI MAY open an SSE stream for that screen only, and the
-  rest of the UI SHALL remain fully functional without SSE
-
-#### Scenario: Core browse and search work without SSE
-
-- **WHEN** SSE is unavailable or disabled
-- **THEN** browsing mailboxes, reading messages, searching, and
-  viewing contacts SHALL all continue to work via ordinary requests
-  and HTMX swaps
-
-## Out of Scope
-
-- OIDC login, account-administration wizard, and any multi-user or
-  admin surface — deleted by ADR-0012; the OS user is the identity.
-- Write actions beyond what the CLI and MCP already own. Sending mail
-  lives in SPEC-0010 (outbound send); this UI MAY surface at most a
-  compose affordance that hands off to that path — send semantics
-  (drafting, confirmation, Proton submission) are specified there, not
-  here.
-- Exposing the UI to the network. A non-loopback bind is permitted but
-  is entirely the operator's responsibility behind their own access
-  control; the UI ships no authentication to make that safe.
-- IMAP/SMTP relay credentials, MCP-token issuance, and per-account
-  state management — all removed with the relay (ADR-0012).
+- **WHEN** the UI's route surface is enumerated
+- **THEN** it SHALL contain no conversation/message browsing route and no
+  search endpoint

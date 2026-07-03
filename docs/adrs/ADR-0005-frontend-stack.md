@@ -1,6 +1,6 @@
 # ADR-0005: Frontend stack — HTMX, SSE, Tailwind 4, DaisyUI, Hero Icons
 
-- **Status:** accepted (reframed 2026-06-29 by [ADR-0012](ADR-0012-single-user-local-first.md))
+- **Status:** accepted (reframed 2026-06-29 by [ADR-0012](ADR-0012-single-user-local-first.md); scope narrowed 2026-07-03 by [ADR-0024](ADR-0024-local-insights-ui-scope.md))
 - **Date:** 2026-04-25
 - **Deciders:** Joe Stump
 
@@ -14,6 +14,11 @@
 > is a local CLI flow (`reduit auth`). SSE is retained only if a screen needs live
 > updates (e.g. sync progress); it is no longer load-bearing. See the rewritten
 > Local UI spec (SPEC-0005).
+>
+> **Scope narrowed 2026-07-03 by [ADR-0024](ADR-0024-local-insights-ui-scope.md).**
+> The browse/search UI is withdrawn entirely; the stack decided here now applies
+> only to the lightweight **Local Insights UI** (attachments, contact facts,
+> metadata, stats). SSE is out of scope.
 
 ## Context and Problem Statement
 
