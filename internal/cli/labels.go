@@ -10,6 +10,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"text/tabwriter"
@@ -68,34 +69,53 @@ func runLabels(ctx context.Context, st *store.Store, ks keychain.Store, dialer p
 	}
 
 	// The session UID is required to resume — Proton identifies the session by it,
-	// and resuming without it yields a raw 10013 "Invalid refresh token". A row
-	// added before session-uid tracking has none; `labels` cannot re-login, so
+	// and a lazy refresh without it yields a raw 10013 "Invalid refresh token". A
+	// row added before session-uid tracking has none; `labels` cannot re-login, so
 	// surface an actionable message instead of that opaque code.
 	if m.SessionUID == nil || *m.SessionUID == "" {
 		return fmt.Errorf("mailbox %q predates session-uid tracking and cannot resume; re-add it: 'reduit auth remove %s' then 'reduit auth add %s'", m.Address, m.Address, m.Address)
 	}
 	storedUID := *m.SessionUID
 
-	client, err := dialer.Resume(ctx, *m.ProtonUserID, storedUID, refreshToken)
+	// The access token is required to resume: Resume REUSES the cached session
+	// (go-proton-api's NewClient) to preserve the 2FA-elevated scope rather than
+	// eagerly refreshing into a reduced scope that fails key/salt access with 403
+	// code 9101. A row added before access-token tracking has none; `labels`
+	// cannot re-login, so surface an actionable message instead of silently
+	// resuming into a scope that would later break sync.
+	accessToken, err := ks.Get(m.ID, keychain.AccessToken)
+	if errors.Is(err, keychain.ErrNotFound) {
+		return fmt.Errorf("mailbox %q predates full-scope resume (no stored access token); re-authenticate it: 'reduit auth refresh %s' (or remove and re-add it)", m.Address, m.Address)
+	} else if err != nil {
+		return fmt.Errorf("read access token: %w", actionableKeyringErr(err))
+	}
+
+	client, err := dialer.Resume(ctx, *m.ProtonUserID, storedUID, accessToken, refreshToken)
 	if err != nil {
 		return fmt.Errorf("resume session: %w", err)
 	}
 	defer client.Close()
 
-	// Resume may rotate the token; persist it so the next use isn't stale. A
-	// failed write flags the mailbox needs_reauth (the old token is now spent).
-	if err := persistRotatedTokenOrFlag(ctx, st, ks, m.ID, refreshToken, client.RefreshToken()); err != nil {
-		return fmt.Errorf("store rotated token: %w", err)
-	}
-	// Resume may also rotate the session UID; persist it so the next resume
-	// presents the current one.
-	if err := persistRotatedSessionUID(ctx, st, m.ID, storedUID, client.SessionUID()); err != nil {
-		return fmt.Errorf("store rotated session uid: %w", err)
-	}
-
+	// Labels is both the connection test and the first real API call: Resume
+	// itself makes no network call, so this is where an expired cached access
+	// token triggers the scope-preserving lazy refresh that rotates the tokens.
 	labels, err := client.Labels(ctx)
 	if err != nil {
 		return fmt.Errorf("fetch labels: %w", err)
+	}
+
+	// A lazy refresh during the fetch may have rotated the access/refresh token
+	// or the session UID; persist any that changed so the next resume matches. A
+	// failed refresh-token write flags the mailbox needs_reauth (the old token is
+	// now spent).
+	if err := persistRotatedAccessToken(ks, m.ID, accessToken, client.AccessToken()); err != nil {
+		return fmt.Errorf("store rotated access token: %w", err)
+	}
+	if err := persistRotatedTokenOrFlag(ctx, st, ks, m.ID, refreshToken, client.RefreshToken()); err != nil {
+		return fmt.Errorf("store rotated token: %w", err)
+	}
+	if err := persistRotatedSessionUID(ctx, st, m.ID, storedUID, client.SessionUID()); err != nil {
+		return fmt.Errorf("store rotated session uid: %w", err)
 	}
 
 	fmt.Fprintf(out, "Labels for %s (%d):\n", m.Address, len(labels))

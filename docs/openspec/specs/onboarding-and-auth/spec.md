@@ -17,11 +17,14 @@ OpenPGP key unlock, refresh-token rotation — is delegated to
 transitions, and where the secrets land. Human verification is *avoided*
 rather than solved: reduit identifies as a Proton Bridge client
 (app-version), which Proton waves through with no CAPTCHA, so there is no
-in-app challenge solver (ADR-0021). The two live secrets
-produced by a successful auth — the Proton refresh token and the mailbox
-passphrase — are written to the OS keychain (ADR-0013) under service
-`reduit` at keys `mailbox/<id>/refresh_token` and
-`mailbox/<id>/mailbox_passphrase`. They MUST NOT be written to disk,
+in-app challenge solver (ADR-0021). The live secrets
+produced by a successful auth — the Proton refresh token, the Proton
+access token, and the mailbox passphrase — are written to the OS keychain
+(ADR-0013) under service `reduit` at keys `mailbox/<id>/refresh_token`,
+`mailbox/<id>/access_token`, and `mailbox/<id>/mailbox_passphrase`. The
+access token is persisted so a cross-process resume can reuse the cached
+session and preserve the 2FA-elevated scope (see "Cross-Process Session
+Resume"). They MUST NOT be written to disk,
 logs, the SQLite store, error messages, or shell history. The same flow
 re-authenticates a mailbox in `needs_reauth` and supports adding a second
 or Nth distinct Proton account without any "you already have one"
@@ -49,8 +52,8 @@ password authentication, satisfy any 2FA challenge, capture and apply
 the mailbox passphrase, and on success record `proton_user_id` and
 transition the mailbox to `active`. The `mailboxes` row SHALL be created
 in `pending_auth` before network auth begins and SHALL only advance to
-`active` after both the refresh token and the passphrase are persisted
-to the keychain.
+`active` after the refresh token, access token, and passphrase are
+persisted to the keychain.
 
 #### Scenario: Operator runs reduit auth for a new mailbox
 
@@ -65,8 +68,8 @@ to the keychain.
 - **WHEN** SRP, any required 2FA, and mailbox-passphrase unlock all
   complete for a `pending_auth` mailbox
 - **THEN** the system SHALL persist the returned `proton_user_id` on the
-  row, write the refresh token and passphrase to the keychain, and
-  transition the mailbox `state` to `active`
+  row, write the refresh token, access token, and passphrase to the
+  keychain, and transition the mailbox `state` to `active`
 
 #### Scenario: Aborted auth leaves no active mailbox
 
@@ -162,21 +165,22 @@ to any error message.
 
 Per-mailbox secrets SHALL be created in the OS keychain at auth time,
 read non-interactively at sync and send time, and deleted when the
-mailbox is removed. The keys SHALL be `mailbox/<id>/refresh_token` and
-`mailbox/<id>/mailbox_passphrase` under service `reduit`; the database
-SHALL hold only the `mailbox_id` reference.
+mailbox is removed. The keys SHALL be `mailbox/<id>/refresh_token`,
+`mailbox/<id>/access_token`, and `mailbox/<id>/mailbox_passphrase` under
+service `reduit`; the database SHALL hold only the `mailbox_id` reference.
 
 #### Scenario: Secrets created on successful auth
 
 - **WHEN** `reduit auth` completes for a mailbox
 - **THEN** the system SHALL write the Proton refresh token to
-  `mailbox/<id>/refresh_token` and the mailbox passphrase to
+  `mailbox/<id>/refresh_token`, the Proton access token to
+  `mailbox/<id>/access_token`, and the mailbox passphrase to
   `mailbox/<id>/mailbox_passphrase`
 
 #### Scenario: Secrets read non-interactively at use time
 
-- **WHEN** a sync or send operation needs the refresh token or passphrase
-  for an `active` mailbox
+- **WHEN** a sync or send operation needs the refresh token, access token,
+  or passphrase for an `active` mailbox
 - **THEN** the system SHALL read it from the keychain by the
   `mailbox/<id>/<kind>` key without prompting the operator, subject only
   to the OS keyring being unlocked
@@ -184,9 +188,9 @@ SHALL hold only the `mailbox_id` reference.
 #### Scenario: Secrets deleted on mailbox removal
 
 - **WHEN** a mailbox is removed
-- **THEN** the system SHALL delete both `mailbox/<id>/refresh_token` and
-  `mailbox/<id>/mailbox_passphrase`; no orphaned secret SHALL remain in
-  the keychain
+- **THEN** the system SHALL delete `mailbox/<id>/refresh_token`,
+  `mailbox/<id>/access_token`, and `mailbox/<id>/mailbox_passphrase`; no
+  orphaned secret SHALL remain in the keychain
 
 ### Requirement: Re-Auth Flow
 
@@ -202,8 +206,8 @@ SHALL be an error and SHALL NOT overwrite the stored value.
 - **WHEN** the operator runs `reduit auth` for a mailbox whose `state`
   is `needs_reauth`
 - **THEN** the system SHALL re-run the auth flow against the same row,
-  rewrite the refresh token and passphrase in the keychain, and
-  transition the mailbox back to `active`
+  rewrite the refresh token, access token, and passphrase in the keychain,
+  and transition the mailbox back to `active`
 
 #### Scenario: Re-auth preserves the existing cache
 
@@ -223,17 +227,32 @@ SHALL be an error and SHALL NOT overwrite the stored value.
 ### Requirement: Cross-Process Session Resume
 
 A session minted by `reduit auth` SHALL be resumable from a separate
-process (a sync or send run) without re-prompting. Two pieces of session
-state make this correct, and both SHALL be honored (ADR-0001, ADR-0013,
+process (a sync or send run) without re-prompting. Three pieces of session
+state make this correct, and all SHALL be honored (ADR-0001, ADR-0013,
 ADR-0021):
 
+- **Access token (session reuse, not eager refresh).** Resume SHALL rebuild
+  the session by REUSING the cached tokens via go-proton-api's session-reuse
+  constructor (`Manager.NewClient`), which makes no network call and
+  preserves the access token's scope. Resume SHALL NOT use an eager refresh
+  (`Manager.NewClientWithRefresh`): an eager `/auth/v4/refresh` of a
+  freshly-2FA'd session returns a REDUCED scope, which later fails key/salt
+  access (`GetSalts` during `Unlock`) with **403 code 9101** ("Access token
+  does not have sufficient scope") — so a low-scope call like `labels`
+  succeeds on resume while `sync` 9101s. The access token SHALL therefore be
+  persisted per mailbox as a session secret (in the keychain, alongside the
+  refresh token), presented on every resume, and — because a lazy refresh
+  (triggered when the cached access token expires) may rotate the access
+  token, refresh token, and UID — re-read and re-persisted after operations
+  whenever it changed. An auth handler registered on the resumed client SHALL
+  capture the rotated tokens from that lazy refresh.
 - **Session UID.** The go-proton-api session UID (`auth.UID`, distinct
   from the account's `proton_user_id`) SHALL be persisted per mailbox as
   non-secret session state and presented on every resume. Proton's
-  `/auth/v4/refresh` identifies the session by this UID; resuming without
-  it yields code **10013** ("invalid refresh token"). Because a resume may
-  rotate the UID, the caller SHALL re-read and re-persist it after each
-  resume, alongside the rotated refresh token.
+  `/auth/v4/refresh` identifies the session by this UID; a lazy refresh
+  without it yields code **10013** ("invalid refresh token"). Because a
+  resume may rotate the UID, the caller SHALL re-read and re-persist it
+  after each resume, alongside the rotated access and refresh tokens.
 - **App-version binding.** Proton binds a session to the app-version that
   minted it, so the app-version presented at resume SHALL match the one
   presented at mint; a mismatch also yields 10013. The default Bridge
@@ -241,13 +260,25 @@ ADR-0021):
   path; an operator who overrides `proton.app_version` SHALL do so
   consistently across `auth`, `labels`, and `sync`.
 
-#### Scenario: Resume presents the persisted session UID
+#### Scenario: Resume reuses the cached access token to preserve scope
 
 - **WHEN** a sync or send process resumes an `active` mailbox from its
-  stored refresh token
-- **THEN** the system SHALL present the mailbox's persisted session UID on
-  the refresh, and after a resume that rotates the UID or refresh token
-  SHALL persist the rotated values so the next resume still matches
+  stored session
+- **THEN** the system SHALL reconstruct the client by reusing the stored
+  access token (session reuse, no eager refresh), so the 2FA-elevated scope
+  is preserved and key/salt access during `Unlock` does not fail with 403
+  code 9101; and after a lazy refresh that rotates the access token, refresh
+  token, or UID SHALL persist the rotated values so the next resume matches
+
+#### Scenario: Missing access token forces re-auth rather than a scope-reduced resume
+
+- **WHEN** a mailbox row has a refresh token and session UID but no persisted
+  access token (e.g. a pre-fix row)
+- **THEN** the system SHALL NOT resume via an eager refresh that would reduce
+  the session scope and later 9101; `labels` and `sync` SHALL surface an
+  actionable "re-authenticate" message, and `auth refresh` SHALL fall back to
+  the interactive re-login, which stores a fresh full-scope access token and
+  self-heals the row
 
 #### Scenario: Missing session UID forces re-auth rather than a broken resume
 
@@ -255,7 +286,7 @@ ADR-0021):
   (e.g. a pre-migration row)
 - **THEN** the system SHALL NOT attempt a resume that would fail with
   10013; it SHALL fall back to the interactive re-login, which re-persists
-  both the refresh token and the session UID, self-healing the row
+  the refresh token, access token, and session UID, self-healing the row
 
 #### Scenario: Resume app-version matches the minting app-version
 

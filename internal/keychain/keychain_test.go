@@ -106,6 +106,9 @@ func TestDeleteAll(t *testing.T) {
 		if err := s.Set(id, RefreshToken, "rt-"+id); err != nil {
 			t.Fatalf("Set RefreshToken %s: %v", id, err)
 		}
+		if err := s.Set(id, AccessToken, "at-"+id); err != nil {
+			t.Fatalf("Set AccessToken %s: %v", id, err)
+		}
 		if err := s.Set(id, MailboxPassphrase, "pp-"+id); err != nil {
 			t.Fatalf("Set MailboxPassphrase %s: %v", id, err)
 		}

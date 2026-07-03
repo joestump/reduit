@@ -21,22 +21,31 @@ import (
 // CLI auth/labels flow runs without a live account. NewClient hands out the
 // pre-scripted Fake; Resume marks it authenticated like the real cold-resume.
 type fakeDialer struct {
-	client     *proton.Fake
-	resumeErr  error
-	resumed    bool
-	resumedUID string // the session UID the last Resume received
+	client        *proton.Fake
+	resumeErr     error
+	resumed       bool
+	resumedUID    string // the session UID the last Resume received
+	resumedAccess string // the access token the last Resume received
 }
 
 func (d *fakeDialer) NewClient() proton.Client { return d.client }
 
-func (d *fakeDialer) Resume(ctx context.Context, protonUserID, sessionUID, token string) (proton.Client, error) {
+func (d *fakeDialer) Resume(ctx context.Context, protonUserID, sessionUID, accessToken, token string) (proton.Client, error) {
 	_, _ = protonUserID, token
 	d.resumedUID = sessionUID
+	d.resumedAccess = accessToken
 	if d.resumeErr != nil {
 		return nil, d.resumeErr
 	}
 	d.resumed = true
-	_ = d.client.Refresh(ctx) // a real resume authenticates the returned client
+	// The real Resume reuses the cached session to produce an authenticated
+	// client; go-proton-api then lazily refreshes (rotating the tokens) on the
+	// first API call whose cached access token has expired. This double folds both
+	// steps into the resume so a caller that reads the tokens after its probe/
+	// operation observes any scripted rotation (RefreshTokens/AccessTokens/
+	// SessionUIDs). The no-eager-refresh distinction is asserted at the proton
+	// package level, against the real Manager.
+	_ = d.client.Refresh(ctx)
 	return d.client, nil
 }
 
@@ -376,6 +385,99 @@ func TestRunLabels_EmptySessionUID(t *testing.T) {
 	}
 }
 
+// TestAuthAdd_PersistsAccessToken pins that `auth add` stores the access token
+// alongside the refresh token, so a later cross-process Resume can reuse the
+// cached session and keep the 2FA-elevated scope (SPEC-0007 "Cross-Process
+// Session Resume").
+func TestAuthAdd_PersistsAccessToken(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newTestKeychain(t)
+	fake := proton.NewFake()
+	fake.UserID = "u-add"
+	fake.Token = "rt-add"
+	fake.UID = "uid-add"
+	fake.Access = "acc-add"
+	dialer := &fakeDialer{client: fake}
+
+	if err := authAdd(ctx, st, ks, dialer, &scriptPrompter{secrets: []string{"pw", "pass"}}, "add@proton.test", &bytes.Buffer{}); err != nil {
+		t.Fatalf("authAdd: %v", err)
+	}
+	m, _ := st.GetMailboxByAddress(ctx, "add@proton.test")
+	if got, _ := ks.Get(m.ID, keychain.AccessToken); got != "acc-add" {
+		t.Errorf("stored access token = %q, want acc-add", got)
+	}
+}
+
+// TestRunLabels_ResumesWithAccessTokenAndPersistsRotation asserts labels reads
+// the stored access token, hands it to Resume, and persists the rotated access
+// token a (simulated) lazy refresh produced during the connection test.
+func TestRunLabels_ResumesWithAccessTokenAndPersistsRotation(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newTestKeychain(t)
+	fake := proton.NewFake()
+	fake.UserID = "u-lbl"
+	fake.Token = "rt-lbl"
+	fake.UID = "uid-lbl"
+	fake.Access = "acc-init"
+	fake.LabelList = []proton.Label{{ID: "0", Name: "Inbox", Type: proton.LabelTypeSystem}}
+	dialer := &fakeDialer{client: fake}
+
+	if err := authAdd(ctx, st, ks, dialer, &scriptPrompter{secrets: []string{"pw", "pass"}}, "lbl@proton.test", &bytes.Buffer{}); err != nil {
+		t.Fatalf("seed add: %v", err)
+	}
+	m, _ := st.GetMailboxByAddress(ctx, "lbl@proton.test")
+
+	// A lazy refresh during the resume rotates the access token.
+	fake.AccessTokens = []string{"acc-rot"}
+
+	if err := runLabels(ctx, st, ks, dialer, "", &bytes.Buffer{}); err != nil {
+		t.Fatalf("runLabels: %v", err)
+	}
+	// Resume must have received the STORED access token (reuse, not eager refresh).
+	if dialer.resumedAccess != "acc-init" {
+		t.Errorf("Resume got access token %q, want acc-init", dialer.resumedAccess)
+	}
+	// The rotated access token must be persisted for the next resume.
+	if got, _ := ks.Get(m.ID, keychain.AccessToken); got != "acc-rot" {
+		t.Errorf("rotated access token not persisted: %q, want acc-rot", got)
+	}
+}
+
+// TestRunLabels_AbsentAccessToken covers a pre-fix row: identity, refresh token,
+// and session UID present, but no stored access token. `labels` cannot re-login,
+// so it must surface an actionable re-auth message and NOT resume into a
+// scope-reduced session that would 9101 (SPEC-0007 "Cross-Process Session
+// Resume").
+func TestRunLabels_AbsentAccessToken(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newTestKeychain(t)
+
+	if err := st.InsertMailbox(ctx, "prefix-id", "prefix@proton.test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetProtonUserID(ctx, "prefix-id", "u-prefix"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSessionUID(ctx, "prefix-id", "uid-prefix"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ks.Set("prefix-id", keychain.RefreshToken, "rt-prefix"); err != nil {
+		t.Fatal(err)
+	}
+
+	dialer := &fakeDialer{client: proton.NewFake()}
+	err := runLabels(ctx, st, ks, dialer, "", &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "no stored access token") {
+		t.Fatalf("expected actionable access-token error, got %v", err)
+	}
+	if dialer.resumed {
+		t.Error("resume must not be attempted without a stored access token")
+	}
+}
+
 // --- auth refresh -----------------------------------------------------------
 
 func TestAuthRefresh(t *testing.T) {
@@ -415,6 +517,56 @@ func TestAuthRefresh(t *testing.T) {
 	m2, _ := st.GetMailboxByAddress(ctx, "refresh@proton.test")
 	if m2.SessionUID == nil || *m2.SessionUID != "session-uid-7-rot" {
 		t.Errorf("rotated session_uid not persisted: %v", m2.SessionUID)
+	}
+}
+
+// TestAuthRefresh_AbsentAccessTokenReLogin covers a pre-fix row on the refresh
+// path: with a refresh token and session UID but NO stored access token, the
+// cheap resume is skipped (reusing an eager-refresh would reduce scope) and the
+// interactive re-login self-heals the row by storing a fresh full-scope access
+// token (SPEC-0007 "Cross-Process Session Resume").
+func TestAuthRefresh_AbsentAccessTokenReLogin(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newTestKeychain(t)
+
+	// Seed an active pre-fix row: identity + refresh token + session UID, but no
+	// access token.
+	if err := st.InsertMailbox(ctx, "pf-id", "prefix-refresh@proton.test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetProtonUserID(ctx, "pf-id", "u-pf"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSessionUID(ctx, "pf-id", "uid-pf"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ks.Set("pf-id", keychain.RefreshToken, "rt-pf"); err != nil {
+		t.Fatal(err)
+	}
+
+	fake := proton.NewFake()
+	fake.UserID = "u-pf" // re-login resolves the same account
+	fake.Token = "rt-pf-relogin"
+	fake.UID = "uid-pf-relogin"
+	fake.Access = "acc-pf-relogin"
+	dialer := &fakeDialer{client: fake}
+
+	var out bytes.Buffer
+	p := &scriptPrompter{secrets: []string{"pw", "pass"}}
+	if err := authRefresh(ctx, st, ks, dialer, p, "prefix-refresh@proton.test", &out); err != nil {
+		t.Fatalf("authRefresh: %v", err)
+	}
+	// The cheap resume must have been skipped (no access token to reuse).
+	if dialer.resumed {
+		t.Error("cheap resume should be skipped when no access token is stored")
+	}
+	// The re-login self-healed the row: a fresh access token is now stored.
+	if got, _ := ks.Get("pf-id", keychain.AccessToken); got != "acc-pf-relogin" {
+		t.Errorf("access token not stored by re-login: %q, want acc-pf-relogin", got)
+	}
+	if !strings.Contains(out.String(), "Re-authenticated") {
+		t.Errorf("unexpected output: %q", out.String())
 	}
 }
 

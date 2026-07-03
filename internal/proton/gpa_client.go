@@ -89,33 +89,41 @@ func (d *GPADialer) NewClient() Client {
 	return &gpaClient{mgr: d.mgr}
 }
 
-// Resume reconstructs an authenticated client from a stored session UID and
-// refresh token (SPEC-0007 "Secrets read non-interactively at use time").
-// go-proton-api may rotate the token (and UID); the caller reads RefreshToken
-// and SessionUID afterward and persists them (ADR-0013). The returned client is
-// authenticated but not unlocked; the caller supplies the passphrase to Unlock.
-// The expected proton user id is verified to catch a token that resolves a
-// different account (SPEC-0007 "Re-Auth Flow").
+// Resume reconstructs an authenticated client from a stored session UID, access
+// token, and refresh token (SPEC-0007 "Cross-Process Session Resume"). It uses
+// go-proton-api's session-REUSE constructor Manager.NewClient(uid, acc, ref),
+// which re-hydrates the cached session from the stored tokens and makes NO
+// network call — deliberately NOT Manager.NewClientWithRefresh, whose eager
+// /auth/v4/refresh of a freshly-2FA'd session returns a REDUCED scope that later
+// fails key/salt access with 403 code 9101 (the "used the wrong newClient
+// function" gotcha documented by Proton-API-Bridge). Reusing the cached access
+// token preserves the 2FA-elevated scope; go-proton-api lazily refreshes only
+// when that token expires (on a 401), and the registered auth handler captures
+// the rotated tokens then (setClient). This mirrors Proton Bridge's session
+// caching.
 //
-// sessionUID is REQUIRED. Proton's /auth/v4/refresh identifies the session by
-// its UID (AuthRefreshReq.UID), NOT by the refresh token alone; refreshing with
-// UID="" yields 10013 "Invalid refresh token". reduit persists the UID captured
-// at Login on the mailbox row precisely so this cross-process resume can supply
-// it.
-func (d *GPADialer) Resume(ctx context.Context, protonUserID, sessionUID, refreshToken string) (Client, error) {
-	c := &gpaClient{mgr: d.mgr, userID: protonUserID, uid: sessionUID, refreshToken: refreshToken}
-	if err := c.refreshWithUID(ctx, sessionUID); err != nil {
-		return nil, err
-	}
-	// No post-resume account-identity check: a stored (session_uid, refresh
-	// token) pair is bound to the session that minted it, which is bound to one
-	// account — it cannot resolve a different Proton user. And /auth/v4/refresh
-	// does not return the UserID (auth.UserID is empty), so there is nothing to
-	// compare without an extra GetUser round trip. The account-switch guard that
-	// matters — an address now mapping to a different Proton account — lives in
-	// the INTERACTIVE re-auth path (auth.go re-login verifies proton_user_id),
-	// not here. c.userID stays the seeded proton_user_id. Governing: SPEC-0007
-	// "Re-Auth Flow", ADR-0001.
+// Because NewClient performs no I/O, Resume does not validate the session here;
+// the first real API call (Labels/Unlock/…) surfaces an invalid session. The
+// caller reads AccessToken/RefreshToken/SessionUID after its operations and
+// persists any that rotated (ADR-0013). The returned client is authenticated but
+// not unlocked; the caller supplies the passphrase to Unlock.
+//
+// sessionUID is REQUIRED for the later lazy /auth/v4/refresh, which identifies
+// the session by its UID (AuthRefreshReq.UID), NOT by the refresh token alone;
+// a lazy refresh with UID="" yields 10013 "Invalid refresh token". accessToken
+// is REQUIRED to preserve scope; callers that lack it (a pre-fix mailbox row)
+// must not reach here — see the actionable re-add error in auth.go/labels.go and
+// the sync engine.
+//
+// No post-resume account-identity check is done: a stored (session_uid, tokens)
+// tuple is bound to the session that minted it, which is bound to one account —
+// it cannot resolve a different Proton user. The account-switch guard that
+// matters lives in the INTERACTIVE re-auth path (auth.go re-login verifies
+// proton_user_id). c.userID stays the seeded proton_user_id. Governing:
+// SPEC-0007 "Cross-Process Session Resume" / "Re-Auth Flow", ADR-0001.
+func (d *GPADialer) Resume(_ context.Context, protonUserID, sessionUID, accessToken, refreshToken string) (Client, error) {
+	c := &gpaClient{mgr: d.mgr, userID: protonUserID, uid: sessionUID, accessToken: accessToken, refreshToken: refreshToken}
+	c.setClient(d.mgr.NewClient(sessionUID, accessToken, refreshToken))
 	return c, nil
 }
 
@@ -133,7 +141,8 @@ type gpaClient struct {
 
 	userID       string // immutable proton_user_id, set on Login/Resume
 	uid          string // go-proton-api session UID
-	refreshToken string // rotated on Login and Refresh
+	accessToken  string // rotated on Login, Refresh, and lazy refresh
+	refreshToken string // rotated on Login, Refresh, and lazy refresh
 
 	// Unlock state. Populated by Unlock, used by decrypt/send.
 	addrKRs   map[string]*crypto.KeyRing // address id -> unlocked keyring
@@ -162,14 +171,47 @@ func (c *gpaClient) Login(ctx context.Context, address string, password []byte) 
 
 // applyAuth records the authenticated session from a successful login and
 // derives the reduit AuthStatus: store the client, session UID, immutable
-// proton_user_id, and rotated refresh token, and compute the 2FA state. The
-// mailbox keyring is loaded later by Unlock, not here.
+// proton_user_id, and the rotated access + refresh tokens, and compute the 2FA
+// state. The mailbox keyring is loaded later by Unlock, not here.
 func (c *gpaClient) applyAuth(cli *gpa.Client, auth gpa.Auth) AuthStatus {
-	c.cli = cli
+	c.setClient(cli)
 	c.uid = auth.UID
 	c.userID = auth.UserID
+	c.accessToken = auth.AccessToken
 	c.refreshToken = auth.RefreshToken
 	return AuthStatus{ProtonUserID: auth.UserID, TwoFA: classify2FA(auth.TwoFA)}
+}
+
+// setClient installs a freshly-minted *gpa.Client (from login, refresh, or a
+// resume's session reuse), closing any prior one, and registers the auth handler
+// that keeps this wrapper's tokens in step with go-proton-api's own. When the
+// cached access token expires, go-proton-api lazily refreshes on a 401 and
+// invokes the handler with the new Auth; capturing it here is how a full-scope
+// session is kept fresh across a long-running sync, and how the caller learns
+// the rotated tokens to persist (ADR-0013, SPEC-0007 "Cross-Process Session
+// Resume"). The wrapper is single-worker (not concurrent), and go-proton-api
+// invokes the handler synchronously inside the triggering request, so these
+// field writes need no additional locking.
+func (c *gpaClient) setClient(cli *gpa.Client) {
+	if c.cli != nil {
+		c.cli.Close()
+	}
+	c.cli = cli
+	cli.AddAuthHandler(c.onAuth)
+}
+
+// onAuth is the go-proton-api AuthHandler installed by setClient. go-proton-api
+// invokes it after a lazy /auth/v4/refresh with the rotated session state, so
+// the wrapper's tokens track the live session and the caller can persist the
+// rotated values (SPEC-0007 "Cross-Process Session Resume"). A lazy refresh may
+// omit the account UserID (see refreshWithUID) but always carries the rotated
+// session UID and tokens, so UID is guarded against an empty clobber.
+func (c *gpaClient) onAuth(auth gpa.Auth) {
+	if auth.UID != "" {
+		c.uid = auth.UID
+	}
+	c.accessToken = auth.AccessToken
+	c.refreshToken = auth.RefreshToken
 }
 
 // SubmitTOTP completes a login that reported TwoFATOTP.
@@ -233,6 +275,12 @@ func (c *gpaClient) Unlock(ctx context.Context, passphrase []byte) error {
 func (c *gpaClient) ProtonUserID() string { return c.userID }
 func (c *gpaClient) RefreshToken() string { return c.refreshToken }
 
+// AccessToken returns the Proton access token. It is captured at Login and
+// re-read after every Refresh/Resume and lazy refresh, so a rotated value is
+// observable here and can be re-persisted (SPEC-0007 "Cross-Process Session
+// Resume").
+func (c *gpaClient) AccessToken() string { return c.accessToken }
+
 // SessionUID returns the go-proton-api session UID. It is captured at Login
 // (applyAuth) and re-read after every Refresh/Resume, so a rotated UID is
 // observable here and can be re-persisted.
@@ -256,10 +304,7 @@ func (c *gpaClient) refreshWithUID(ctx context.Context, uid string) error {
 	if err != nil {
 		return classifyError(err)
 	}
-	if c.cli != nil {
-		c.cli.Close()
-	}
-	c.cli = cli
+	c.setClient(cli)
 	c.uid = auth.UID
 	// /auth/v4/refresh does not return the account UserID, so auth.UserID is
 	// empty on a refresh — do NOT clobber a userID we already know (seeded at
@@ -268,6 +313,7 @@ func (c *gpaClient) refreshWithUID(ctx context.Context, uid string) error {
 	if auth.UserID != "" {
 		c.userID = auth.UserID
 	}
+	c.accessToken = auth.AccessToken
 	c.refreshToken = auth.RefreshToken
 	return nil
 }

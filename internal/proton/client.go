@@ -59,6 +59,16 @@ type Client interface {
 	// this after each and persist the new value to the keychain (ADR-0013).
 	RefreshToken() string
 
+	// AccessToken returns the current Proton access token. reduit persists it
+	// alongside the refresh token so a cross-process Resume can REUSE the cached
+	// session (go-proton-api's NewClient) and preserve the 2FA-elevated scope,
+	// rather than eagerly refreshing into a reduced scope that fails key/salt
+	// access with 403 code 9101 (SPEC-0007 "Cross-Process Session Resume"). Like
+	// the refresh token it rotates on Login, Refresh, and a lazy refresh, so the
+	// caller re-reads and re-persists it after its operations. It is "" before
+	// authentication.
+	AccessToken() string
+
 	// SessionUID returns the go-proton-api session UID captured at Login and
 	// re-read after Refresh/Resume. Proton's /auth/v4/refresh requires this UID
 	// to identify the session; resuming without it yields 10013 "Invalid refresh
@@ -135,14 +145,20 @@ type Dialer interface {
 	// Login flow.
 	NewClient() Client
 
-	// Resume reconstructs an authenticated client from a stored session UID and
-	// refresh token (SPEC-0007 "Secrets read non-interactively at use time").
-	// Both are required: Proton's /auth/v4/refresh identifies the session by its
-	// UID, so resuming with an empty sessionUID yields 10013 "Invalid refresh
-	// token". The refresh token (and possibly the UID) may be rotated by the
-	// resume; read RefreshToken and SessionUID afterward and persist them. The
-	// returned client is authenticated but not unlocked.
-	Resume(ctx context.Context, protonUserID, sessionUID, refreshToken string) (Client, error)
+	// Resume reconstructs an authenticated client by REUSING a stored session:
+	// its UID, access token, and refresh token (SPEC-0007 "Cross-Process Session
+	// Resume"). It uses go-proton-api's session-reuse constructor (NewClient),
+	// which makes no network call and preserves the access token's 2FA-elevated
+	// scope — resuming via an eager refresh instead reduces the scope and later
+	// fails key/salt access with 403 code 9101. Because it does not validate, the
+	// first real API call surfaces an invalid session. sessionUID and accessToken
+	// are both required (the UID identifies the session to the later lazy
+	// /auth/v4/refresh; the access token carries the scope); resuming with an
+	// empty sessionUID yields 10013 "Invalid refresh token". The access token,
+	// refresh token, and UID may all rotate on a lazy refresh; read AccessToken,
+	// RefreshToken, and SessionUID after operating and persist them. The returned
+	// client is authenticated but not unlocked.
+	Resume(ctx context.Context, protonUserID, sessionUID, accessToken, refreshToken string) (Client, error)
 }
 
 // TwoFAState reports what, if anything, must happen after the password step of

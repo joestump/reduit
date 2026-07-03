@@ -36,7 +36,7 @@ var (
 // failure is the mailbox's own (summary.Err) so a caller syncing many mailboxes
 // is not derailed by one (SPEC-0002 "Per-Mailbox Sync Isolation").
 func (e *Engine) syncMailbox(ctx context.Context, m store.Mailbox, summary *RunSummary) {
-	client, reauth, err := e.resumeClient(ctx, m)
+	client, seed, reauth, err := e.resumeClient(ctx, m)
 	if err != nil {
 		// An auth failure isolates to this mailbox: mark it needs_reauth only
 		// when the credentials are genuinely bad/absent (not a transient network
@@ -53,6 +53,13 @@ func (e *Engine) syncMailbox(ctx context.Context, m store.Mailbox, summary *RunS
 		return
 	}
 	defer client.Close()
+	// Resume REUSES the cached session (no network), so tokens rotate only lazily
+	// when the access token expires mid-run — on Unlock or a later API call. The
+	// auth handler tracks the rotated values on the client; persist them once here
+	// AFTER all operations, so the next resume matches (SPEC-0007 "Cross-Process
+	// Session Resume"). Runs before client.Close (defer LIFO) so the client's
+	// tokens are still readable.
+	defer e.persistRotatedSession(ctx, m.ID, client, seed, summary)
 
 	// Labels are fetched once per run and indexed for folder resolution, so each
 	// message map is a cheap lookup rather than a per-message API call.
@@ -81,56 +88,69 @@ func (e *Engine) syncMailbox(ctx context.Context, m store.Mailbox, summary *RunS
 	summary.Err = e.tail(ctx, client, m, *ss.EventCursor, folders, summary)
 }
 
+// resumeSeed holds the session values a resume started from, so the rotated
+// values observed after operations can be diffed and persisted (SPEC-0007
+// "Cross-Process Session Resume").
+type resumeSeed struct {
+	accessToken  string
+	refreshToken string
+	sessionUID   string
+}
+
 // resumeClient reconstructs an authenticated, unlocked Proton client for the
-// mailbox from its stored secrets, mirroring how `reduit labels` resumes today:
-// keychain refresh token + stored session UID → Dialer.Resume → persist any
-// rotated token/UID → Unlock with the keychain passphrase. It reports whether
-// the failure warrants flipping the mailbox to needs_reauth (bad/absent
-// credentials) versus a transient failure that should be retried next run.
-func (e *Engine) resumeClient(ctx context.Context, m store.Mailbox) (client proton.Client, reauth bool, err error) {
+// mailbox from its stored secrets, mirroring how `reduit labels` resumes:
+// keychain access + refresh token + stored session UID → Dialer.Resume (session
+// REUSE, no network) → Unlock with the keychain passphrase. Reusing the cached
+// access token preserves the 2FA-elevated scope key/salt access needs; an eager
+// refresh would reduce it and fail Unlock's GetSalts with 403 code 9101. It
+// returns the seed values so the caller can persist any tokens a lazy refresh
+// rotates during the run, and reports whether the failure warrants flipping the
+// mailbox to needs_reauth (bad/absent credentials) versus a transient failure
+// retried next run. Nothing is persisted here: Resume makes no network call, so
+// no rotation has happened yet.
+func (e *Engine) resumeClient(ctx context.Context, m store.Mailbox) (client proton.Client, seed resumeSeed, reauth bool, err error) {
 	if m.ProtonUserID == nil {
-		return nil, true, errors.New("mailbox has never authenticated")
+		return nil, seed, true, errors.New("mailbox has never authenticated")
 	}
 
 	refreshToken, err := e.keychain.Get(m.ID, keychain.RefreshToken)
 	if err != nil {
 		// A missing secret is a re-auth condition; an unavailable/locked keyring
 		// is an environmental failure the operator must resolve, not a re-auth.
-		return nil, errors.Is(err, keychain.ErrNotFound), fmt.Errorf("read refresh token: %w", err)
+		return nil, seed, errors.Is(err, keychain.ErrNotFound), fmt.Errorf("read refresh token: %w", err)
 	}
 	if m.SessionUID == nil || *m.SessionUID == "" {
-		return nil, true, errors.New("mailbox predates session-uid tracking; re-auth required")
+		return nil, seed, true, errors.New("mailbox predates session-uid tracking; re-auth required")
 	}
 	storedUID := *m.SessionUID
+	accessToken, err := e.keychain.Get(m.ID, keychain.AccessToken)
+	if err != nil {
+		// A pre-fix row has a refresh token but no access token. Resuming without
+		// it would force an eager refresh that reduces the scope and later 9101s on
+		// key/salt access, so treat its absence as a re-auth condition: the
+		// operator must re-authenticate (`reduit auth refresh`) to store one.
+		if errors.Is(err, keychain.ErrNotFound) {
+			return nil, seed, true, errors.New("mailbox predates full-scope resume (no stored access token); re-authenticate it with 'reduit auth refresh'")
+		}
+		return nil, seed, false, fmt.Errorf("read access token: %w", err)
+	}
+	seed = resumeSeed{accessToken: accessToken, refreshToken: refreshToken, sessionUID: storedUID}
 
-	// Resume is NOT retried at this layer: Proton refresh tokens are
-	// one-time-use, so a blind retry with the same token risks double-spending
-	// it. A transient network failure here simply fails the mailbox this run and
-	// is retried fresh next run; go-proton-api's transport already retries at the
-	// request level beneath us.
-	client, err = e.dialer.Resume(ctx, *m.ProtonUserID, storedUID, refreshToken)
+	// Resume reuses the cached session (NewClient) and makes no network call, so
+	// it cannot itself fail transiently; the first real call (Unlock below)
+	// surfaces an invalid session. Proton refresh tokens are one-time-use, so this
+	// layer never retries a resume.
+	client, err = e.dialer.Resume(ctx, *m.ProtonUserID, storedUID, accessToken, refreshToken)
 	if err != nil {
 		// A rejected/invalid refresh token is a re-auth condition; a network
 		// error is transient and must NOT flip the mailbox's state.
-		return nil, errors.Is(err, proton.ErrRefreshTokenInvalid), fmt.Errorf("resume session: %w", err)
-	}
-
-	// Resume may rotate the token and/or UID; persist them so the next run
-	// resumes cleanly. A failed token write is a re-auth condition — the old
-	// token is now spent, so the mailbox cannot resume until re-authenticated.
-	if err := e.persistRotatedToken(m.ID, refreshToken, client.RefreshToken()); err != nil {
-		client.Close()
-		return nil, true, fmt.Errorf("store rotated token: %w", err)
-	}
-	if err := e.persistRotatedSessionUID(ctx, m.ID, storedUID, client.SessionUID()); err != nil {
-		client.Close()
-		return nil, false, fmt.Errorf("store rotated session uid: %w", err)
+		return nil, seed, errors.Is(err, proton.ErrRefreshTokenInvalid), fmt.Errorf("resume session: %w", err)
 	}
 
 	passphrase, err := e.keychain.Get(m.ID, keychain.MailboxPassphrase)
 	if err != nil {
 		client.Close()
-		return nil, errors.Is(err, keychain.ErrNotFound), fmt.Errorf("read passphrase: %w", err)
+		return nil, seed, errors.Is(err, keychain.ErrNotFound), fmt.Errorf("read passphrase: %w", err)
 	}
 	pb := []byte(passphrase)
 	defer zeroBytes(pb)
@@ -138,9 +158,37 @@ func (e *Engine) resumeClient(ctx context.Context, m store.Mailbox) (client prot
 		client.Close()
 		// A rejected passphrase means the stored secret no longer unlocks the
 		// keys — a re-auth condition.
-		return nil, true, fmt.Errorf("unlock mailbox: %w", err)
+		return nil, seed, true, fmt.Errorf("unlock mailbox: %w", err)
 	}
-	return client, false, nil
+	return client, seed, false, nil
+}
+
+// persistRotatedSession writes back any session value a lazy refresh rotated
+// during the run — the access token and refresh token (keychain secrets) and the
+// session UID (non-secret store state) — comparing the client's current values
+// against the seed the run started from. It runs as a deferred step after all
+// operations. A failed refresh-token write is a re-auth condition: Proton refresh
+// tokens are one-time-use, so once a lazy refresh spent the old token, a mailbox
+// whose new token could not be stored cannot resume next run — flip it to
+// needs_reauth and, if the run had not already failed, surface the cause. A
+// failed access-token or UID write is recoverable (the persisted refresh token
+// still drives the next resume's lazy refresh), so it is logged, not fatal.
+func (e *Engine) persistRotatedSession(ctx context.Context, mailboxID string, client proton.Client, seed resumeSeed, summary *RunSummary) {
+	if err := e.persistRotatedAccessToken(mailboxID, seed.accessToken, client.AccessToken()); err != nil {
+		e.log.Error("store rotated access token failed", "mailbox_id", mailboxID, "error", err)
+	}
+	if err := e.persistRotatedToken(mailboxID, seed.refreshToken, client.RefreshToken()); err != nil {
+		if serr := e.store.SetMailboxState(ctx, mailboxID, store.MailboxStateNeedsReauth); serr != nil {
+			e.log.Error("mark needs_reauth failed", "mailbox_id", mailboxID, "error", serr)
+		}
+		e.log.Error("store rotated token failed", "mailbox_id", mailboxID, "error", err)
+		if summary.Err == nil {
+			summary.Err = fmt.Errorf("store rotated token: %w", err)
+		}
+	}
+	if err := e.persistRotatedSessionUID(ctx, mailboxID, seed.sessionUID, client.SessionUID()); err != nil {
+		e.log.Error("store rotated session uid failed", "mailbox_id", mailboxID, "error", err)
+	}
 }
 
 // persistRotatedToken writes the new refresh token to the keychain only when it
@@ -151,6 +199,16 @@ func (e *Engine) persistRotatedToken(mailboxID, old, current string) error {
 		return nil
 	}
 	return e.keychain.Set(mailboxID, keychain.RefreshToken, current)
+}
+
+// persistRotatedAccessToken writes the new access token to the keychain only
+// when a lazy refresh actually rotated it. An empty current value is ignored so a
+// run that produced none never clobbers the stored one.
+func (e *Engine) persistRotatedAccessToken(mailboxID, old, current string) error {
+	if current == "" || current == old {
+		return nil
+	}
+	return e.keychain.Set(mailboxID, keychain.AccessToken, current)
 }
 
 // persistRotatedSessionUID writes the rotated session UID to the mailbox row

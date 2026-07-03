@@ -5,7 +5,8 @@
 `reduit auth` is a Cobra command that orchestrates three actors: the
 terminal (no-echo prompts), `go-proton-api` (all Proton-protocol work),
 and two stores — the SQLite `mailboxes` row (state + `proton_user_id` +
-session UID) and the OS keychain (the two live secrets). Reduit owns none
+session UID) and the OS keychain (the live secrets: refresh token, access
+token, and mailbox passphrase). Reduit owns none
 of the cryptography: SRP, TOTP submission, and OpenPGP key unlock are
 go-proton-api calls. Reduit owns ordering, prompts, state transitions,
 the rule that secrets only ever go to the keychain, and the choice of
@@ -43,12 +44,13 @@ sequenceDiagram
         CLI->>Op: prompt TOTP (no echo)
         CLI->>GP: submit TOTP
     end
-    GP-->>CLI: session + proton_user_id + session UID
+    GP-->>CLI: session + proton_user_id + session UID + access/refresh tokens
     CLI->>DB: check proton_user_id uniqueness
     CLI->>Op: prompt mailbox passphrase (no echo)
     CLI->>GP: unlock OpenPGP keys(passphrase)
     GP-->>CLI: keys unlocked
     CLI->>KC: write mailbox/<id>/refresh_token
+    CLI->>KC: write mailbox/<id>/access_token
     CLI->>KC: write mailbox/<id>/mailbox_passphrase
     CLI->>DB: set proton_user_id, session UID, state=active
     CLI->>Op: success
@@ -82,9 +84,10 @@ sequenceDiagram
 5. **Passphrase + key unlock.** Prompt for the mailbox passphrase (no
    echo); ask go-proton-api to unlock the OpenPGP private keys. Failure
    re-prompts or aborts.
-6. **Persist.** Write refresh token and passphrase to the keychain,
-   record `proton_user_id`, flip state to `active`. Keychain writes are
-   last so a failure before them leaves nothing to clean up.
+6. **Persist.** Write the refresh token, access token, and passphrase to
+   the keychain, record `proton_user_id` and session UID, flip state to
+   `active`. Keychain writes are last so a failure before them leaves
+   nothing to clean up.
 
 ## Identity resolution and uniqueness
 
@@ -111,6 +114,7 @@ with guidance ("already configured" for `active`, "re-auth it" for
 | TOTP code | no-echo prompt | go-proton-api only | disk, logs, DB |
 | Mailbox passphrase | no-echo prompt | go-proton-api unlock + `mailbox/<id>/mailbox_passphrase` | disk, logs, DB |
 | Refresh token | go-proton-api session | `mailbox/<id>/refresh_token` | disk, logs, DB |
+| Access token | go-proton-api session | `mailbox/<id>/access_token` | disk, logs, DB |
 
 - **No flags, no env.** Password and passphrase are read only via
   no-echo terminal prompts (`golang.org/x/term`), never CLI flags or
@@ -124,8 +128,11 @@ with guidance ("already configured" for `active`, "re-auth it" for
   and this redaction discipline are backend-agnostic and unchanged. Logs
   go to stderr.
 - **Keychain keys.** Service `reduit`; account keys
-  `mailbox/<id>/refresh_token` and `mailbox/<id>/mailbox_passphrase`
-  (ADR-0013). The DB stores only the `mailbox_id` reference.
+  `mailbox/<id>/refresh_token`, `mailbox/<id>/access_token`, and
+  `mailbox/<id>/mailbox_passphrase` (ADR-0013). The DB stores only the
+  `mailbox_id` reference. The access token is a session secret persisted
+  alongside the refresh token so a cross-process resume can reuse the cached
+  session (see "Cross-process session resume").
 
 ## Re-auth and cache preservation
 
@@ -141,20 +148,43 @@ cache means re-auth is cheap and does not trigger a full re-sync.
 
 A session minted by `reduit auth` in one process must resume in another
 (a `labels`, `sync`, or `send` run, or the cheap path of `auth refresh`)
-without re-prompting. Two pieces of session state make that work, and both
+without re-prompting. Three pieces of session state make that work, and all
 are load-bearing (ADR-0001, ADR-0013, ADR-0021):
 
+- **Access token (session reuse, not eager refresh).** Resume rebuilds the
+  session by REUSING the cached tokens via go-proton-api's session-reuse
+  constructor `Manager.NewClient(uid, access, refresh)`, which makes no
+  network call. It deliberately does **not** use
+  `Manager.NewClientWithRefresh`, whose eager `/auth/v4/refresh` of a
+  freshly-2FA'd session comes back with a REDUCED scope (the "used the wrong
+  newClient function" gotcha documented by Proton-API-Bridge). That reduced
+  scope later fails key/salt access — `GetSalts` during `Unlock` — with
+  **403 code 9101** ("Access token does not have sufficient scope"), the
+  concrete bug this fixes: a low-scope call like `labels` succeeds on resume
+  while `sync`'s unlock 9101s. Reusing the cached access token preserves the
+  2FA-elevated scope; go-proton-api lazily refreshes only when that token
+  expires (on a 401), and a registered auth handler captures the rotated
+  tokens then (mirroring Proton Bridge's session caching). Because reuse does
+  no I/O, resume does not validate — the first real API call surfaces an
+  invalid session. The access token is a session secret, so it lives in the
+  keychain alongside the refresh token, is written at `auth` time, and is
+  re-read and re-persisted (with the refresh token) after operations when a
+  lazy refresh rotated it. A row with a refresh token but no access token (a
+  pre-fix row) is **not** resumed via an eager refresh: `labels`/`sync`
+  surface an actionable re-auth message and `auth refresh` falls through to
+  interactive re-login, which stores a fresh full-scope access token and
+  self-heals the row.
 - **Session UID.** go-proton-api returns a session UID (`auth.UID`) that
   is distinct from the account's `proton_user_id`. Proton's
-  `/auth/v4/refresh` identifies the session by this UID; resuming with an
-  empty UID yields code **10013** ("invalid refresh token") — the concrete
-  bug this fixes. The UID is non-secret session state, so it lives on the
+  `/auth/v4/refresh` (the lazy refresh) identifies the session by this UID;
+  a refresh with an empty UID yields code **10013** ("invalid refresh
+  token"). The UID is non-secret session state, so it lives on the
   `mailboxes` row (not the keychain, ADR-0013), is persisted at `auth`
   time alongside the secret writes, and is presented on every resume. A
-  resume may rotate the UID and the refresh token; both are re-read and
-  re-persisted afterward. A row with a token but no UID (a pre-migration
-  row) skips the resume attempt and falls through to interactive
-  re-login, which re-persists both and self-heals the row.
+  lazy refresh may rotate the UID, the access token, and the refresh token;
+  all are re-read and re-persisted afterward. A row with a token but no UID
+  (a pre-migration row) skips the resume attempt and falls through to
+  interactive re-login, which re-persists everything and self-heals the row.
 - **App-version binding.** Proton binds a session to the app-version that
   minted it, so the app-version presented at resume must match the one at
   mint — a mismatch is another 10013. The default Bridge app-version
@@ -187,6 +217,8 @@ needed, would be a new opt-in ADR, loudly caveated.
 | Duplicate `proton_user_id` | "already configured" (or "re-auth it"); no second row |
 | `proton_user_id` mismatch on re-auth | error; stored value untouched |
 | Resume with missing/rotated session UID or mismatched app-version (10013) | missing UID → fall back to interactive re-login (self-heals the row); rotated UID/token → re-persist after resume |
+| Resume of a pre-fix row with no stored access token | `labels`/`sync` → actionable "no stored access token; re-authenticate" (never an eager refresh that would 9101); `auth refresh` → interactive re-login stores a fresh access token |
+| Key/salt access returns 403 code 9101 ("insufficient scope") | prevented by reusing the cached access token on resume (session reuse, not eager refresh); a pre-fix row without one is sent to re-auth instead of resuming into a reduced scope |
 | Keyring unavailable/locked | abort with provisioning/unlock guidance; no fallback store |
 
 ## References

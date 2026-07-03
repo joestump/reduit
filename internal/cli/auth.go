@@ -185,7 +185,7 @@ func authAdd(ctx context.Context, st *store.Store, ks keychain.Store, dialer pro
 		cleanup()
 		return err
 	}
-	if err := writeMailboxSecrets(ks, mailboxID, client.RefreshToken(), string(passphrase)); err != nil {
+	if err := writeMailboxSecrets(ks, mailboxID, client.RefreshToken(), client.AccessToken(), string(passphrase)); err != nil {
 		cleanup()
 		return fmt.Errorf("store secrets: %w", err)
 	}
@@ -263,10 +263,16 @@ func interactiveAuth(ctx context.Context, client proton.Client, p prompter, addr
 	return passphrase, nil
 }
 
-// writeMailboxSecrets persists a mailbox's two live secrets to the keychain,
-// keyed by mailbox id (#85, the store↔keychain seam). It never logs the values.
-func writeMailboxSecrets(ks keychain.Store, mailboxID, refreshToken, passphrase string) error {
+// writeMailboxSecrets persists a mailbox's live secrets to the keychain, keyed
+// by mailbox id (#85, the store↔keychain seam). It never logs the values. The
+// access token is persisted alongside the refresh token so a later cross-process
+// Resume can reuse the cached session and keep the 2FA-elevated scope (SPEC-0007
+// "Cross-Process Session Resume").
+func writeMailboxSecrets(ks keychain.Store, mailboxID, refreshToken, accessToken, passphrase string) error {
 	if err := ks.Set(mailboxID, keychain.RefreshToken, refreshToken); err != nil {
+		return actionableKeyringErr(err)
+	}
+	if err := ks.Set(mailboxID, keychain.AccessToken, accessToken); err != nil {
 		return actionableKeyringErr(err)
 	}
 	if err := ks.Set(mailboxID, keychain.MailboxPassphrase, passphrase); err != nil {
@@ -459,22 +465,16 @@ func authRefresh(ctx context.Context, st *store.Store, ks keychain.Store, dialer
 	case storedUID == "":
 		// No stored session UID (pre-migration row) — go straight to re-login.
 	default:
-		if client, rerr := dialer.Resume(ctx, *m.ProtonUserID, storedUID, refreshToken); rerr == nil {
-			defer client.Close()
-			if err := persistRotatedTokenOrFlag(ctx, st, ks, m.ID, refreshToken, client.RefreshToken()); err != nil {
-				return fmt.Errorf("store rotated token: %w", err)
-			}
-			// Resume may rotate the UID too; persist it so the next resume matches.
-			if err := persistRotatedSessionUID(ctx, st, m.ID, storedUID, client.SessionUID()); err != nil {
-				return fmt.Errorf("store rotated session uid: %w", err)
-			}
-			if err := st.SetMailboxState(ctx, m.ID, store.MailboxStateActive); err != nil {
-				return err
-			}
-			fmt.Fprintf(out, "Refreshed mailbox %s\n", address)
+		done, cerr := tryCheapResume(ctx, st, ks, dialer, m, storedUID, refreshToken, address, out)
+		if cerr != nil {
+			return cerr
+		}
+		if done {
 			return nil
 		}
-		// Resume failed: the stored token is dead. Fall through to re-login.
+		// Resume unavailable or the stored session is dead. Fall through to
+		// re-login, which re-persists every secret (including the access token)
+		// and self-heals a pre-fix row.
 	}
 
 	// Recovery path: the token is dead or absent. The mailbox cannot serve until
@@ -496,7 +496,7 @@ func authRefresh(ctx context.Context, st *store.Store, ks keychain.Store, dialer
 		return fmt.Errorf("this address now maps to a different Proton account than before; remove and re-add it ('reduit auth remove %s' then 'reduit auth add %s')", address, address)
 	}
 
-	if err := writeMailboxSecrets(ks, m.ID, client.RefreshToken(), string(passphrase)); err != nil {
+	if err := writeMailboxSecrets(ks, m.ID, client.RefreshToken(), client.AccessToken(), string(passphrase)); err != nil {
 		return fmt.Errorf("store secrets: %w", err)
 	}
 	// Record the session UID minted by this re-login so the next Resume can
@@ -546,6 +546,70 @@ func persistRotatedSessionUID(ctx context.Context, st *store.Store, mailboxID, o
 		return nil
 	}
 	return st.SetSessionUID(ctx, mailboxID, current)
+}
+
+// persistRotatedAccessToken writes the new access token only when a lazy refresh
+// actually rotated it, avoiding a needless keychain write (and prompt on some
+// platforms) when it was reused unchanged. An empty current value is ignored so
+// a path that produced no access token never clobbers the stored one to "".
+func persistRotatedAccessToken(ks keychain.Store, mailboxID, old, current string) error {
+	if current == "" || current == old {
+		return nil
+	}
+	return ks.Set(mailboxID, keychain.AccessToken, current)
+}
+
+// tryCheapResume is the cheap path of `auth refresh`: reuse the stored session
+// (Resume) and prove it still works before declaring the mailbox active. It
+// returns done=true only when the mailbox was refreshed and reactivated; a
+// done=false, err=nil result means the caller SHOULD fall through to the
+// interactive re-login (dead session, or a pre-fix row with no stored access
+// token). A non-nil err is a hard failure the caller returns as-is.
+//
+// Because Resume now reuses the cached session (NewClient) and makes no network
+// call, this path must issue a real API call to validate it. Labels is that
+// probe — the same authenticated, no-unlock call `reduit labels` uses as the
+// live connection test — and it is where a lazy refresh (if the cached access
+// token has expired) rotates the tokens. The rotated access/refresh/UID are
+// persisted AFTER the probe so the next resume matches.
+func tryCheapResume(ctx context.Context, st *store.Store, ks keychain.Store, dialer proton.Dialer, m store.Mailbox, storedUID, refreshToken, address string, out io.Writer) (done bool, err error) {
+	accessToken, aerr := ks.Get(m.ID, keychain.AccessToken)
+	switch {
+	case errors.Is(aerr, keychain.ErrNotFound):
+		// Pre-fix row: no access token to reuse. Resuming via an eager refresh
+		// would reduce the session scope (the 9101 bug), so do NOT; fall through
+		// to the re-login, which stores a fresh full-scope access token.
+		return false, nil
+	case aerr != nil:
+		return false, actionableKeyringErr(aerr)
+	}
+
+	client, rerr := dialer.Resume(ctx, *m.ProtonUserID, storedUID, accessToken, refreshToken)
+	if rerr != nil {
+		return false, nil // dead session — re-login
+	}
+	defer client.Close()
+
+	// Probe: NewClient did no network, so a real call is what surfaces a dead
+	// session and triggers the scope-preserving lazy refresh when needed.
+	if _, perr := client.Labels(ctx); perr != nil {
+		return false, nil // dead session — re-login
+	}
+
+	if err := persistRotatedAccessToken(ks, m.ID, accessToken, client.AccessToken()); err != nil {
+		return false, fmt.Errorf("store rotated access token: %w", err)
+	}
+	if err := persistRotatedTokenOrFlag(ctx, st, ks, m.ID, refreshToken, client.RefreshToken()); err != nil {
+		return false, fmt.Errorf("store rotated token: %w", err)
+	}
+	if err := persistRotatedSessionUID(ctx, st, m.ID, storedUID, client.SessionUID()); err != nil {
+		return false, fmt.Errorf("store rotated session uid: %w", err)
+	}
+	if err := st.SetMailboxState(ctx, m.ID, store.MailboxStateActive); err != nil {
+		return false, err
+	}
+	fmt.Fprintf(out, "Refreshed mailbox %s\n", address)
+	return true, nil
 }
 
 // resolveMailbox selects the mailbox to operate on. When address is non-empty

@@ -24,7 +24,7 @@ type syncTestDialer struct {
 	errs    map[string]error
 }
 
-func (d *syncTestDialer) Resume(_ context.Context, protonUserID, _, _ string) (proton.Client, error) {
+func (d *syncTestDialer) Resume(_ context.Context, protonUserID, _, _, _ string) (proton.Client, error) {
 	if err := d.errs[protonUserID]; err != nil {
 		return nil, err
 	}
@@ -41,6 +41,7 @@ func authedSyncFake(token, uid, latestEvent string, backfill []string, msgs map[
 	f := proton.NewFake()
 	f.Token = token
 	f.UID = uid
+	f.Access = "acc-" + token           // matches the seeded keychain access token
 	_ = f.Refresh(context.Background()) // marks authed like a cold resume
 	f.LabelList = []proton.Label{{ID: "0", Name: "Inbox", Type: proton.LabelTypeSystem}}
 	f.LatestEvent = latestEvent
@@ -78,6 +79,9 @@ func seedActiveSyncMailbox(t *testing.T, st *store.Store, ks keychain.Store, id,
 	}
 	if err := ks.Set(id, keychain.RefreshToken, token); err != nil {
 		t.Fatalf("set refresh token: %v", err)
+	}
+	if err := ks.Set(id, keychain.AccessToken, "acc-"+token); err != nil {
+		t.Fatalf("set access token: %v", err)
 	}
 	if err := ks.Set(id, keychain.MailboxPassphrase, pass); err != nil {
 		t.Fatalf("set passphrase: %v", err)

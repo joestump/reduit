@@ -41,9 +41,11 @@ import (
 // *proton.Fake. The engine intentionally does NOT depend on Dialer.NewClient —
 // sync never runs the interactive login, only Resume from stored secrets.
 type Dialer interface {
-	// Resume reconstructs an authenticated (not yet unlocked) client from a
-	// stored session UID and refresh token. See proton.Dialer.Resume.
-	Resume(ctx context.Context, protonUserID, sessionUID, refreshToken string) (proton.Client, error)
+	// Resume reconstructs an authenticated (not yet unlocked) client by reusing a
+	// stored session — its UID, access token, and refresh token. Reusing the
+	// cached access token preserves the 2FA-elevated scope key/salt access needs
+	// (SPEC-0007 "Cross-Process Session Resume"). See proton.Dialer.Resume.
+	Resume(ctx context.Context, protonUserID, sessionUID, accessToken, refreshToken string) (proton.Client, error)
 }
 
 // Deps are the engine's collaborators, all interfaces or concrete seams so the

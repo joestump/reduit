@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -57,7 +58,7 @@ func (k *memKeychain) Delete(id string, kind keychain.Kind) error {
 func (k *memKeychain) DeleteAll(id string) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	for _, kind := range []keychain.Kind{keychain.RefreshToken, keychain.MailboxPassphrase} {
+	for _, kind := range []keychain.Kind{keychain.RefreshToken, keychain.AccessToken, keychain.MailboxPassphrase} {
 		delete(k.m, k.key(id, kind))
 	}
 	return nil
@@ -71,7 +72,7 @@ type fakeDialer struct {
 	errs    map[string]error
 }
 
-func (d *fakeDialer) Resume(_ context.Context, protonUserID, _, _ string) (proton.Client, error) {
+func (d *fakeDialer) Resume(_ context.Context, protonUserID, _, _, _ string) (proton.Client, error) {
 	if err := d.errs[protonUserID]; err != nil {
 		return nil, err
 	}
@@ -169,9 +170,15 @@ func authedFake(token, uid string) *proton.Fake {
 	f := proton.NewFake()
 	f.Token = token
 	f.UID = uid
+	f.Access = accessFor(token)         // matches the seeded keychain access token
 	_ = f.Refresh(context.Background()) // marks authed like a cold resume
 	return f
 }
+
+// accessFor derives the access token seedActiveMailbox stores for a mailbox from
+// its refresh token, so authedFake and the seeded keychain agree and no spurious
+// rotation write occurs.
+func accessFor(token string) string { return "acc-" + token }
 
 // seedActiveMailbox inserts an active mailbox with its secrets, matching how the
 // auth layer leaves a freshly-added mailbox.
@@ -189,6 +196,9 @@ func seedActiveMailbox(t *testing.T, st *store.Store, ks keychain.Store, id, add
 	}
 	if err := ks.Set(id, keychain.RefreshToken, token); err != nil {
 		t.Fatalf("set refresh token: %v", err)
+	}
+	if err := ks.Set(id, keychain.AccessToken, accessFor(token)); err != nil {
+		t.Fatalf("set access token: %v", err)
 	}
 	if err := ks.Set(id, keychain.MailboxPassphrase, pass); err != nil {
 		t.Fatalf("set passphrase: %v", err)
@@ -765,5 +775,64 @@ func TestTail_CursorAdvancesAtomicallyAndResumes(t *testing.T) {
 	ss2, _ := st.GetSyncState(ctx, "mb-1")
 	if ss2.EventCursor == nil || *ss2.EventCursor != "ev-2" {
 		t.Errorf("cursor = %v, want ev-2 after resume", ss2.EventCursor)
+	}
+}
+
+// TestSync_AbsentAccessTokenNeedsReauth covers a pre-fix mailbox row: a refresh
+// token and session UID are stored, but no access token. Resuming via an eager
+// refresh would reduce the session scope and later 9101 on key/salt access, so
+// the engine treats the missing access token as a re-auth condition — the
+// mailbox is flipped to needs_reauth with an actionable cause, never silently
+// resumed (SPEC-0007 "Cross-Process Session Resume").
+func TestSync_AbsentAccessTokenNeedsReauth(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newMemKeychain()
+	seedActiveMailbox(t, st, ks, "mb-1", "joe@proton.test", "user-1", "uid-1", "tok-1", "pass-1")
+	// Simulate a pre-fix row by removing the access token seedActiveMailbox wrote.
+	if err := ks.Delete("mb-1", keychain.AccessToken); err != nil {
+		t.Fatalf("delete access token: %v", err)
+	}
+
+	fake := authedFake("tok-1", "uid-1")
+	fake.LabelList = inboxLabels()
+	eng := newEngine(st, ks, &fakeDialer{clients: map[string]proton.Client{"user-1": fake}}, Config{})
+
+	sum, err := eng.SyncMailbox(ctx, "mb-1")
+	if err == nil || sum.Err == nil {
+		t.Fatal("sync must fail when no access token is stored")
+	}
+	if !strings.Contains(sum.Err.Error(), "access token") {
+		t.Errorf("error = %v, want it to mention the missing access token", sum.Err)
+	}
+	m, _ := st.GetMailbox(ctx, "mb-1")
+	if m.State != store.MailboxStateNeedsReauth {
+		t.Errorf("state = %q, want needs_reauth", m.State)
+	}
+}
+
+// TestSync_PersistsRotatedAccessToken asserts that when a lazy refresh rotates
+// the access token mid-run (simulated here by the resumed client surfacing a new
+// access token), the engine persists it after operations so the next resume
+// reuses the current token (SPEC-0007 "Cross-Process Session Resume").
+func TestSync_PersistsRotatedAccessToken(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	ks := newMemKeychain()
+	seedActiveMailbox(t, st, ks, "mb-1", "joe@proton.test", "user-1", "uid-1", "tok-1", "pass-1")
+
+	fake := authedFake("tok-1", "uid-1")
+	fake.LabelList = inboxLabels()
+	fake.LatestEvent = "ev-1"
+	// A lazy refresh during the run rotated the access token; the wrapper's auth
+	// handler would have captured it. Model that end state on the fake.
+	fake.Access = "acc-rotated"
+	eng := newEngine(st, ks, &fakeDialer{clients: map[string]proton.Client{"user-1": fake}}, Config{})
+
+	if _, err := eng.SyncMailbox(ctx, "mb-1"); err != nil {
+		t.Fatalf("SyncMailbox: %v", err)
+	}
+	if got, _ := ks.Get("mb-1", keychain.AccessToken); got != "acc-rotated" {
+		t.Errorf("rotated access token not persisted: %q, want acc-rotated", got)
 	}
 }

@@ -1,14 +1,15 @@
-// Package keychain stores and retrieves a mailbox's two live secrets — the
-// Proton refresh token and the mailbox passphrase — in the operating
-// system's secret service: macOS Keychain, Linux Secret Service (libsecret
-// / GNOME Keyring / KWallet via D-Bus), or Windows Credential Manager. It is
-// the only component permitted to hold those secret values; everything else
-// in Reduit references a mailbox by its local UUIDv7 and asks this package
-// for the secret at use time.
+// Package keychain stores and retrieves a mailbox's live secrets — the Proton
+// refresh token, the Proton access token, and the mailbox passphrase — in the
+// operating system's secret service: macOS Keychain, Linux Secret Service
+// (libsecret / GNOME Keyring / KWallet via D-Bus), or Windows Credential
+// Manager. It is the only component permitted to hold those secret values;
+// everything else in Reduit references a mailbox by its local UUIDv7 and asks
+// this package for the secret at use time.
 //
 // Keying (ADR-0013): every entry is written under service name "reduit" with
 // account key "mailbox/<mailbox_id>/<kind>" where <kind> is one of
-// "refresh_token" or "mailbox_passphrase". Secrets are per mailbox; there is
+// "refresh_token", "access_token", or "mailbox_passphrase". Secrets are per
+// mailbox; there is
 // no shared key spanning mailboxes, so removing one mailbox's secrets never
 // touches another's. The SQLite store holds only the <mailbox_id> reference
 // (SPEC-0001 REQ "Secret References, Not Secrets"); no secret, ciphertext, or
@@ -46,27 +47,34 @@ import (
 // stored. Fixed by ADR-0013.
 const ServiceName = "reduit"
 
-// Kind enumerates the two — and only two — secret classes Reduit persists per
-// mailbox (ADR-0013). The string values are load-bearing: they form the final
-// segment of the keyring account key, so they MUST NOT change without a
-// migration.
+// Kind enumerates the secret classes Reduit persists per mailbox (ADR-0013).
+// The string values are load-bearing: they form the final segment of the
+// keyring account key, so they MUST NOT change without a migration.
 type Kind string
 
 const (
 	// RefreshToken is the Proton refresh token that renews the access token.
 	RefreshToken Kind = "refresh_token"
+	// AccessToken is the Proton access token. It is persisted alongside the
+	// refresh token so a cross-process resume can REUSE the cached session
+	// (go-proton-api's NewClient) instead of eagerly refreshing it — an eager
+	// refresh of a freshly-2FA'd session comes back with a reduced scope, which
+	// later fails key/salt access with 403 code 9101 (SPEC-0007 "Cross-Process
+	// Session Resume"). It is a session secret like the refresh token and rotates
+	// on refresh.
+	AccessToken Kind = "access_token"
 	// MailboxPassphrase unlocks the mailbox's OpenPGP private keys.
 	MailboxPassphrase Kind = "mailbox_passphrase"
 )
 
 // allKinds lists every secret kind a mailbox can own. DeleteAll iterates it so
 // that adding a future kind automatically extends mailbox teardown.
-var allKinds = []Kind{RefreshToken, MailboxPassphrase}
+var allKinds = []Kind{RefreshToken, AccessToken, MailboxPassphrase}
 
 // valid reports whether k is a recognised secret kind.
 func (k Kind) valid() bool {
 	switch k {
-	case RefreshToken, MailboxPassphrase:
+	case RefreshToken, AccessToken, MailboxPassphrase:
 		return true
 	default:
 		return false
