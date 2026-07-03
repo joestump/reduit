@@ -57,7 +57,7 @@ var ErrProtonUserIDConflict = errors.New("store: proton_user_id mismatch — ref
 // Governing: SPEC-0001 REQ "Mailbox Identity" scenario "Mailbox row created with a UUIDv7 id".
 func (s *Store) InsertMailbox(ctx context.Context, id, address string) error {
 	const q = `INSERT INTO mailboxes (id, address, state) VALUES (?, ?, 'pending_auth')`
-	_, err := s.DB.ExecContext(ctx, q, id, address)
+	_, err := s.WriterDB().ExecContext(ctx, q, id, address)
 	if err != nil {
 		return fmt.Errorf("store: insert mailbox: %w", err)
 	}
@@ -120,7 +120,7 @@ func (s *Store) SetProtonUserID(ctx context.Context, id, protonUserID string) er
 		return s.SetMailboxState(ctx, id, MailboxStateActive)
 	}
 	const q = `UPDATE mailboxes SET proton_user_id = ?, state = 'active' WHERE id = ?`
-	if _, err := s.DB.ExecContext(ctx, q, protonUserID, id); err != nil {
+	if _, err := s.WriterDB().ExecContext(ctx, q, protonUserID, id); err != nil {
 		return fmt.Errorf("store: set proton_user_id: %w", err)
 	}
 	return nil
@@ -135,7 +135,7 @@ func (s *Store) SetProtonUserID(ctx context.Context, id, protonUserID string) er
 // non-interactively at use time".
 func (s *Store) SetSessionUID(ctx context.Context, id, uid string) error {
 	const q = `UPDATE mailboxes SET session_uid = ? WHERE id = ?`
-	res, err := s.DB.ExecContext(ctx, q, uid, id)
+	res, err := s.WriterDB().ExecContext(ctx, q, uid, id)
 	if err != nil {
 		return fmt.Errorf("store: set session_uid: %w", err)
 	}
@@ -149,7 +149,7 @@ func (s *Store) SetSessionUID(ctx context.Context, id, uid string) error {
 // SetMailboxState updates the lifecycle state of a mailbox.
 func (s *Store) SetMailboxState(ctx context.Context, id string, state MailboxState) error {
 	const q = `UPDATE mailboxes SET state = ? WHERE id = ?`
-	res, err := s.DB.ExecContext(ctx, q, string(state), id)
+	res, err := s.WriterDB().ExecContext(ctx, q, string(state), id)
 	if err != nil {
 		return fmt.Errorf("store: set mailbox state: %w", err)
 	}
@@ -163,7 +163,7 @@ func (s *Store) SetMailboxState(ctx context.Context, id string, state MailboxSta
 // SetLastSyncAt records the time of a successful sync completion.
 func (s *Store) SetLastSyncAt(ctx context.Context, id string, t time.Time) error {
 	const q = `UPDATE mailboxes SET last_sync_at = ? WHERE id = ?`
-	_, err := s.DB.ExecContext(ctx, q, t, id)
+	_, err := s.WriterDB().ExecContext(ctx, q, t, id)
 	if err != nil {
 		return fmt.Errorf("store: set last_sync_at: %w", err)
 	}
