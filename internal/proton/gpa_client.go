@@ -107,11 +107,15 @@ func (d *GPADialer) Resume(ctx context.Context, protonUserID, sessionUID, refres
 	if err := c.refreshWithUID(ctx, sessionUID); err != nil {
 		return nil, err
 	}
-	if protonUserID != "" && c.userID != protonUserID {
-		// Token resolved a different account than expected.
-		return nil, fmt.Errorf("%w: token resolved proton user %q, expected %q",
-			ErrRefreshTokenInvalid, c.userID, protonUserID)
-	}
+	// No post-resume account-identity check: a stored (session_uid, refresh
+	// token) pair is bound to the session that minted it, which is bound to one
+	// account — it cannot resolve a different Proton user. And /auth/v4/refresh
+	// does not return the UserID (auth.UserID is empty), so there is nothing to
+	// compare without an extra GetUser round trip. The account-switch guard that
+	// matters — an address now mapping to a different Proton account — lives in
+	// the INTERACTIVE re-auth path (auth.go re-login verifies proton_user_id),
+	// not here. c.userID stays the seeded proton_user_id. Governing: SPEC-0007
+	// "Re-Auth Flow", ADR-0001.
 	return c, nil
 }
 
@@ -276,7 +280,13 @@ func (c *gpaClient) refreshWithUID(ctx context.Context, uid string) error {
 	}
 	c.cli = cli
 	c.uid = auth.UID
-	c.userID = auth.UserID
+	// /auth/v4/refresh does not return the account UserID, so auth.UserID is
+	// empty on a refresh — do NOT clobber a userID we already know (seeded at
+	// Resume from the stored proton_user_id, or set by Login/Unlock in a live
+	// session). Only overwrite when the response actually carries one.
+	if auth.UserID != "" {
+		c.userID = auth.UserID
+	}
 	c.refreshToken = auth.RefreshToken
 	return nil
 }
