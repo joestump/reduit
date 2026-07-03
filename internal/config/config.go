@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Config is the top-level runtime configuration.
@@ -34,6 +35,11 @@ type Config struct {
 	//
 	// Governing: SPEC-0007 (onboarding & auth), ADR-0001 (go-proton-api edge).
 	Proton ProtonConfig `mapstructure:"proton"`
+
+	// Sync configures the sync engine (per-mailbox bootstrap-then-tail).
+	//
+	// Governing: SPEC-0002 (Sync & Local Cache), ADR-0014 (sync-and-cache).
+	Sync SyncConfig `mapstructure:"sync"`
 
 	// Logger configures the structured logger.
 	Logger LoggerConfig `mapstructure:"logger"`
@@ -116,6 +122,26 @@ type ProtonConfig struct {
 	HostURL string `mapstructure:"host_url"`
 }
 
+// SyncConfig configures the sync engine (SPEC-0002). Both fields are
+// non-secret and safe to commit.
+//
+// Governing: SPEC-0002 REQ "Bootstrap Then Tail", "Rate-Limit Respect".
+type SyncConfig struct {
+	// BackfillWindow bounds a mailbox's FIRST sync: only messages whose
+	// Proton timestamp is at or after (now - BackfillWindow) are backfilled
+	// (SPEC-0002 "First sync backfills a bounded window"). A ZERO window means
+	// "no bound" — backfill the FULL mailbox. Defaults to 8760h (one year).
+	// Sourced from sync.backfill_window / REDUIT_SYNC_BACKFILL_WINDOW; accepts
+	// any Go duration string ("720h", "0" for the full mailbox).
+	BackfillWindow time.Duration `mapstructure:"backfill_window"`
+
+	// Concurrency bounds how many mailboxes sync in parallel in one
+	// invocation, capping in-flight Proton requests so a multi-mailbox run
+	// does not surge Proton's API (SPEC-0002 "Bounded concurrency"). Defaults
+	// to 3. Sourced from sync.concurrency / REDUIT_SYNC_CONCURRENCY.
+	Concurrency int `mapstructure:"concurrency"`
+}
+
 // LoggerConfig configures the structured logger.
 type LoggerConfig struct {
 	// Level is one of debug, info, warn, error.
@@ -154,6 +180,14 @@ func Defaults() Config {
 			// (opt-in; Proton challenges the web client). An explicit value wins.
 			AppVersion: "",
 		},
+		Sync: SyncConfig{
+			// One year of history on first sync, three parallel mailboxes —
+			// bounded defaults that keep the first backfill and Proton request
+			// pressure sane out of the box (SPEC-0002). Zero window (full
+			// mailbox) is opt-in.
+			BackfillWindow: 365 * 24 * time.Hour,
+			Concurrency:    3,
+		},
 		Logger: LoggerConfig{
 			Level:  "info",
 			Format: "text",
@@ -189,6 +223,12 @@ func (c Config) Validate() error {
 	case "", "text", "json":
 	default:
 		errs = append(errs, errors.New("logger.format must be one of text, json"))
+	}
+	if c.Sync.BackfillWindow < 0 {
+		errs = append(errs, errors.New("sync.backfill_window must not be negative (use 0 for the full mailbox)"))
+	}
+	if c.Sync.Concurrency < 0 {
+		errs = append(errs, errors.New("sync.concurrency must not be negative"))
 	}
 	return errors.Join(errs...)
 }

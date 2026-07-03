@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestDefaults(t *testing.T) {
@@ -137,6 +138,44 @@ func TestLoad_ProtonEnvOverrides(t *testing.T) {
 	}
 	if cfg.Proton.HostURL != "https://proton.test" {
 		t.Errorf("Proton.HostURL = %q", cfg.Proton.HostURL)
+	}
+}
+
+func TestDefaults_Sync(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Sync.BackfillWindow != 365*24*time.Hour {
+		t.Errorf("Sync.BackfillWindow = %v, want 8760h", cfg.Sync.BackfillWindow)
+	}
+	if cfg.Sync.Concurrency != 3 {
+		t.Errorf("Sync.Concurrency = %d, want 3", cfg.Sync.Concurrency)
+	}
+}
+
+func TestLoad_SyncEnvOverrides(t *testing.T) {
+	t.Setenv("REDUIT_SYNC_BACKFILL_WINDOW", "720h")
+	t.Setenv("REDUIT_SYNC_CONCURRENCY", "5")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Sync.BackfillWindow != 720*time.Hour {
+		t.Errorf("Sync.BackfillWindow = %v, want 720h", cfg.Sync.BackfillWindow)
+	}
+	if cfg.Sync.Concurrency != 5 {
+		t.Errorf("Sync.Concurrency = %d, want 5", cfg.Sync.Concurrency)
+	}
+}
+
+func TestValidate_SyncNegative(t *testing.T) {
+	cfg := Defaults()
+	cfg.Sync.Concurrency = -1
+	if err := cfg.Validate(); err == nil {
+		t.Error("negative sync.concurrency should be rejected")
+	}
+	cfg = Defaults()
+	cfg.Sync.BackfillWindow = -time.Hour
+	if err := cfg.Validate(); err == nil {
+		t.Error("negative sync.backfill_window should be rejected")
 	}
 }
 

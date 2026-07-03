@@ -148,6 +148,8 @@ func bindDefaults(v *viper.Viper, cfg Config) error {
 		"llm.multimodal_model":    cfg.LLM.MultimodalModel,
 		"proton.app_version":      cfg.Proton.AppVersion,
 		"proton.host_url":         cfg.Proton.HostURL,
+		"sync.backfill_window":    cfg.Sync.BackfillWindow.String(),
+		"sync.concurrency":        cfg.Sync.Concurrency,
 		"logger.level":            cfg.Logger.Level,
 		"logger.format":           cfg.Logger.Format,
 		"ui.listen_addr":          cfg.UI.ListenAddr,

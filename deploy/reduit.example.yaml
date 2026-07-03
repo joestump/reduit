@@ -71,6 +71,15 @@ oidc:
   # If true (default), first login auto-creates the account.
   auto_create: true
 
+sync:
+  # First sync of a mailbox backfills history over this window; every run
+  # after that tails Proton's event stream (SPEC-0002). Any Go duration
+  # string; "0" backfills the FULL mailbox. Default: 8760h (one year).
+  backfill_window: 8760h
+  # How many mailboxes sync in parallel in one `reduit sync`, bounding
+  # in-flight Proton requests. Default: 3.
+  concurrency: 3
+
 logger:
   level:  info     # debug | info | warn | error
   format: text     # text | json
