@@ -62,6 +62,11 @@ type Deps struct {
 	Logger *slog.Logger
 	// Config tunes the backfill window and concurrency (SPEC-0002).
 	Config Config
+	// Progress receives typed progress events for a presentation layer to
+	// render (SPEC-0012). A nil Progress is a no-op — the engine emits nothing
+	// and behaves exactly as before this seam existed. Its methods MUST be
+	// non-blocking; see ProgressReporter's contract.
+	Progress ProgressReporter
 }
 
 // Config tunes sync behavior. It mirrors config.SyncConfig; the CLI layer maps
@@ -85,6 +90,7 @@ type Engine struct {
 	dialer   Dialer
 	log      *slog.Logger
 	cfg      Config
+	progress ProgressReporter
 
 	// now and sleep are injected so tests can control time and make backoff
 	// instantaneous. Production uses time.Now and time.Sleep.
@@ -110,6 +116,7 @@ func New(deps Deps) *Engine {
 		dialer:   deps.Dialer,
 		log:      log,
 		cfg:      cfg,
+		progress: deps.Progress,
 		now:      time.Now,
 		sleep:    sleepCtx,
 	}
@@ -205,6 +212,11 @@ func (e *Engine) runIsolated(ctx context.Context, m store.Mailbox) (summary RunS
 			summary.Err = fmt.Errorf("syncengine: panic: %v", p)
 		}
 		e.recordRun(ctx, started, &summary)
+		// Emit the terminal progress event with the FINAL summary (after any
+		// panic recover and bookkeeping), so the consumer marks this mailbox
+		// complete exactly once whatever the outcome (SPEC-0012 "Events carry
+		// the run's shape", "mailbox complete").
+		e.emitMailboxDone(MailboxDone{MailboxID: m.ID, Summary: summary})
 	}()
 
 	e.syncMailbox(ctx, m, &summary)

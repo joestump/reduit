@@ -263,6 +263,10 @@ func (e *Engine) bootstrap(ctx context.Context, client proton.Client, m store.Ma
 		return fmt.Errorf("backfill message ids: %w", err)
 	}
 	e.log.Info("backfill starting", "mailbox_id", m.ID, "address", m.Address, "messages", len(ids))
+	// Progress seam: the enumerated total is the determinate bar's denominator
+	// (SPEC-0012 "Backfill has a denominator"). Emitted alongside — not instead
+	// of — the INFO log the non-TTY path depends on.
+	e.emitBackfillEnumerated(BackfillEnumerated{MailboxID: m.ID, Address: m.Address, Total: len(ids)})
 
 	// Ids arrive oldest-first, so each is applied in its own transaction: a
 	// crash resumes forward without re-walking already-committed messages, and a
@@ -291,6 +295,9 @@ func (e *Engine) bootstrap(ctx context.Context, client proton.Client, m store.Ma
 			e.log.Warn("decrypt failed during backfill; skipping message",
 				"mailbox_id", m.ID, "proton_id", id, "error", err)
 			summary.Errors++
+			// A skipped message still advances the enumeration, so report it so
+			// the bar does not stall on a run with terminal decrypt failures.
+			e.emitMessageApplied(MessageApplied{MailboxID: m.ID, Done: i + 1, Total: len(ids)})
 			continue
 		}
 		w := mapMessage(m.ID, dm, folders)
@@ -299,6 +306,9 @@ func (e *Engine) bootstrap(ctx context.Context, client proton.Client, m store.Ma
 			return fmt.Errorf("apply backfilled message %s: %w", id, err)
 		}
 		applyCounts(summary, res, w)
+		// Progress seam: emitted every message (the consumer coalesces —
+		// SPEC-0012 "Slow consumer does not stall sync").
+		e.emitMessageApplied(MessageApplied{MailboxID: m.ID, Done: i + 1, Total: len(ids)})
 	}
 
 	if err := e.store.UpsertSyncState(ctx, m.ID, startCursor, e.now().UTC()); err != nil {
@@ -357,6 +367,10 @@ func (e *Engine) tail(ctx context.Context, client proton.Client, m store.Mailbox
 		e.log.Debug("event batch applied", "mailbox_id", m.ID,
 			"events", len(batch.Events), "writes", len(writes), "deletes", len(deletes),
 			"cursor", batch.NextCursor, "more", batch.More)
+		// Progress seam: the tail has no total, so this drives the indeterminate
+		// indicator (SPEC-0012 "Tail has no denominator"). Emitted only after the
+		// batch commits, so it reflects durably-applied work.
+		e.emitTailBatchApplied(TailBatchApplied{MailboxID: m.ID, Events: len(batch.Events)})
 		cursor = batch.NextCursor
 
 		if !batch.More {

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os/signal"
 	"syscall"
 	"text/tabwriter"
@@ -86,23 +87,35 @@ suitable for cron, a systemd timer, or launchd.
 			dialer := dialProton(protonConfig(cmd.Context(), cfg, logger))
 			defer dialer.Close()
 
-			eng := syncengine.New(syncengine.Deps{
-				Store:    st,
-				Keychain: openKeychain(),
-				Dialer:   dialer, // dialerCloser satisfies syncengine.Dialer (Resume)
-				Logger:   logger,
-				Config: syncengine.Config{
-					BackfillWindow: cfg.Sync.BackfillWindow,
-					Concurrency:    cfg.Sync.Concurrency,
-				},
-			})
-
 			// Stop cleanly on SIGINT/SIGTERM: for a one-shot run this cancels an
-			// in-flight sync; for --watch it ends the loop between iterations.
+			// in-flight sync; for --watch it ends the loop between iterations. The
+			// same cancellation also tears down the progress TUI (SPEC-0012
+			// "Interrupt restores the terminal").
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 
-			return runSync(ctx, st, eng, syncOptions{mailbox: mailbox, full: full, watch: watch}, cmd.OutOrStdout())
+			// engineFor builds the engine with the given logger and progress
+			// reporter. The TTY-gated runner (runSyncGated) calls it once it has
+			// decided whether to swap the logger for the TUI writer and attach a
+			// progress adapter (SPEC-0012 "TTY Gate", "Engine Presentation
+			// Isolation"). In the plain path both args are the base logger and a
+			// nil reporter, reproducing today's exact wiring.
+			engineFor := func(lg *slog.Logger, reporter syncengine.ProgressReporter) syncEngine {
+				return syncengine.New(syncengine.Deps{
+					Store:    st,
+					Keychain: openKeychain(),
+					Dialer:   dialer, // dialerCloser satisfies syncengine.Dialer (Resume)
+					Logger:   lg,
+					Config: syncengine.Config{
+						BackfillWindow: cfg.Sync.BackfillWindow,
+						Concurrency:    cfg.Sync.Concurrency,
+					},
+					Progress: reporter,
+				})
+			}
+
+			return runSyncGated(ctx, st, engineFor, logger, cfg.Logger,
+				syncOptions{mailbox: mailbox, full: full, watch: watch}, cmd.OutOrStdout())
 		},
 	}
 
