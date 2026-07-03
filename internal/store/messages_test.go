@@ -89,16 +89,23 @@ func TestUpsertMessageConverges(t *testing.T) {
 	seedMailbox(t, st, testMailboxID, "joe@example.com")
 	ctx := context.Background()
 
-	h1, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
+	r1, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
 	if err != nil {
 		t.Fatalf("first upsert: %v", err)
 	}
-	h2, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
+	r2, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
 	if err != nil {
 		t.Fatalf("second upsert: %v", err)
 	}
-	if h1 != h2 {
-		t.Errorf("hash changed across upserts: %q != %q", h1, h2)
+	if r1.Hash != r2.Hash {
+		t.Errorf("hash changed across upserts: %q != %q", r1.Hash, r2.Hash)
+	}
+	// The first upsert inserts; the re-upsert converges onto the same row.
+	if !r1.Inserted {
+		t.Error("first upsert: Inserted=false, want true")
+	}
+	if r2.Inserted {
+		t.Error("re-upsert: Inserted=true, want false (converged, not a new row)")
 	}
 	if n := countRows(t, st, "messages"); n != 1 {
 		t.Errorf("message count grew: got %d, want 1", n)
@@ -161,10 +168,11 @@ func TestDerivedDataSurvivesReSync(t *testing.T) {
 	seedMailbox(t, st, testMailboxID, "joe@example.com")
 	ctx := context.Background()
 
-	hash, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
+	res, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
 	if err != nil {
 		t.Fatalf("insert message: %v", err)
 	}
+	hash := res.Hash
 	// Seed derived data keyed by the stable hash.
 	if _, err := st.WriterDB().ExecContext(ctx,
 		`INSERT INTO embeddings (hash, model, dim, vec) VALUES (?, 'test-model', 1, ?)`,
@@ -261,15 +269,19 @@ func TestDeleteMessage(t *testing.T) {
 		Links:       []LinkInput{{URL: "https://example.com/a", AnchorText: "a"}},
 		Attachments: []AttachmentInput{{ProtonAttID: "att1", Filename: "f.pdf", MIME: "application/pdf", SizeBytes: 10}},
 	}
-	if err := st.ApplyMessage(ctx, w); err != nil {
+	if _, err := st.ApplyMessage(ctx, w); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	if got := countRows(t, st, "messages"); got != 1 {
 		t.Fatalf("precondition messages=%d", got)
 	}
 
-	if err := st.DeleteMessageByProtonID(ctx, testMailboxID, "m1"); err != nil {
+	deleted, err := st.DeleteMessageByProtonID(ctx, testMailboxID, "m1")
+	if err != nil {
 		t.Fatalf("delete: %v", err)
+	}
+	if !deleted {
+		t.Error("delete reported deleted=false for a present message")
 	}
 	if got := countRows(t, st, "messages"); got != 0 {
 		t.Errorf("message not deleted: %d", got)
@@ -292,8 +304,95 @@ func TestDeleteMessage(t *testing.T) {
 		t.Errorf("FTS entry not removed: %d", n)
 	}
 
-	// Idempotent: deleting again is a no-op, no error.
-	if err := st.DeleteMessageByProtonID(ctx, testMailboxID, "m1"); err != nil {
+	// Idempotent: deleting again is a no-op, no error, and reports deleted=false.
+	deleted, err = st.DeleteMessageByProtonID(ctx, testMailboxID, "m1")
+	if err != nil {
 		t.Errorf("second delete errored: %v", err)
+	}
+	if deleted {
+		t.Error("second delete reported deleted=true for an absent message")
+	}
+}
+
+// TestDeletePurgesEmbeddingsKeepsFacts: deleting a message purges its embedding
+// (a dangling vector would be a semantic-search hit with no message) but RETAINS
+// contact_facts, which the facts layer (SPEC-0011) owns and reconciles. This is
+// the reviewer-flagged orphan-on-delete decision.
+func TestDeletePurgesEmbeddingsKeepsFacts(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedMailbox(t, st, testMailboxID, "joe@example.com")
+	ctx := context.Background()
+
+	w := MessageWrite{
+		Message:  sampleMessage(testMailboxID, "m1"),
+		Contacts: []ContactInput{{Address: "alice@example.com", DisplayName: "Alice"}},
+	}
+	res, err := st.ApplyMessage(ctx, w)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	hash := res.Hash
+	// Seed an embedding keyed by the message hash.
+	if _, err := st.WriterDB().ExecContext(ctx,
+		`INSERT INTO embeddings (hash, model, dim, vec) VALUES (?, 'test-model', 1, ?)`,
+		hash, []byte{0x00, 0x00, 0x00, 0x00}); err != nil {
+		t.Fatalf("seed embedding: %v", err)
+	}
+	// Seed a contact_fact citing this message.
+	contactID, err := st.UpsertContactIdentifier(ctx, "alice@example.com", "Alice")
+	if err != nil {
+		t.Fatalf("resolve contact: %v", err)
+	}
+	if _, err := st.WriterDB().ExecContext(ctx,
+		`INSERT INTO contact_facts (id, contact_id, fact, fact_hash, source_message_hash) VALUES (?, ?, 'likes tea', 'fh1', ?)`,
+		"01234567-fact-uuid-v7-000000000001", contactID, hash); err != nil {
+		t.Fatalf("seed contact_fact: %v", err)
+	}
+
+	if _, err := st.DeleteMessageByProtonID(ctx, testMailboxID, "m1"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	if got := countRows(t, st, "embeddings"); got != 0 {
+		t.Errorf("embedding not purged on delete: %d dangling vectors remain", got)
+	}
+	if got := countRows(t, st, "contact_facts"); got != 1 {
+		t.Errorf("contact_fact wrongly cascade-deleted: got %d, want 1 (facts layer owns it)", got)
+	}
+}
+
+// TestTxUpsertInsertThenUpdate: within one transaction the first apply of a
+// message reports Inserted=true and a re-apply reports Inserted=false — the
+// added-vs-updated signal the engine sums (SPEC-0002 "Bookkeeping And
+// Observability"), exercised on the Tx path the engine actually uses.
+func TestTxUpsertInsertThenUpdate(t *testing.T) {
+	t.Parallel()
+	st := newTestStore(t)
+	seedMailbox(t, st, testMailboxID, "joe@example.com")
+	ctx := context.Background()
+
+	err := st.WithTx(ctx, func(ctx context.Context, tx *Tx) error {
+		first, err := tx.ApplyMessage(ctx, MessageWrite{Message: sampleMessage(testMailboxID, "m1")})
+		if err != nil {
+			return err
+		}
+		if !first.Inserted {
+			t.Error("first apply: Inserted=false, want true")
+		}
+		second, err := tx.ApplyMessage(ctx, MessageWrite{Message: sampleMessage(testMailboxID, "m1")})
+		if err != nil {
+			return err
+		}
+		if second.Inserted {
+			t.Error("re-apply: Inserted=true, want false (converged)")
+		}
+		if first.Hash != second.Hash {
+			t.Errorf("hash changed within tx: %q != %q", first.Hash, second.Hash)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithTx: %v", err)
 	}
 }

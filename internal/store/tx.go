@@ -56,6 +56,15 @@ type Tx struct {
 // the engine calls Tx.ApplyMessage for each changed message and Tx.UpsertSyncState
 // once, all within the same fn, so a partial commit is never observable.
 //
+// Inside fn, callers MUST use the Tx.* methods (Tx.ApplyMessage,
+// Tx.UpsertMessage, Tx.UpsertSyncState, …) so the writes join this transaction.
+// They MUST NOT call the Store.* write methods (s.ApplyMessage, s.UpsertMessage,
+// s.RecordSyncRun, …): those acquire the single writer connection themselves,
+// but WithTx already holds it for the open transaction, so the nested call would
+// block waiting on a connection that cannot be released until fn returns —
+// a self-deadlock (WriterDB is MaxOpenConns(1)). The Tx methods reuse the
+// transaction's own handle and are the only safe writes here.
+//
 // A panic inside fn rolls back and re-panics. All writes serialise through the
 // single-connection writer pool (store.go).
 func (s *Store) WithTx(ctx context.Context, fn func(context.Context, *Tx) error) (err error) {

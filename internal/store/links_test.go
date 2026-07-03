@@ -13,10 +13,11 @@ func TestLinksConverge(t *testing.T) {
 	seedMailbox(t, st, testMailboxID, "joe@example.com")
 	ctx := context.Background()
 
-	hash, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
+	res, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
 	if err != nil {
 		t.Fatalf("message: %v", err)
 	}
+	hash := res.Hash
 	if err := st.UpsertLink(ctx, hash, "https://example.com/a", "first"); err != nil {
 		t.Fatalf("link 1: %v", err)
 	}
@@ -51,10 +52,11 @@ func TestLinkEmptyURLNoOp(t *testing.T) {
 	seedMailbox(t, st, testMailboxID, "joe@example.com")
 	ctx := context.Background()
 
-	hash, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
+	res, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
 	if err != nil {
 		t.Fatalf("message: %v", err)
 	}
+	hash := res.Hash
 	if err := st.UpsertLink(ctx, hash, "   ", "x"); err != nil {
 		t.Fatalf("empty url errored: %v", err)
 	}
@@ -72,7 +74,7 @@ func TestMessageWithNoLinks(t *testing.T) {
 	ctx := context.Background()
 
 	w := MessageWrite{Message: sampleMessage(testMailboxID, "m1")}
-	if err := st.ApplyMessage(ctx, w); err != nil {
+	if _, err := st.ApplyMessage(ctx, w); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 	if got := countRows(t, st, "links"); got != 0 {
@@ -92,10 +94,11 @@ func TestAttachmentsConvergeKeepExtractedText(t *testing.T) {
 	seedMailbox(t, st, testMailboxID, "joe@example.com")
 	ctx := context.Background()
 
-	hash, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
+	res, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
 	if err != nil {
 		t.Fatalf("message: %v", err)
 	}
+	hash := res.Hash
 	if err := st.UpsertAttachment(ctx, hash, "att1", "old.pdf", "application/pdf", 10); err != nil {
 		t.Fatalf("attachment 1: %v", err)
 	}
@@ -135,10 +138,11 @@ func TestAttachmentEmptyIDNoOp(t *testing.T) {
 	seedMailbox(t, st, testMailboxID, "joe@example.com")
 	ctx := context.Background()
 
-	hash, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
+	res, err := st.UpsertMessage(ctx, sampleMessage(testMailboxID, "m1"))
 	if err != nil {
 		t.Fatalf("message: %v", err)
 	}
+	hash := res.Hash
 	if err := st.UpsertAttachment(ctx, hash, "  ", "f.pdf", "application/pdf", 1); err != nil {
 		t.Fatalf("empty att id errored: %v", err)
 	}

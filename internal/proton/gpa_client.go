@@ -343,6 +343,17 @@ func (c *gpaClient) GetEvents(ctx context.Context, sinceEventID string) (EventBa
 	return collectEvents(ctx, c.cli, sinceEventID)
 }
 
+// BackfillMessageIDs enumerates the message ids for a mailbox's first sync,
+// bounded to since (ADR-0014 "Bootstrap then tail"). It needs only an
+// authenticated session (metadata, no keyring); the paging + time-window logic
+// lives in the pure collectBackfillIDs helper.
+func (c *gpaClient) BackfillMessageIDs(ctx context.Context, since time.Time) ([]string, error) {
+	if c.cli == nil {
+		return nil, ErrNotAuthenticated
+	}
+	return collectBackfillIDs(ctx, c.cli, since)
+}
+
 // DecryptMessage fetches and decrypts one message with the unlocked address
 // keyring (ADR-0014 "Decrypt in the pipeline").
 func (c *gpaClient) DecryptMessage(ctx context.Context, messageID string) (DecryptedMessage, error) {

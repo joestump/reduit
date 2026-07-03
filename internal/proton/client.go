@@ -93,6 +93,17 @@ type Client interface {
 	// delta"). A batch may carry a Refresh flag instructing a full re-sync.
 	GetEvents(ctx context.Context, sinceEventID string) (EventBatch, error)
 
+	// BackfillMessageIDs enumerates the message ids to import for a mailbox's
+	// FIRST sync, bounded to messages whose Proton timestamp is at or after
+	// since (SPEC-0002 REQ "Bootstrap Then Tail" — "First sync backfills a
+	// bounded window"). GetEvents/DecryptMessage can tail and decrypt by id but
+	// cannot enumerate history; this is that seam. Ids are returned oldest-first
+	// so an interrupted backfill resumes forward without re-walking applied
+	// messages. It pages Proton's metadata endpoint (bounded requests, never an
+	// unbounded load) and needs only an authenticated session — no Unlock —
+	// returning ErrNotAuthenticated otherwise.
+	BackfillMessageIDs(ctx context.Context, since time.Time) ([]string, error)
+
 	// DecryptMessage fetches and decrypts a single message with the unlocked
 	// keyring (ADR-0014 "Decrypt in the pipeline"). Requires Unlock.
 	DecryptMessage(ctx context.Context, messageID string) (DecryptedMessage, error)

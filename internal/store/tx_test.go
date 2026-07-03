@@ -25,7 +25,7 @@ func TestWithTxAtomicMessageAndCursor(t *testing.T) {
 	runAt := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
 
 	err := st.WithTx(ctx, func(ctx context.Context, tx *Tx) error {
-		if err := tx.ApplyMessage(ctx, w); err != nil {
+		if _, err := tx.ApplyMessage(ctx, w); err != nil {
 			return err
 		}
 		return tx.UpsertSyncState(ctx, testMailboxID, "cursor-42", runAt)
@@ -68,7 +68,7 @@ func TestWithTxRollsBackOnError(t *testing.T) {
 
 	sentinel := errors.New("boom")
 	err := st.WithTx(ctx, func(ctx context.Context, tx *Tx) error {
-		if err := tx.ApplyMessage(ctx, MessageWrite{Message: sampleMessage(testMailboxID, "m1")}); err != nil {
+		if _, err := tx.ApplyMessage(ctx, MessageWrite{Message: sampleMessage(testMailboxID, "m1")}); err != nil {
 			return err
 		}
 		if err := tx.UpsertSyncState(ctx, testMailboxID, "cursor-99", time.Now()); err != nil {
@@ -103,7 +103,7 @@ func TestWithTxOverlappingWindowsNoDuplicate(t *testing.T) {
 
 	apply := func(cursor string) {
 		err := st.WithTx(ctx, func(ctx context.Context, tx *Tx) error {
-			if err := tx.ApplyMessage(ctx, MessageWrite{Message: sampleMessage(testMailboxID, "m1")}); err != nil {
+			if _, err := tx.ApplyMessage(ctx, MessageWrite{Message: sampleMessage(testMailboxID, "m1")}); err != nil {
 				return err
 			}
 			return tx.UpsertSyncState(ctx, testMailboxID, cursor, time.Now())

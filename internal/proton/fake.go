@@ -3,6 +3,7 @@ package proton
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // Fake is an in-memory Client for testing the auth, sync, and send layers
@@ -58,6 +59,11 @@ type Fake struct {
 	// Batches are returned by successive GetEvents calls (FIFO); when drained,
 	// GetEvents returns an empty batch whose cursor echoes the request.
 	Batches []EventBatch
+	// BackfillIDs is the scripted id list returned by BackfillMessageIDs, in the
+	// oldest-first order the real client guarantees; the engine's backfill can be
+	// driven offline from it. BackfillErr, when set, is returned instead.
+	BackfillIDs []string
+	BackfillErr error
 	// Messages maps message id -> decrypted message for DecryptMessage.
 	Messages map[string]DecryptedMessage
 	// Attachments maps "messageID/attachmentID" -> bytes for DecryptAttachment.
@@ -215,6 +221,18 @@ func (f *Fake) GetEvents(_ context.Context, sinceEventID string) (EventBatch, er
 	b := f.Batches[f.batchIdx]
 	f.batchIdx++
 	return b, nil
+}
+
+func (f *Fake) BackfillMessageIDs(_ context.Context, _ time.Time) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.authed {
+		return nil, ErrNotAuthenticated
+	}
+	if f.BackfillErr != nil {
+		return nil, f.BackfillErr
+	}
+	return f.BackfillIDs, nil
 }
 
 func (f *Fake) DecryptMessage(_ context.Context, messageID string) (DecryptedMessage, error) {

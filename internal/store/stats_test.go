@@ -171,8 +171,8 @@ func TestSchemaVersionReportsHead(t *testing.T) {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
 	// After Migrate the current version must equal the newest migration on disk,
-	// which is the session_uid column add (20260702000001).
-	if want := int64(20260702000001); v != want {
+	// which is the sync_runs table add (20260703000001).
+	if want := int64(20260703000001); v != want {
 		t.Errorf("SchemaVersion() = %d, want %d", v, want)
 	}
 }

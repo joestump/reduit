@@ -128,9 +128,9 @@ func TestStatusToolEmptyCache(t *testing.T) {
 	if !out.Healthy {
 		t.Errorf("healthy = %v, want true on a migrated cache", out.Healthy)
 	}
-	// schema_version is the newest migration's timestamped id (session_uid add).
-	if out.SchemaVersion != 20260702000001 {
-		t.Errorf("schema_version = %d, want 20260702000001", out.SchemaVersion)
+	// schema_version is the newest migration's timestamped id (sync_runs add).
+	if out.SchemaVersion != 20260703000001 {
+		t.Errorf("schema_version = %d, want 20260703000001", out.SchemaVersion)
 	}
 	if out.Totals != (statusTotals{}) {
 		t.Errorf("totals = %+v, want all zero", out.Totals)
