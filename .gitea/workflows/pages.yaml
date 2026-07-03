@@ -7,6 +7,10 @@
 name: Deploy Docs to Gitea Pages
 
 on:
+  # Manual re-run: Gitea exposes no rerun API for failed runs, so when a deploy
+  # fails for environmental reasons (e.g. the 2026-07-03 runner disk-full) the
+  # site can be republished from the Actions tab without needing a docs commit.
+  workflow_dispatch:
   push:
     branches:
       - main
