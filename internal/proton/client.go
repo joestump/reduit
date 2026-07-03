@@ -29,19 +29,13 @@ type Client interface {
 	// reports the immutable proton_user_id and whether a 2FA challenge must
 	// still be satisfied. password is the caller's buffer; this package does
 	// not retain or log it.
+	//
+	// When Proton demands human verification (code 9001) Login returns an
+	// *HVRequiredError. reduit does not solve it in-app (ADR-0021): it identifies
+	// as a Proton Bridge client by default (DefaultAppVersion), which Proton waves
+	// through with no challenge. Reaching an HV here means a non-Bridge app-version
+	// is configured, and the CLI surfaces a clear app-version error.
 	Login(ctx context.Context, address string, password []byte) (AuthStatus, error)
-
-	// LoginWithHV retries the SRP password exchange after Login returned an
-	// *HVRequiredError, passing back the SAME challenge (its Methods and Token)
-	// once the operator has completed Proton's hosted human-verification page —
-	// which verifies the token server-side (SPEC-0007, ADR-0001). It mirrors
-	// Login: the returned AuthStatus reports the proton_user_id and any remaining
-	// 2FA challenge, so the flow continues into SubmitTOTP/Unlock exactly as a
-	// non-HV login would. If Proton still demands verification (the operator did
-	// not complete it, or it did not register) the returned error is again an
-	// *HVRequiredError. password is the caller's buffer; it is not retained or
-	// logged.
-	LoginWithHV(ctx context.Context, address string, password []byte, hv *HVRequiredError) (AuthStatus, error)
 
 	// SubmitTOTP submits a TOTP code to complete a login that reported
 	// TwoFATOTP (SPEC-0007 scenario "TOTP 2FA is required"). It is an error to

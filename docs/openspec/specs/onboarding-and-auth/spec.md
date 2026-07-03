@@ -11,10 +11,13 @@ unlock, creating exactly one `mailboxes` row (SPEC-0001) that starts in
 `pending_auth` and transitions to `active` on success, with the
 `proton_user_id` recorded on first auth and treated as immutable.
 
-All Proton-protocol work — SRP, 2FA challenges, human-verification /
-CAPTCHA, mailbox-passphrase OpenPGP key unlock, refresh-token rotation —
-is delegated to `go-proton-api` (ADR-0001); Reduit owns the CLI prompts,
-the state transitions, and where the secrets land. The two live secrets
+All Proton-protocol work — SRP, 2FA challenges, mailbox-passphrase
+OpenPGP key unlock, refresh-token rotation — is delegated to
+`go-proton-api` (ADR-0001); Reduit owns the CLI prompts, the state
+transitions, and where the secrets land. Human verification is *avoided*
+rather than solved: reduit identifies as a Proton Bridge client
+(app-version), which Proton waves through with no CAPTCHA, so there is no
+in-app challenge solver (ADR-0021). The two live secrets
 produced by a successful auth — the Proton refresh token and the mailbox
 passphrase — are written to the OS keychain (ADR-0013) under service
 `reduit` at keys `mailbox/<id>/refresh_token` and
@@ -33,6 +36,7 @@ requirement; it does not reintroduce an on-disk key file.
 
 Governing: ADR-0012 (single-user local-first), ADR-0001
 (go-proton-api as Proton client), ADR-0013 (secrets in OS keychain),
+ADR-0021 (avoid human verification via the Bridge app-version),
 SPEC-0001 (mailbox model).
 
 ## Requirements
@@ -78,19 +82,19 @@ Password authentication SHALL use go-proton-api's SRP exchange; Reduit
 SHALL NOT implement its own SRP. When the account requires TOTP 2FA, the
 flow SHALL prompt for the one-time code and submit it.
 
-When Proton returns a human-verification challenge (API code 9001 —
-expected on effectively every fresh login from a third-party client),
-the flow SHALL resolve it the way Proton Bridge does (ADR-0021): open
-`https://verify.proton.me/?methods=<offered>&token=<token>` in the
-operator's browser (and print the URL for copy/paste), wait for the
-operator to complete the challenge on Proton's own page — which verifies
-the token **server-side** — then retry the login presenting the **same**
-token via go-proton-api's HV-token login. The flow SHALL pass through
-all offered methods (captcha, email, sms) and SHALL NOT attempt to
-render, embed, or capture the challenge itself: the challenge's
-`frame-ancestors` CSP is first-party-only, and no client-side token
-capture exists in this flow (see ADR-0021 for the falsified
-alternatives).
+The flow SHALL avoid Proton's human-verification wall by presenting a
+Proton **Bridge** app-version by default (`proton.DefaultAppVersion`,
+e.g. `macos-bridge@3.21.2`): Proton challenges the web client family with
+a 9001 CAPTCHA on every fresh login but waves the Bridge family through
+with none (ADR-0021). Under the default the normal login therefore never
+sees a challenge and continues straight to TOTP/passphrase. If Proton
+still returns a 9001 — which means a **non-Bridge** app-version was
+configured (`proton.app_version` / `REDUIT_PROTON_APP_VERSION`, or the
+`auto` web-client detection) — the flow SHALL return a clear, actionable
+error directing the operator to unset or override the app-version, and
+SHALL NOT attempt to render, embed, or capture the challenge and SHALL
+NOT implement an in-app CAPTCHA solver (every solve mechanism was
+falsified live or proved unnecessary; see ADR-0021).
 
 #### Scenario: TOTP 2FA is required
 
@@ -99,23 +103,24 @@ alternatives).
 - **THEN** the system SHALL prompt the operator for the TOTP code and
   submit it to complete authentication
 
+#### Scenario: Default Bridge app-version avoids human verification
+
+- **WHEN** the operator authenticates under the default configuration
+  (no `proton.app_version` set), so reduit presents the Bridge
+  app-version `proton.DefaultAppVersion`
+- **THEN** Proton SHALL NOT raise a 9001 human-verification challenge and
+  the flow SHALL continue to TOTP/passphrase as a normal login
+
 #### Scenario: Human verification / CAPTCHA is requested
 
 - **WHEN** Proton responds to the auth attempt with a human-verification
-  challenge (code 9001) carrying offered methods and a verification
-  token
-- **THEN** the system SHALL print and open
-  `https://verify.proton.me/?methods=<offered>&token=<token>`, wait for
-  the operator to confirm completion, and retry the login with the same
-  token; on success the flow SHALL continue to 2FA/passphrase as normal,
-  and it SHALL NOT crash, loop, or print the raw challenge payload
-
-#### Scenario: Verification not completed before retry
-
-- **WHEN** the operator confirms before the challenge is actually
-  completed and the retry returns another human-verification challenge
-- **THEN** the system SHALL allow at least one further solve-and-retry
-  attempt before aborting with a clear, actionable error
+  challenge (code 9001) — indicating a non-Bridge app-version was
+  configured — carrying offered methods and a verification token
+- **THEN** the system SHALL return a clear, actionable error instructing
+  the operator to unset or override `proton.app_version` /
+  `REDUIT_PROTON_APP_VERSION` (or set a Bridge value), and it SHALL NOT
+  crash, loop, print the raw challenge token, render/embed/capture the
+  challenge, or launch a browser
 
 #### Scenario: Wrong password or 2FA code
 
@@ -214,6 +219,50 @@ SHALL be an error and SHALL NOT overwrite the stored value.
 - **THEN** the system SHALL treat this as an error, SHALL NOT overwrite
   the stored `proton_user_id`, and SHALL surface the discrepancy to the
   operator
+
+### Requirement: Cross-Process Session Resume
+
+A session minted by `reduit auth` SHALL be resumable from a separate
+process (a sync or send run) without re-prompting. Two pieces of session
+state make this correct, and both SHALL be honored (ADR-0001, ADR-0013,
+ADR-0021):
+
+- **Session UID.** The go-proton-api session UID (`auth.UID`, distinct
+  from the account's `proton_user_id`) SHALL be persisted per mailbox as
+  non-secret session state and presented on every resume. Proton's
+  `/auth/v4/refresh` identifies the session by this UID; resuming without
+  it yields code **10013** ("invalid refresh token"). Because a resume may
+  rotate the UID, the caller SHALL re-read and re-persist it after each
+  resume, alongside the rotated refresh token.
+- **App-version binding.** Proton binds a session to the app-version that
+  minted it, so the app-version presented at resume SHALL match the one
+  presented at mint; a mismatch also yields 10013. The default Bridge
+  app-version (`proton.DefaultAppVersion`) satisfies this for the normal
+  path; an operator who overrides `proton.app_version` SHALL do so
+  consistently across `auth`, `labels`, and `sync`.
+
+#### Scenario: Resume presents the persisted session UID
+
+- **WHEN** a sync or send process resumes an `active` mailbox from its
+  stored refresh token
+- **THEN** the system SHALL present the mailbox's persisted session UID on
+  the refresh, and after a resume that rotates the UID or refresh token
+  SHALL persist the rotated values so the next resume still matches
+
+#### Scenario: Missing session UID forces re-auth rather than a broken resume
+
+- **WHEN** a mailbox row has a refresh token but no persisted session UID
+  (e.g. a pre-migration row)
+- **THEN** the system SHALL NOT attempt a resume that would fail with
+  10013; it SHALL fall back to the interactive re-login, which re-persists
+  both the refresh token and the session UID, self-healing the row
+
+#### Scenario: Resume app-version matches the minting app-version
+
+- **WHEN** a mailbox is resumed for `labels` or `sync`
+- **THEN** the system SHALL present the same app-version used at `auth`
+  time (the default Bridge value unless the operator overrode it
+  consistently), so Proton does not reject the resume with 10013
 
 ### Requirement: Multi-Mailbox Add
 

@@ -144,10 +144,11 @@ var _ Client = (*gpaClient)(nil)
 
 // Login runs the SRP password exchange via go-proton-api (SPEC-0007 REQ "SRP
 // and 2FA Handling"). reduit never implements SRP itself. When Proton demands
-// human verification (code 9001), Login returns a typed *HVRequiredError so the
-// CLI can solve the CAPTCHA and retry via LoginWithHV, rather than dying with a
-// generic "login failed" (SPEC-0007 scenario "Human verification / CAPTCHA is
-// requested").
+// human verification (code 9001), Login returns a typed *HVRequiredError. reduit
+// avoids this challenge by identifying as a Proton Bridge client by default
+// (DefaultAppVersion), which Proton waves through; the CLI turns any HV that does
+// surface into a clear app-version error rather than solving it in-app (ADR-0021,
+// SPEC-0007 scenario "Human verification / CAPTCHA is requested").
 func (c *gpaClient) Login(ctx context.Context, address string, password []byte) (AuthStatus, error) {
 	cli, auth, err := c.mgr.NewClientWithLogin(ctx, address, password)
 	if err != nil {
@@ -159,28 +160,8 @@ func (c *gpaClient) Login(ctx context.Context, address string, password []byte) 
 	return c.applyAuth(cli, auth), nil
 }
 
-// LoginWithHV retries the SRP password exchange after Login reported human
-// verification, passing back the SAME challenge (SPEC-0007, ADR-0001). Mirroring
-// Proton Bridge, the operator has already completed Proton's hosted verify page
-// (which verifies the token server-side); we simply hand the same {Methods,
-// Token} to go-proton-api. It mirrors Login's post-processing; if Proton STILL
-// demands verification (the operator did not complete it) it returns an
-// *HVRequiredError again so the caller can offer another attempt.
-func (c *gpaClient) LoginWithHV(ctx context.Context, address string, password []byte, hv *HVRequiredError) (AuthStatus, error) {
-	cli, auth, err := c.mgr.NewClientWithLoginWithHVToken(ctx, address, password,
-		&gpa.APIHVDetails{Methods: hv.Methods, Token: hv.Token})
-	if err != nil {
-		if hv, ok := hvRequiredFrom(err); ok {
-			return AuthStatus{}, hv
-		}
-		return AuthStatus{}, classifyError(err)
-	}
-	return c.applyAuth(cli, auth), nil
-}
-
 // applyAuth records the authenticated session from a successful login and
-// derives the reduit AuthStatus. It is the shared post-login processing for
-// Login and LoginWithHV: store the client, session UID, immutable
+// derives the reduit AuthStatus: store the client, session UID, immutable
 // proton_user_id, and rotated refresh token, and compute the 2FA state. The
 // mailbox keyring is loaded later by Unlock, not here.
 func (c *gpaClient) applyAuth(cli *gpa.Client, auth gpa.Auth) AuthStatus {

@@ -9,14 +9,15 @@ import (
 )
 
 // HVRequiredError is a typed human-verification (CAPTCHA) challenge carried out
-// of Login/LoginWithHV so the CLI can SOLVE it rather than merely report it
-// (SPEC-0007 scenario "Human verification / CAPTCHA is requested"). Proton
-// returns code 9001 with the challenge details; this type carries the offered
-// Methods (e.g. "captcha", "email", "sms") and the challenge Token the solver
-// fetches the CAPTCHA with and, once solved, retries the login with. It unwraps
-// to ErrHumanVerification so existing errors.Is checks keep working.
+// of Login so the CLI can detect it and surface a clear, actionable app-version
+// error (SPEC-0007 scenario "Human verification / CAPTCHA is requested"). reduit
+// avoids the challenge entirely by identifying as a Proton Bridge client
+// (DefaultAppVersion); it does not solve it in-app (ADR-0021). Proton returns
+// code 9001 with the challenge details; this type carries the offered Methods
+// (e.g. "captcha", "email", "sms") for diagnostics and the challenge Token. It
+// unwraps to ErrHumanVerification so existing errors.Is checks keep working.
 //
-// Governing: SPEC-0007 REQ "SRP and 2FA Handling", ADR-0001.
+// Governing: SPEC-0007 REQ "SRP and 2FA Handling", ADR-0001, ADR-0021.
 type HVRequiredError struct {
 	// Methods are the human-verification methods Proton will accept. reduit
 	// only solves "captcha"; the CLI reports the offered set when it cannot.

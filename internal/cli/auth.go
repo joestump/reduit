@@ -207,13 +207,13 @@ func authAdd(ctx context.Context, st *store.Store, ks keychain.Store, dialer pro
 }
 
 // interactiveAuth drives the SPEC-0007 interactive sequence on a fresh,
-// unauthenticated client: password → Login → optional CAPTCHA/human-verification
-// → optional TOTP → passphrase → Unlock. It returns the mailbox passphrase so
-// the caller can persist it (and must zero it). Secrets are read without echo
-// and never logged; the password buffer is zeroed only after the final login
-// attempt (a CAPTCHA retry needs it live). out receives the CAPTCHA solver's
-// operator instructions. Shared by the add flow and the refresh fallback
-// re-login.
+// unauthenticated client: password → Login → optional TOTP → passphrase →
+// Unlock. It returns the mailbox passphrase so the caller can persist it (and
+// must zero it). Secrets are read without echo and never logged. The default
+// Bridge app-version avoids Proton's human-verification wall; if a non-Bridge
+// app-version is configured and Proton returns a 9001, Login surfaces a clear
+// app-version error (humanVerificationError) rather than attempting an in-app
+// solve (ADR-0021). Shared by the add flow and the refresh fallback re-login.
 func interactiveAuth(ctx context.Context, client proton.Client, p prompter, address string, out io.Writer) ([]byte, error) {
 	password, err := p.secret(fmt.Sprintf("Proton password for %s: ", address))
 	if err != nil {
@@ -224,21 +224,20 @@ func interactiveAuth(ctx context.Context, client proton.Client, p prompter, addr
 	status, err := client.Login(ctx, address, password)
 	if err != nil {
 		// Proton's anti-abuse wall (code 9001) demands human verification before
-		// it will run the 2FA/password exchange. Solve the CAPTCHA and retry the
-		// login with the solved token; on success the flow falls through to the
-		// same TOTP + passphrase steps a non-HV login would (SPEC-0007 "Human
-		// verification / CAPTCHA is requested"). The password must stay live for
-		// the retry, which is why it is not zeroed until below.
-		hv, ok := proton.AsHVRequired(err)
-		if !ok {
-			return nil, fmt.Errorf("login failed: %w", err)
+		// it will run the 2FA/password exchange. reduit AVOIDS this by identifying
+		// as a Proton Bridge client by default (proton.DefaultAppVersion), which
+		// Proton waves through with no challenge; reaching an HV here means a
+		// non-Bridge app-version is configured. There is no in-app CAPTCHA solver
+		// (all solve paths were falsified live — ADR-0021); return a clear,
+		// actionable error pointing back at the app-version knob rather than
+		// rendering/embedding/capturing the challenge (SPEC-0007 "Human
+		// verification / CAPTCHA is requested").
+		if hv, ok := proton.AsHVRequired(err); ok {
+			return nil, humanVerificationError(hv)
 		}
-		status, err = solveCaptchaHV(ctx, client, address, password, hv, out)
-		if err != nil {
-			return nil, err
-		}
+		return nil, fmt.Errorf("login failed: %w", err)
 	}
-	zero(password) // no longer needed once the SRP exchange (incl. any HV retry) is done.
+	zero(password) // no longer needed once the SRP exchange is done.
 
 	switch status.TwoFA {
 	case proton.TwoFATOTP:

@@ -26,20 +26,14 @@ type Fake struct {
 	// UID is the current session UID reported by SessionUID; rotated values can
 	// be scripted via SessionUIDs (applied on Refresh, mirroring Token).
 	UID string
-	// TwoFA is the 2FA state Login (or LoginWithHV, once HV is passed) reports.
+	// TwoFA is the 2FA state Login reports.
 	TwoFA TwoFAState
 
-	// HVChallenge, when non-nil, makes the FIRST Login fail with it — modeling
-	// Proton's 9001 anti-abuse wall — so tests can drive the human-verification
-	// → LoginWithHV → 2FA → unlock sequence. Later Logins (and a LoginWithHV with
-	// an accepted token) succeed. A LoginWithHV whose token is rejected (see
-	// HVToken) fails with this same challenge again, modeling verification that
-	// did not register.
+	// HVChallenge, when non-nil, makes Login fail with it — modeling Proton's 9001
+	// anti-abuse wall — so tests can drive the human-verification path. reduit does
+	// not solve the challenge in-app (ADR-0021); it surfaces a clear app-version
+	// error, so the challenge is terminal for the login rather than retried.
 	HVChallenge *HVRequiredError
-	// HVToken, when non-empty, is the only solved token LoginWithHV accepts; any
-	// other value re-issues HVChallenge (or ErrHumanVerification if none is set).
-	// Empty accepts any token.
-	HVToken string
 	// TOTPCode, when non-empty, is the only code SubmitTOTP accepts; any other
 	// code yields ErrAuthFailed. Empty accepts any code.
 	TOTPCode string
@@ -81,7 +75,6 @@ type Fake struct {
 
 	Sent          []OutgoingMessage
 	TOTPSubmitted []string
-	HVTokens      []string // solved tokens passed to LoginWithHV
 	RefreshCalls  int
 	Closed        bool
 
@@ -89,7 +82,6 @@ type Fake struct {
 	authed   bool
 	unlocked bool
 	pending  bool // 2FA outstanding
-	hvIssued bool // first HVChallenge has been handed out
 	batchIdx int
 }
 
@@ -109,25 +101,8 @@ func (f *Fake) Login(_ context.Context, _ string, _ []byte) (AuthStatus, error) 
 	if f.LoginErr != nil {
 		return AuthStatus{}, f.LoginErr
 	}
-	if f.HVChallenge != nil && !f.hvIssued {
-		f.hvIssued = true
+	if f.HVChallenge != nil {
 		return AuthStatus{}, f.HVChallenge
-	}
-	f.authed = true
-	f.pending = f.TwoFA == TwoFATOTP
-	return AuthStatus{ProtonUserID: f.UserID, TwoFA: f.TwoFA}, nil
-}
-
-func (f *Fake) LoginWithHV(_ context.Context, _ string, _ []byte, hv *HVRequiredError) (AuthStatus, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.HVTokens = append(f.HVTokens, hv.Token)
-	if f.HVToken != "" && hv.Token != f.HVToken {
-		// Token rejected/expired: Proton re-issues the challenge.
-		if f.HVChallenge != nil {
-			return AuthStatus{}, f.HVChallenge
-		}
-		return AuthStatus{}, ErrHumanVerification
 	}
 	f.authed = true
 	f.pending = f.TwoFA == TwoFATOTP
