@@ -34,8 +34,12 @@ It must never read as corporate or flat.
 - **Palette.** Void/surfaces `#08080F → #1E1E38`; brand Charm purple
   `#7D56F4` + hot pink `#FF5FA2`; Tron accents cyan `#4EE6FF` + mint
   `#00F0A8`; phosphor text `#F4F4FF` fading to dim indigo-grey; gold/coral
-  for warn/danger. Foreground is neon on blue-black; elevation is expressed
-  as **glow** (a `0 0 12px` colored halo per accent), not grey drop-shadow.
+  for warn/danger. Foreground is neon on blue-black. **No glow / drop-shadow
+  system:** the design system's `0 0 12px` neon "glow" is a web-CSS affordance
+  a terminal cannot render — defer to bubbletea/bubbles/lipgloss defaults.
+  Emphasis and "elevation" are expressed with lipgloss-native means only —
+  foreground/background color, bold, border style/color, and adaptive
+  light/dark colors — never a simulated halo.
 - **Type.** Monospace-first. Body/UI **JetBrains Mono**; chunky display/
   wordmarks **Space Mono** (tracking ~-0.04em, often gradient-filled);
   pixel eyebrows/badges **Silkscreen**. Hierarchy comes from weight/size/
@@ -51,11 +55,19 @@ It must never read as corporate or flat.
   Everything MUST honor `prefers-reduced-motion` (cursor/spinners freeze,
   progress jumps to end) — the reduced-motion equivalent in a TUI is
   `lipgloss`/`bubbletea` rendering without the blink/spin tick.
-- **Iconography.** Unicode + box-drawing glyphs, never a web icon set:
-  nav `↑↓←→`, status `✓ ✗ ◆ ● ○ •`, prompts `❯ › $`, spinners
-  `⣾⣽⣻⢿⡿⣟⣯⣷` / `⠋⠙⠹⠸`, progress `█ ▓ ▒ ░`, borders `─ │ ╭ ╮ ╰ ╯ ├ ┤`.
-  Emoji only as sparing flourishes (never in dense UI). This is exactly how
-  mutt + Charm render — type the glyph.
+- **Iconography.** Base layer: plain Unicode + box-drawing glyphs that render
+  in **any** terminal font — nav `↑↓←→`, status `✓ ✗ ◆ ● ○ •`, prompts
+  `❯ › $`, spinners `⣾⣽⣻⢿⡿⣟⣯⣷` / `⠋⠙⠹⠸`, progress `█ ▓ ▒ ░`, borders
+  `─ │ ╭ ╮ ╰ ╯ ├ ┤`. Emoji only as sparing flourishes (never in dense UI).
+  This is how mutt + Charm render — type the glyph, never a web icon set.
+  **Optional Nerd Fonts enhancement layer** (<https://www.nerdfonts.com> — the
+  patched-font glyph set powerline/Oh-My-Zsh themes rely on): when the user's
+  terminal has a Nerd Font, the TUI MAY use its extended glyphs (file-type
+  icons, git branch/state, folder/attachment icons) for a richer index/status
+  line. This MUST be a progressive enhancement gated behind detection or an
+  explicit config opt-in (Nerd Font code points render as tofu boxes without a
+  patched font), and every Nerd Font glyph MUST have a plain-Unicode fallback
+  from the base layer. Never assume a Nerd Font is present.
 - **Voice.** Playful, warm, lowercase; address the user as "you"; a load-
   bearing dim **help footer** of `key • action` pairs on every view
   (`↑/↓ navigate • enter select • / search • q quit`); shell-flavored
