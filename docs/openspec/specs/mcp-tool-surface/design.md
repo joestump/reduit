@@ -9,7 +9,8 @@
 JSON-RPC over the subprocess's stdin/stdout. There is no network
 listener, no OIDC, no account record, and no auth middleware — the
 process inherits the authority of the single local OS user (ADR-0012).
-`log/slog` is wired to **stderr** so stdout carries only the protocol
+`log/slog` — backed by `github.com/charmbracelet/log` as an `slog.Handler`
+(ADR-0022) — is wired to **stderr** so stdout carries only the protocol
 stream.
 
 Tools are typed: `AddTool[In, Out]` infers and validates each tool's
@@ -49,8 +50,9 @@ only `store` internals — the tools are unaffected.
   session; concurrent multi-client access is a non-goal.
 - **No auth.** No bearer, no token table, no handshake. The local user
   is the authority.
-- **stdout discipline.** The go-sdk server owns stdout. `slog` and any
-  panic/recover diagnostics go to stderr. A stray `fmt.Println` to
+- **stdout discipline.** The go-sdk server owns stdout. `slog` (backed by
+  charmbracelet/log, ADR-0022) and any panic/recover diagnostics go to
+  stderr. A stray `fmt.Println` to
   stdout would corrupt JSON-RPC, so the codebase forbids it outside
   the protocol writer.
 - **Optional loopback HTTP.** A streamable-HTTP mode MAY be added for

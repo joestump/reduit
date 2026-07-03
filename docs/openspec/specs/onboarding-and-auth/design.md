@@ -118,7 +118,11 @@ with guidance ("already configured" for `active`, "re-auth it" for
 - **slog redaction.** Auth-path logging logs *structure* (which step,
   which mailbox id, success/failure), never secret values. Secret-bearing
   types carry a `LogValue()` that returns a redacted placeholder so an
-  accidental `slog` of the struct cannot leak.
+  accidental `slog` of the struct cannot leak. The structured-logging
+  backend is `github.com/charmbracelet/log` used *as an `slog.Handler`*
+  (ADR-0022) — only the root handler construction changed; the `slog` API
+  and this redaction discipline are backend-agnostic and unchanged. Logs
+  go to stderr.
 - **Keychain keys.** Service `reduit`; account keys
   `mailbox/<id>/refresh_token` and `mailbox/<id>/mailbox_passphrase`
   (ADR-0013). The DB stores only the `mailbox_id` reference.

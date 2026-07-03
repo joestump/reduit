@@ -297,6 +297,14 @@ SHALL be passed only through no-echo prompts and the keychain API, never
 through command-line flags or environment that a process listing or
 history file would capture.
 
+Reduit's structured logging backend SHALL be `github.com/charmbracelet/log`
+used *as an `slog.Handler`* (ADR-0022): the `slog` API surface and the
+redaction discipline of this requirement are properties of the `slog`
+records themselves (`LogValue()` on secret-bearing types, structure-only
+auth logging) and SHALL be unchanged by the backend. Logs SHALL go to
+stderr. Any log-level assertion in this requirement holds regardless of
+`logger.format` (`text` or `json`).
+
 #### Scenario: Secrets are absent from logs
 
 - **WHEN** the auth flow runs at any log level, including debug
