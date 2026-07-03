@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestMailboxLifecycle(t *testing.T) {
@@ -173,5 +174,92 @@ func TestMailboxDuplicateProtonUserID(t *testing.T) {
 	}
 	if err := st.SetProtonUserID(ctx, "01234567-test-uuid-v7-000000000002", "proton-user-123"); err == nil {
 		t.Error("expected UNIQUE constraint error for duplicate proton_user_id")
+	}
+}
+
+// TestDeleteMailbox_CascadesAllDependents reproduces the live `auth remove`
+// failure: a mailbox with a recorded sync_run (FK to mailboxes) made
+// DeleteMailbox trip "FOREIGN KEY constraint failed". The delete must remove
+// EVERY dependent row — messages (+ hash-keyed links/attachments/embeddings),
+// sync_runs, sync_state, fact_state, mailbox-scoped denylist — atomically,
+// while retaining shared contacts.
+func TestDeleteMailbox_CascadesAllDependents(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	if err := st.Migrate(""); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	ctx := context.Background()
+
+	const mb = "01234567-test-uuid-v7-00000000del1"
+	if err := st.InsertMailbox(ctx, mb, "del@example.com"); err != nil {
+		t.Fatalf("InsertMailbox: %v", err)
+	}
+
+	// A cached message with every hash-keyed child + a contact.
+	res, err := st.ApplyMessage(ctx, MessageWrite{
+		Message: MessageRow{MailboxID: mb, ProtonID: "pm-1", Timestamp: time.Now().UTC(),
+			Sender: "a@example.com", Subject: "hi", Body: "see https://example.com"},
+		Contacts:    []ContactInput{{Address: "a@example.com", DisplayName: "A"}},
+		Links:       []LinkInput{{URL: "https://example.com"}},
+		Attachments: []AttachmentInput{{ProtonAttID: "att-1", Filename: "f.pdf", MIME: "application/pdf", SizeBytes: 1}},
+	})
+	if err != nil {
+		t.Fatalf("ApplyMessage: %v", err)
+	}
+	if _, err := st.WriterDB().ExecContext(ctx,
+		`INSERT INTO embeddings (hash, model, dim, vec) VALUES (?, 'm', 1, x'00')`, res.Hash); err != nil {
+		t.Fatalf("seed embedding: %v", err)
+	}
+	// The exact live trigger: a recorded sync_run referencing the mailbox.
+	if err := st.RecordSyncRun(ctx, SyncRun{MailboxID: mb,
+		StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}); err != nil {
+		t.Fatalf("RecordSyncRun: %v", err)
+	}
+	if err := st.UpsertSyncState(ctx, mb, "ev-1", time.Now().UTC()); err != nil {
+		t.Fatalf("UpsertSyncState: %v", err)
+	}
+	if _, err := st.WriterDB().ExecContext(ctx,
+		`INSERT INTO denylist (id, mailbox_id, kind, value) VALUES ('dl-1', ?, 'sender', 'x@y.z')`, mb); err != nil {
+		t.Fatalf("seed denylist: %v", err)
+	}
+
+	if err := st.DeleteMailbox(ctx, mb); err != nil {
+		t.Fatalf("DeleteMailbox with dependents: %v", err)
+	}
+
+	for _, q := range []struct{ name, sql string }{
+		{"mailboxes", `SELECT COUNT(*) FROM mailboxes WHERE id = '` + mb + `'`},
+		{"messages", `SELECT COUNT(*) FROM messages WHERE mailbox_id = '` + mb + `'`},
+		{"links", `SELECT COUNT(*) FROM links WHERE message_hash = '` + res.Hash + `'`},
+		{"attachments", `SELECT COUNT(*) FROM attachments WHERE message_hash = '` + res.Hash + `'`},
+		{"embeddings", `SELECT COUNT(*) FROM embeddings WHERE hash = '` + res.Hash + `'`},
+		{"sync_runs", `SELECT COUNT(*) FROM sync_runs WHERE mailbox_id = '` + mb + `'`},
+		{"sync_state", `SELECT COUNT(*) FROM sync_state WHERE mailbox_id = '` + mb + `'`},
+		{"denylist", `SELECT COUNT(*) FROM denylist WHERE mailbox_id = '` + mb + `'`},
+	} {
+		var n int
+		if err := st.DB.GetContext(ctx, &n, q.sql); err != nil {
+			t.Fatalf("count %s: %v", q.name, err)
+		}
+		if n != 0 {
+			t.Errorf("%s: %d rows survive DeleteMailbox, want 0", q.name, n)
+		}
+	}
+	// Shared contacts are retained.
+	var contacts int
+	if err := st.DB.GetContext(ctx, &contacts, `SELECT COUNT(*) FROM contact_identifiers WHERE address = 'a@example.com'`); err != nil {
+		t.Fatalf("count contacts: %v", err)
+	}
+	if contacts != 1 {
+		t.Errorf("contact_identifiers = %d, want 1 (contacts are shared, retained)", contacts)
+	}
+	// Idempotent on a now-missing mailbox.
+	if err := st.DeleteMailbox(ctx, mb); err != nil {
+		t.Fatalf("DeleteMailbox second call: %v", err)
 	}
 }

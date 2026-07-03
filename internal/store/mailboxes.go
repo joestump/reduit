@@ -170,21 +170,47 @@ func (s *Store) SetLastSyncAt(ctx context.Context, id string, t time.Time) error
 	return nil
 }
 
-// DeleteMailbox removes a mailbox row and its dependent sync_state and fact_state.
-// Message cache rows, contacts, and embeddings are NOT deleted here — they are
-// derived data keyed by stable hash, and cleanup is a separate maintenance pass.
+// DeleteMailbox removes a mailbox row and EVERY row that references it — the
+// message cache (and the messages' hash-keyed children: links, attachments,
+// embeddings), sync_runs, sync_state, fact_state, and mailbox-scoped denylist
+// entries — in one transaction, so `auth remove` can never trip the FOREIGN KEY
+// constraint (observed live: a recorded sync_run blocked the delete) and never
+// leaves orphaned cache rows behind. Contacts are retained: they are shared
+// across mailboxes and are not FK'd to this row. contact_facts are keyed by
+// contact, not mailbox, and are likewise retained (the facts layer owns their
+// lifecycle, SPEC-0011).
 func (s *Store) DeleteMailbox(ctx context.Context, id string) error {
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM sync_state WHERE mailbox_id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("store: delete sync_state for mailbox: %w", err)
+	if s == nil || s.WriterDB() == nil {
+		return errNotOpen
 	}
-	_, err = s.DB.ExecContext(ctx, `DELETE FROM fact_state WHERE mailbox_id = ?`, id)
+	tx, err := s.WriterDB().BeginTxx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("store: delete fact_state for mailbox: %w", err)
+		return fmt.Errorf("store: delete mailbox: begin: %w", err)
 	}
-	_, err = s.DB.ExecContext(ctx, `DELETE FROM mailboxes WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("store: delete mailbox: %w", err)
+	defer func() { _ = tx.Rollback() }()
+
+	// The messages' hash-keyed children first (no FK, but orphaning them would
+	// leave dangling search/embedding rows pointing at deleted messages).
+	for _, q := range []struct{ name, sql string }{
+		{"links", `DELETE FROM links WHERE message_hash IN (SELECT hash FROM messages WHERE mailbox_id = ?)`},
+		{"attachments", `DELETE FROM attachments WHERE message_hash IN (SELECT hash FROM messages WHERE mailbox_id = ?)`},
+		{"embeddings", `DELETE FROM embeddings WHERE hash IN (SELECT hash FROM messages WHERE mailbox_id = ?)`},
+		// messages last of the hash family (the subqueries above need them);
+		// the messages_ad trigger clears messages_fts.
+		{"messages", `DELETE FROM messages WHERE mailbox_id = ?`},
+		// Direct mailbox_id dependents.
+		{"sync_runs", `DELETE FROM sync_runs WHERE mailbox_id = ?`},
+		{"sync_state", `DELETE FROM sync_state WHERE mailbox_id = ?`},
+		{"fact_state", `DELETE FROM fact_state WHERE mailbox_id = ?`},
+		{"denylist", `DELETE FROM denylist WHERE mailbox_id = ?`},
+		{"mailbox", `DELETE FROM mailboxes WHERE id = ?`},
+	} {
+		if _, err := tx.ExecContext(ctx, q.sql, id); err != nil {
+			return fmt.Errorf("store: delete mailbox: %s: %w", q.name, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: delete mailbox: commit: %w", err)
 	}
 	return nil
 }
