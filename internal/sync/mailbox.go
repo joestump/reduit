@@ -53,6 +53,7 @@ func (e *Engine) syncMailbox(ctx context.Context, m store.Mailbox, summary *RunS
 		return
 	}
 	defer client.Close()
+	e.log.Debug("session resumed and unlocked", "mailbox_id", m.ID, "address", m.Address)
 	// Resume REUSES the cached session (no network), so tokens rotate only lazily
 	// when the access token expires mid-run — on Unlock or a later API call. The
 	// auth handler tracks the rotated values on the client; persist them once here
@@ -67,6 +68,7 @@ func (e *Engine) syncMailbox(ctx context.Context, m store.Mailbox, summary *RunS
 	if err := e.retry(ctx, "labels", func() error {
 		l, er := client.Labels(ctx)
 		labels = l
+		e.log.Debug("labels fetched for folder resolution", "mailbox_id", m.ID, "labels", len(l))
 		return er
 	}); err != nil {
 		summary.Err = fmt.Errorf("fetch labels: %w", err)
@@ -189,6 +191,11 @@ func (e *Engine) persistRotatedSession(ctx context.Context, mailboxID string, cl
 	if err := e.persistRotatedSessionUID(ctx, mailboxID, seed.sessionUID, client.SessionUID()); err != nil {
 		e.log.Error("store rotated session uid failed", "mailbox_id", mailboxID, "error", err)
 	}
+	e.log.Debug("session state persisted",
+		"mailbox_id", mailboxID,
+		"access_token_rotated", client.AccessToken() != seed.accessToken,
+		"refresh_token_rotated", client.RefreshToken() != seed.refreshToken,
+		"session_uid_rotated", client.SessionUID() != seed.sessionUID)
 }
 
 // persistRotatedToken writes the new refresh token to the keychain only when it
@@ -245,6 +252,8 @@ func (e *Engine) bootstrap(ctx context.Context, client proton.Client, m store.Ma
 		since = e.now().Add(-e.cfg.BackfillWindow)
 	}
 
+	e.log.Info("enumerating mailbox for backfill (first sync pages all message metadata; this can take a while)",
+		"mailbox_id", m.ID, "address", m.Address)
 	var ids []string
 	if err := e.retry(ctx, "backfill_ids", func() error {
 		x, er := client.BackfillMessageIDs(ctx, since)
@@ -253,13 +262,19 @@ func (e *Engine) bootstrap(ctx context.Context, client proton.Client, m store.Ma
 	}); err != nil {
 		return fmt.Errorf("backfill message ids: %w", err)
 	}
+	e.log.Info("backfill starting", "mailbox_id", m.ID, "address", m.Address, "messages", len(ids))
 
 	// Ids arrive oldest-first, so each is applied in its own transaction: a
 	// crash resumes forward without re-walking already-committed messages, and a
 	// TERMINAL decrypt failure skips one message without poisoning the run.
-	for _, id := range ids {
+	for i, id := range ids {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// Progress heartbeat: a large backfill decrypts thousands of messages
+		// one by one — without this the run is silent for minutes.
+		if i > 0 && i%100 == 0 {
+			e.log.Info("backfill progress", "mailbox_id", m.ID, "done", i, "total", len(ids))
 		}
 		dm, err := e.decrypt(ctx, client, id)
 		if err != nil {
@@ -289,6 +304,8 @@ func (e *Engine) bootstrap(ctx context.Context, client proton.Client, m store.Ma
 	if err := e.store.UpsertSyncState(ctx, m.ID, startCursor, e.now().UTC()); err != nil {
 		return fmt.Errorf("persist bootstrap cursor: %w", err)
 	}
+	e.log.Info("backfill complete", "mailbox_id", m.ID, "address", m.Address,
+		"added", summary.Added, "updated", summary.Updated, "attachments", summary.Attachments, "errors", summary.Errors)
 	return nil
 }
 
@@ -337,6 +354,9 @@ func (e *Engine) tail(ctx context.Context, client proton.Client, m store.Mailbox
 		if err := e.commitBatch(ctx, m.ID, writes, deletes, batch.NextCursor, summary); err != nil {
 			return fmt.Errorf("commit event batch: %w", err)
 		}
+		e.log.Debug("event batch applied", "mailbox_id", m.ID,
+			"events", len(batch.Events), "writes", len(writes), "deletes", len(deletes),
+			"cursor", batch.NextCursor, "more", batch.More)
 		cursor = batch.NextCursor
 
 		if !batch.More {
