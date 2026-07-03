@@ -65,3 +65,20 @@ func (s *Store) UpsertSyncState(ctx context.Context, mailboxID, eventCursor stri
 func (t *Tx) UpsertSyncState(ctx context.Context, mailboxID, eventCursor string, lastRunAt time.Time) error {
 	return upsertSyncState(ctx, t.tx, mailboxID, eventCursor, lastRunAt)
 }
+
+// ResetSyncCursor clears a mailbox's sync cursor back to unset by deleting its
+// sync_state row. The next GetSyncState then reports a nil cursor, so the engine
+// re-bootstraps the bounded backfill and re-applies it idempotently — the
+// mechanism behind `reduit sync --full` (SPEC-0002 "Full rescan on demand").
+// It runs on the writer pool, like every other write in this layer, and is
+// idempotent: clearing a mailbox that has no row is a harmless no-op.
+func (s *Store) ResetSyncCursor(ctx context.Context, mailboxID string) error {
+	if s == nil || s.WriterDB() == nil {
+		return errNotOpen
+	}
+	const q = `DELETE FROM sync_state WHERE mailbox_id = ?`
+	if _, err := s.WriterDB().ExecContext(ctx, q, mailboxID); err != nil {
+		return fmt.Errorf("store: reset sync cursor: %w", err)
+	}
+	return nil
+}
