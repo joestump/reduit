@@ -27,6 +27,29 @@ func updateModel(m syncModel, msg tea.Msg) syncModel {
 	return next.(syncModel)
 }
 
+// TestSyncModel_MailboxStartedPinsRowBeforeEnumeration verifies that the first
+// event of a run (MailboxStarted) creates a pinned row with the address so the
+// header is alive during the long enumeration, before any BackfillEnumerated
+// (SPEC-0012 "The header is alive from the first moment of a run"). Without it
+// the header renders empty until enumeration completes — the "sync shows nothing"
+// bug.
+func TestSyncModel_MailboxStartedPinsRowBeforeEnumeration(t *testing.T) {
+	m := newSyncModel()
+	// Before any event the header is empty (no rows).
+	if strings.TrimSpace(m.View()) != "" {
+		t.Fatalf("view before any event = %q, want empty", m.View())
+	}
+
+	m = updateModel(m, mailboxStartedMsg{ev: syncengine.MailboxStarted{MailboxID: "mb-1", Address: "joe@proton.test"}})
+	mp := m.boxes["mb-1"]
+	if mp == nil || mp.phase != phaseStarting {
+		t.Fatalf("after started: %+v, want a row in phaseStarting", mp)
+	}
+	if view := m.View(); !strings.Contains(view, "joe@proton.test") {
+		t.Errorf("view after started missing address (empty header during enumeration): %q", view)
+	}
+}
+
 // TestSyncModel_BackfillAdvancesBar verifies MessageApplied moves the bar's
 // percent and View renders the bar with the mailbox line (SPEC-0012 "Backfill
 // has a denominator", "Bar visible during backfill").
@@ -146,7 +169,7 @@ type blockingProgram struct {
 }
 
 func (p *blockingProgram) Send(tea.Msg)           { <-p.release }
-func (p *blockingProgram) Println(...interface{}) {}
+func (p *blockingProgram) Println(...interface{}) { <-p.release }
 
 // TestProgressAdapter_FullBufferDropsInsteadOfBlocking verifies the adapter's
 // enqueue never blocks even when the program's Send is wedged and the buffer
@@ -198,7 +221,9 @@ func (p *capturingProgram) Println(args ...interface{}) {
 // (SPEC-0012 "Logs scroll below the pinned bar" — the delivery path).
 func TestSyncLogWriter_ForwardsCompleteLines(t *testing.T) {
 	prog := &capturingProgram{}
-	w := newSyncLogWriter(prog)
+	w := newSyncLogWriter(prog, make(chan struct{}))
+	var fallback bytes.Buffer
+	w.fallback = &fallback
 
 	_, _ = w.Write([]byte("line one\nline two\npart"))
 	prog.mu.Lock()
@@ -208,12 +233,56 @@ func TestSyncLogWriter_ForwardsCompleteLines(t *testing.T) {
 		t.Fatalf("forwarded lines = %v, want [line one, line two]", got)
 	}
 
-	// The partial "part" is buffered, not yet forwarded.
-	w.Flush()
+	// The partial "part" is buffered, not yet forwarded to the program.
 	prog.mu.Lock()
-	defer prog.mu.Unlock()
-	if len(prog.lines) != 3 || prog.lines[2] != "part" {
-		t.Errorf("after flush = %v, want trailing 'part' emitted", prog.lines)
+	nLines := len(prog.lines)
+	prog.mu.Unlock()
+	if nLines != 2 {
+		t.Fatalf("partial line forwarded early: %v", prog.lines)
+	}
+
+	// Flush emits the trailing partial to the fallback (the restored terminal),
+	// NOT via Println — the program has torn down by flush time.
+	w.Flush()
+	if got := strings.TrimSpace(fallback.String()); got != "part" {
+		t.Errorf("flush fallback = %q, want %q", got, "part")
+	}
+}
+
+// TestSyncLogWriter_DropsWhenDead proves a log line racing teardown never blocks
+// on the stopped program: once the run ctx is cancelled (interrupt) or Close has
+// run, Write drops rather than calling the forever-blocking Println (a torn-down
+// bubbletea program's Println is a bare send that never returns). A regression
+// guard for the ^C hang (SPEC-0012 "Interrupt restores the terminal").
+func TestSyncLogWriter_DropsWhenDead(t *testing.T) {
+	blocker := &blockingProgram{release: make(chan struct{})} // never released → Println blocks
+
+	// (a) Cancelled ctx: the writer must drop, not forward.
+	done := make(chan struct{})
+	close(done)
+	w := newSyncLogWriter(blocker, done)
+	assertReturns(t, "write after ctx cancel", func() {
+		_, _ = w.Write([]byte("late line after interrupt\n"))
+	})
+
+	// (b) Explicit Close on a live ctx: same drop.
+	w2 := newSyncLogWriter(blocker, make(chan struct{}))
+	w2.Close()
+	assertReturns(t, "write after Close", func() {
+		_, _ = w2.Write([]byte("late line after teardown\n"))
+	})
+}
+
+// assertReturns fails if fn does not return within a short deadline (i.e. it
+// deadlocked).
+func assertReturns(t *testing.T, what string, fn func()) {
+	t.Helper()
+	returned := make(chan struct{})
+	go func() { fn(); close(returned) }()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s: did not return (deadlocked)", what)
 	}
 }
 
@@ -225,11 +294,11 @@ func withGate(t *testing.T, tty bool, progHook func()) {
 	origTTY, origProg := isTerminal, newSyncProgram
 	t.Cleanup(func() { isTerminal, newSyncProgram = origTTY, origProg })
 	isTerminal = func() bool { return tty }
-	newSyncProgram = func(m tea.Model) *tea.Program {
+	newSyncProgram = func(ctx context.Context, m tea.Model) *tea.Program {
 		if progHook != nil {
 			progHook()
 		}
-		return origProg(m)
+		return origProg(ctx, m)
 	}
 }
 
@@ -283,11 +352,11 @@ func withHeadlessProgram(t *testing.T) {
 	origTTY, origProg := isTerminal, newSyncProgram
 	t.Cleanup(func() { isTerminal, newSyncProgram = origTTY, origProg })
 	isTerminal = func() bool { return true }
-	newSyncProgram = func(m tea.Model) *tea.Program {
+	newSyncProgram = func(ctx context.Context, m tea.Model) *tea.Program {
 		return tea.NewProgram(m,
 			tea.WithInput(bytes.NewReader(nil)),
 			tea.WithoutRenderer(),
-			tea.WithContext(context.Background()),
+			tea.WithContext(ctx),
 		)
 	}
 }

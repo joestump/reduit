@@ -204,6 +204,12 @@ func (e *Engine) runIsolated(ctx context.Context, m store.Mailbox) (summary RunS
 	summary.MailboxID = m.ID
 	summary.Address = m.Address
 
+	// Progress seam: announce the run before any enumeration/fetch so the pinned
+	// header shows an alive spinner immediately — the long first-sync enumeration
+	// otherwise leaves the header empty until BackfillEnumerated lands (SPEC-0012
+	// "The header is alive from the first moment of a run").
+	e.emitMailboxStarted(MailboxStarted{MailboxID: m.ID, Address: m.Address})
+
 	defer func() {
 		if p := recover(); p != nil {
 			e.log.Error("sync panicked; mailbox isolated",

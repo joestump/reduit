@@ -31,6 +31,14 @@ package syncengine
 // bounded concurrency) can be rendered per-mailbox without the events from
 // concurrent mailboxes being conflated (SPEC-0012 "Multi-mailbox progress").
 type ProgressReporter interface {
+	// MailboxStarted fires ONCE per mailbox, at the very start of its run —
+	// before enumeration, resume, or the first fetch. It gives the consumer a
+	// row to render immediately so the pinned header shows an alive "starting…"
+	// spinner during the long first-sync enumeration (which pages all message
+	// metadata and can take a while), rather than an empty header until the
+	// first BackfillEnumerated lands (SPEC-0012 "The header is alive from the
+	// first moment of a run").
+	MailboxStarted(ev MailboxStarted)
 	// BackfillEnumerated fires once per mailbox, after BackfillMessageIDs
 	// returns, carrying the message total that makes the backfill bar
 	// determinate (SPEC-0012 "Backfill has a denominator").
@@ -46,6 +54,14 @@ type ProgressReporter interface {
 	// MailboxDone fires once at the end of a mailbox's run, carrying the final
 	// summary (SPEC-0012 "Events carry the run's shape").
 	MailboxDone(ev MailboxDone)
+}
+
+// MailboxStarted reports that a mailbox's run has begun, before any enumeration
+// or fetch. It carries the address so the consumer can render a labelled row
+// with a spinner from the first instant of the run.
+type MailboxStarted struct {
+	MailboxID string
+	Address   string
 }
 
 // BackfillEnumerated reports the enumerated backfill total for a mailbox: the
@@ -82,6 +98,12 @@ type MailboxDone struct {
 // reportBackfillEnumerated and the emit* helpers below are the engine's guarded
 // emit points: each is a no-op when the reporter is nil, so the engine's sync
 // paths call them unconditionally without a nil check at every call site.
+func (e *Engine) emitMailboxStarted(ev MailboxStarted) {
+	if e.progress != nil {
+		e.progress.MailboxStarted(ev)
+	}
+}
+
 func (e *Engine) emitBackfillEnumerated(ev BackfillEnumerated) {
 	if e.progress != nil {
 		e.progress.BackfillEnumerated(ev)

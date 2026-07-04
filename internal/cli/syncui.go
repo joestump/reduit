@@ -73,6 +73,7 @@ func (mp mailboxProgress) percent() float64 {
 // these and Sends them into the program. They are plain values (no pointers to
 // shared state) so the hand-off is race-free.
 
+type mailboxStartedMsg struct{ ev syncengine.MailboxStarted }
 type backfillEnumeratedMsg struct{ ev syncengine.BackfillEnumerated }
 type messageAppliedMsg struct{ ev syncengine.MessageApplied }
 type tailBatchAppliedMsg struct{ ev syncengine.TailBatchApplied }
@@ -136,6 +137,15 @@ func (m syncModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		// Leave room for the percent + padding; the bar clamps its own width.
 		m.bar.Width = clampWidth(msg.Width - 4)
+		return m, nil
+
+	case mailboxStartedMsg:
+		// First event of a run: create the row so the header shows an alive
+		// "starting…" spinner during the long enumeration, before any total is
+		// known (SPEC-0012 "The header is alive from the first moment of a run").
+		mp := m.box(msg.ev.MailboxID)
+		mp.address = msg.ev.Address
+		mp.phase = phaseStarting
 		return m, nil
 
 	case backfillEnumeratedMsg:

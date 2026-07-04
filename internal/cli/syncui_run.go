@@ -51,8 +51,15 @@ var isTerminal = func() bool {
 // package var so tests can (a) assert the plain path NEVER constructs a program
 // and (b) substitute a fake. Output goes to stderr so stdout stays clean for the
 // summary table and any piped consumer.
-var newSyncProgram = func(m tea.Model) *tea.Program {
-	return tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithContext(context.Background()))
+//
+// The program is bound to the RUN's cancellable ctx (not context.Background):
+// tea.Program.Send/Println select on p.ctx.Done(), so once a SIGINT cancels ctx
+// the engine goroutine's post-cancel log lines and progress events drop instead
+// of blocking on the drained msgs channel after Run() has returned. Binding to
+// context.Background() deadlocked teardown — <-runErrCh waited on a goroutine
+// wedged inside a blocked Send (SPEC-0012 "Interrupt restores the terminal").
+var newSyncProgram = func(ctx context.Context, m tea.Model) *tea.Program {
+	return tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithContext(ctx))
 }
 
 // runSyncGated applies the TTY gate once and dispatches to the plain or TUI
@@ -91,13 +98,26 @@ func runSyncTUI(
 	opts syncOptions,
 	out io.Writer,
 ) error {
-	prog := newSyncProgram(newSyncModel())
+	// Bind the program to a child of the run's ctx we cancel at teardown. Two
+	// distinct wedges are closed by this: (1) an interrupt cancels the parent ctx,
+	// which cancels progCtx, so the program quits and any progressAdapter Send
+	// blocked on the stopped event loop unblocks via p.ctx.Done(); (2) on a NORMAL
+	// finish the parent ctx is still live, so we cancelProg() explicitly after Run
+	// returns to release a pump Send that raced the model's quit. Without this the
+	// pump goroutine wedges in Send and adapter.Close()'s wg.Wait() hangs — the ^C
+	// hang (SPEC-0012 "Interrupt restores the terminal").
+	progCtx, cancelProg := context.WithCancel(ctx)
+	defer cancelProg()
+
+	prog := newSyncProgram(progCtx, newSyncModel())
 
 	// The engine's logs and progress both flow into the program. Build the log
 	// writer BEFORE the engine starts so no record escapes to bare stderr and
 	// tears the bar (design.md "construct the logger writer BEFORE the engine
-	// starts").
-	logWriter := newSyncLogWriter(prog)
+	// starts"). The writer drops once the parent ctx is cancelled: bubbletea's
+	// Println is a bare channel send with no ctx guard, so a post-teardown log
+	// line would block forever otherwise.
+	logWriter := newSyncLogWriter(prog, ctx.Done())
 	tuiLogger := buildLoggerTo(logWriter, loggerCfg)
 	adapter := newProgressAdapter(prog)
 	eng := build(tuiLogger, adapter)
@@ -123,10 +143,19 @@ func runSyncTUI(
 	// error/summary").
 	_, _ = prog.Run()
 
-	// Teardown order: stop the adapter pump (no leaked worker), flush any partial
-	// log line, THEN surface the summary and the run's exit code.
-	runErr := <-runErrCh
+	// Teardown order is load-bearing:
+	//  1. cancelProg() — the event loop has stopped draining p.msgs; cancelling
+	//     progCtx unblocks any adapter Send wedged on it (Send selects on
+	//     p.ctx.Done()), so the pump can exit.
+	//  2. logWriter.Close() — stop forwarding log lines to the stopped program
+	//     (Println has no ctx guard and would block).
+	//  3. adapter.Close() — join the pump goroutine (now guaranteed to exit).
+	//  4. drain runErrCh, flush a trailing partial log line to stderr, print the
+	//     buffered summary, and return the run's authoritative error.
+	cancelProg()
+	logWriter.Close()
 	adapter.Close()
+	runErr := <-runErrCh
 	logWriter.Flush()
 	_, _ = io.Copy(out, &summaryBuf)
 	return runErr

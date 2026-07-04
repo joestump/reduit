@@ -55,10 +55,17 @@ func TestEngine_NoTUIImports(t *testing.T) {
 // concurrent emits a SyncAll fan-out produces.
 type recordingReporter struct {
 	mu        sync.Mutex
+	started   []MailboxStarted
 	enumerate []BackfillEnumerated
 	applied   []MessageApplied
 	tail      []TailBatchApplied
 	done      []MailboxDone
+}
+
+func (r *recordingReporter) MailboxStarted(ev MailboxStarted) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.started = append(r.started, ev)
 }
 
 func (r *recordingReporter) BackfillEnumerated(ev BackfillEnumerated) {
@@ -114,6 +121,11 @@ func TestProgress_Backfill_EmitsEnumeratedAndApplied(t *testing.T) {
 		t.Fatalf("SyncMailbox: %v", err)
 	}
 
+	// MailboxStarted fires exactly once, at the start of the run, so the header
+	// has a labelled row before enumeration completes.
+	if len(rec.started) != 1 || rec.started[0].MailboxID != "mb-1" || rec.started[0].Address != "joe@proton.test" {
+		t.Fatalf("started = %+v, want one event mailbox=mb-1 address=joe@proton.test", rec.started)
+	}
 	if len(rec.enumerate) != 1 || rec.enumerate[0].Total != 3 || rec.enumerate[0].MailboxID != "mb-1" {
 		t.Fatalf("enumerate = %+v, want one event total=3 mailbox=mb-1", rec.enumerate)
 	}
@@ -174,6 +186,11 @@ func TestProgress_Tail_EmitsTailBatch(t *testing.T) {
 		t.Fatalf("SyncMailbox: %v", err)
 	}
 
+	// MailboxStarted fires for a tail run too, so the header is alive before the
+	// first batch even when there is no backfill.
+	if len(rec.started) != 1 || rec.started[0].MailboxID != "mb-1" {
+		t.Fatalf("started = %+v, want one event mailbox=mb-1", rec.started)
+	}
 	if len(rec.enumerate) != 0 || len(rec.applied) != 0 {
 		t.Errorf("tail run emitted backfill events: enumerate=%d applied=%d", len(rec.enumerate), len(rec.applied))
 	}
