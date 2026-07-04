@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -24,6 +25,26 @@ func openStore(cfg config.Config) (*store.Store, error) {
 	st, err := store.Open(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
+	}
+	return st, nil
+}
+
+// openMigratedStore opens the store and brings it to HEAD before returning it,
+// so a command that queries the cache on a brand-new install sees a migrated
+// schema instead of a "no such table" error. It mirrors the tui/sync/mcp
+// bootstrap and is what the auth commands use — `auth add` is the very first
+// onboarding command, run against a fresh data_dir that no migration has touched
+// yet. goose's migration output is routed through reduit's logger onto stderr
+// (ADR-0022). On a migrate failure the store is closed so the caller need not.
+func openMigratedStore(cfg config.Config, logger *slog.Logger) (*store.Store, error) {
+	st, err := openStore(cfg)
+	if err != nil {
+		return nil, err
+	}
+	st.SetLogger(logger)
+	if err := st.Migrate(""); err != nil {
+		st.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return st, nil
 }

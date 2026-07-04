@@ -111,7 +111,7 @@ func newAuthAddCmd(cfgPath *string, verbose *bool) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			st, err := openStore(cfg)
+			st, err := openMigratedStore(cfg, logger)
 			if err != nil {
 				return err
 			}
@@ -325,11 +325,11 @@ func newAuthListCmd(cfgPath *string, verbose *bool) *cobra.Command {
 		Short: "List configured mailboxes",
 		Long:  "Print all Proton mailbox addresses that have been added to Reduit.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, _, err := loadConfigUnchecked(cfgPath, verbose)
+			cfg, logger, err := loadConfigUnchecked(cfgPath, verbose)
 			if err != nil {
 				return err
 			}
-			st, err := openStore(cfg)
+			st, err := openMigratedStore(cfg, logger)
 			if err != nil {
 				return err
 			}
@@ -373,11 +373,11 @@ func newAuthRemoveCmd(cfgPath *string, verbose *bool) *cobra.Command {
 		Long:  "Deregister a Proton mailbox and delete its credentials from the OS keychain.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, _, err := loadConfigUnchecked(cfgPath, verbose)
+			cfg, logger, err := loadConfigUnchecked(cfgPath, verbose)
 			if err != nil {
 				return err
 			}
-			st, err := openStore(cfg)
+			st, err := openMigratedStore(cfg, logger)
 			if err != nil {
 				return err
 			}
@@ -419,7 +419,7 @@ func newAuthRefreshCmd(cfgPath *string, verbose *bool) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			st, err := openStore(cfg)
+			st, err := openMigratedStore(cfg, logger)
 			if err != nil {
 				return err
 			}

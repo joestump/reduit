@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/zalando/go-keyring"
 
+	"github.com/joestump/reduit/internal/config"
 	"github.com/joestump/reduit/internal/keychain"
 	"github.com/joestump/reduit/internal/proton"
 	"github.com/joestump/reduit/internal/store"
@@ -149,6 +152,56 @@ func TestAuthAdd_HappyPath(t *testing.T) {
 		if strings.Contains(out.String(), secret) {
 			t.Errorf("secret %q leaked to output: %q", secret, out.String())
 		}
+	}
+}
+
+// TestAuthAdd_FreshDataDirMigrates guards the onboarding path: `auth add` is the
+// first command run on a brand-new install, against a data_dir no migration has
+// touched. The command wiring must bring the store to HEAD before querying, or
+// authAdd's duplicate check hits "no such table: mailboxes". The other auth tests
+// use a pre-migrated newTestStore and so cannot catch this — here we open the
+// store exactly as the command does (openMigratedStore over an EMPTY data_dir)
+// and assert the add reaches success rather than a missing-table error.
+func TestAuthAdd_FreshDataDirMigrates(t *testing.T) {
+	ctx := context.Background()
+
+	cfg := config.Config{DataDir: t.TempDir()}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// Sanity: an UNMIGRATED store (what the buggy wiring used) fails the very
+	// first query, proving the migration is what makes onboarding work.
+	unmigrated, err := openStore(cfg)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	_, err = unmigrated.GetMailboxByAddress(ctx, "joe@proton.test")
+	if err == nil || !strings.Contains(err.Error(), "no such table") {
+		t.Fatalf("expected missing-table error on unmigrated store, got %v", err)
+	}
+	_ = unmigrated.Close()
+
+	// The real bootstrap: openMigratedStore mirrors tui/sync/mcp and is what the
+	// auth commands now use. authAdd must succeed against it.
+	st, err := openMigratedStore(cfg, logger)
+	if err != nil {
+		t.Fatalf("openMigratedStore: %v", err)
+	}
+	defer st.Close()
+
+	ks := newTestKeychain(t)
+	fake := proton.NewFake()
+	fake.UserID = "proton-user-fresh"
+	fake.Token = "rt-fresh"
+	fake.UID = "uid-fresh"
+	dialer := &fakeDialer{client: fake}
+	p := &scriptPrompter{secrets: []string{"pw", "pass"}}
+
+	if err := authAdd(ctx, st, ks, dialer, p, "joe@proton.test", &bytes.Buffer{}); err != nil {
+		t.Fatalf("authAdd on freshly-migrated store: %v", err)
+	}
+	m, err := st.GetMailboxByAddress(ctx, "joe@proton.test")
+	if err != nil || m.State != store.MailboxStateActive {
+		t.Fatalf("mailbox not active after add: state=%q err=%v", m.State, err)
 	}
 }
 
