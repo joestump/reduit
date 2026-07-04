@@ -139,8 +139,16 @@ func Open(path string) (*Store, error) {
 	return &Store{DB: db, writer: writer, path: abs, logger: slog.New(slog.DiscardHandler)}, nil
 }
 
-// Path returns the absolute path the database is open against.
-func (s *Store) Path() string { return s.path }
+// Path returns the absolute path the database is open against. A nil receiver
+// returns "" rather than panicking, matching the nil-guard degradation of the
+// other read methods (Stats/MailboxStats/SchemaVersion/LatestSyncRun) so a
+// caller holding a not-open Store degrades uniformly.
+func (s *Store) Path() string {
+	if s == nil {
+		return ""
+	}
+	return s.path
+}
 
 // SetLogger sets the structured logger used for store-level diagnostics,
 // most notably the goose migration output routed through Migrate. Commands

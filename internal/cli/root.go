@@ -52,6 +52,7 @@ per-person, local-first tool that runs entirely on your machine.`,
 	root.AddCommand(newFactsCmd(&cfgPath, &verbose))
 	root.AddCommand(newSendCmd(&cfgPath, &verbose))
 	root.AddCommand(newMCPCmd(&cfgPath, &verbose))
+	root.AddCommand(newTUICmd(&cfgPath, &verbose))
 	root.AddCommand(newServeCmd(&cfgPath, &verbose))
 	root.AddCommand(newDenylistCmd(&cfgPath, &verbose))
 	root.AddCommand(newContactsCmd(&cfgPath, &verbose))
