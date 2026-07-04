@@ -7,9 +7,9 @@ falling back to the one beneath it. The bottom layer — FTS5 keyword
 search — has no dependencies beyond the SQLite file and always works.
 The middle layer — vector semantic search — needs vectors and a query
 embedding. The top layer — `search_messages` — fuses the two with
-reciprocal-rank fusion. MCP (ADR-0017) and the loopback UI (ADR-0005)
-both call the *same* `store` methods, so there is one implementation and
-no surface drift.
+reciprocal-rank fusion. MCP (ADR-0017) and the local TUI (ADR-0025) both
+call the *same* `store` methods, so there is one implementation and no
+surface drift.
 
 The store reads `messages_fts` (an FTS5 external-content index kept
 current by triggers, ADR-0006) and `embeddings` (BLOB vectors keyed by
@@ -32,7 +32,7 @@ flowchart TD
     KWONLY --> OUT[ranked, cited results]
     RRF --> OUT
 
-    subgraph store [one store API: MCP + UI share it]
+    subgraph store [one store API: MCP + TUI share it]
         KW
         COS
         RRF
@@ -144,7 +144,7 @@ the same code path degrades to keyword-only without a special case.
 
 Every returned result carries `message_id`, stable `hash`, `mailbox`,
 `conversation`/`sender`, `source`, and `timestamp` (ADR-0017), so an
-agent cites exactly and a human can open the message in the UI.
+agent cites exactly and a human can open the message in the TUI.
 
 ## Snippet safety
 
@@ -216,7 +216,7 @@ additive. No cell errors.
   brute-force cosine default, optional `sqlite-vec`, batched `reduit
   embed`.
 - ADR-0017 (stdio MCP & hybrid RAG) — `search_messages` hybrid + RRF +
-  citation-faithful provenance; one store shared with the UI.
+  citation-faithful provenance; one store shared with the TUI.
 - ADR-0018 (single LLM egress & denylist) — query/content embedding
   through `internal/llm`; local default; per-thread denylist.
 - ADR-0006 (SQLite store) — FTS5 external-content + triggers;

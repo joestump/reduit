@@ -34,13 +34,13 @@ routes through the single egress (ADR-0018), obeys the
 per-conversation/sender denylist, and runs locally by default; with no
 endpoint it fails cleanly and the rest of Reduit is unaffected. Facts
 are read back through one store method, consumed identically by the MCP
-tool surface (SPEC-0006) and the loopback UI contact view (SPEC-0005).
+tool surface (SPEC-0006) and the TUI contact-facts view (SPEC-0005).
 
 Governing: ADR-0019 (sender/contact facts extraction), ADR-0018 (LLM
 single-egress posture + denylist), ADR-0006 (SQLite store; contacts,
 contact_identifiers, contact_facts, fact_state), ADR-0014 (sync-and-
 cache; stable-hash provenance), SPEC-0002 (sync materializes
-`contacts` / `contact_identifiers`), SPEC-0005 (loopback UI), SPEC-0006
+`contacts` / `contact_identifiers`), SPEC-0005 (local TUI), SPEC-0006
 (MCP tool surface).
 
 ## Requirements
@@ -261,11 +261,11 @@ the device.
 - **WHEN** the text model role is configured to the local default
 - **THEN** no message content SHALL leave the device during extraction
 
-### Requirement: Surfacing via MCP and the UI Contact View
+### Requirement: Surfacing via MCP and the TUI Contact View
 
 Stored facts SHALL be retrievable through an MCP tool (SPEC-0006), each
-fact carrying its citation, and SHALL be shown in the loopback UI
-contact view (SPEC-0005). Both surfaces SHALL read facts through the
+fact carrying its citation, and SHALL be shown in the local TUI's
+contact-facts view (SPEC-0005). Both surfaces SHALL read facts through the
 **same store method**, so the two views cannot drift.
 
 #### Scenario: MCP tool returns facts with citations
@@ -275,23 +275,23 @@ contact view (SPEC-0005). Both surfaces SHALL read facts through the
   `source_message_hash` (and resolvable source reference) so the caller
   can cite where a fact came from
 
-#### Scenario: UI contact view shows the same facts
+#### Scenario: TUI contact view shows the same facts
 
-- **WHEN** the operator opens a contact in the loopback UI
-- **THEN** the contact view SHALL display that contact's facts with
+- **WHEN** the operator opens a contact in the TUI
+- **THEN** the contact-facts view SHALL display that contact's facts with
   links to their source messages
 
 #### Scenario: One store method, no drift
 
-- **WHEN** facts are read for either the MCP tool or the UI
-- **THEN** both SHALL call the same store read method, so the MCP and UI
+- **WHEN** facts are read for either the MCP tool or the TUI
+- **THEN** both SHALL call the same store read method, so the MCP and TUI
   surfaces always present the same fact set for a contact
 
 ### Requirement: Graceful Absence of an LLM Endpoint
 
 With no reachable LLM endpoint, `reduit facts` SHALL fail cleanly with a
 clear message and SHALL NOT corrupt or delete existing facts. Already
-extracted facts SHALL remain readable via the MCP tool and the UI, and
+extracted facts SHALL remain readable via the MCP tool and the TUI, and
 the rest of Reduit (browsing, keyword search) SHALL be unaffected.
 
 #### Scenario: Facts command fails cleanly with no endpoint
@@ -305,7 +305,7 @@ the rest of Reduit (browsing, keyword search) SHALL be unaffected.
 
 - **WHEN** no endpoint is configured or reachable but prior facts exist
 - **THEN** those facts SHALL remain retrievable via the MCP tool and the
-  UI contact view, and browsing and keyword search SHALL keep working
+  TUI contact view, and browsing and keyword search SHALL keep working
 
 ## Out of Scope
 

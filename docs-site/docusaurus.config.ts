@@ -6,7 +6,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 // CONFIGURE THESE VALUES FOR YOUR PROJECT
 // ============================================================
 const PROJECT_TITLE = 'Reduit';
-const PROJECT_TAGLINE = 'A sovereign, multi-user Proton Mail relay — use Proton from any IMAP/SMTP client, Apple Mail, and Claude Code';
+const PROJECT_TAGLINE = 'A sovereign, single-user, local-first Proton Mail tool — Bubble Tea TUI + stdio MCP. Docs are being rebuilt.';
 const GITHUB_URL = 'https://gitea.stump.rocks/joestump/reduit';
 const SITE_URL = 'https://joestump.pages.stump.rocks';
 const BASE_URL = '/reduit/';
@@ -82,12 +82,6 @@ const config: Config = {
         },
         {
           type: 'docSidebar',
-          sidebarId: 'guidesSidebar',
-          position: 'left',
-          label: '📖 Guides',
-        },
-        {
-          type: 'docSidebar',
           sidebarId: 'specsSidebar',
           position: 'left',
           label: '📐 Specifications',
@@ -108,15 +102,6 @@ const config: Config = {
     footer: {
       style: 'dark',
       links: [
-        {
-          title: 'Guides',
-          items: [
-            { label: 'Getting Started', to: '/guides/getting-started' },
-            { label: 'Configuration', to: '/guides/configuration' },
-            { label: 'Apple Mail', to: '/guides/apple-mail' },
-            { label: 'Claude Code (MCP)', to: '/guides/claude-code' },
-          ],
-        },
         {
           title: 'Architecture',
           items: [

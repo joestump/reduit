@@ -37,7 +37,7 @@ flowchart TD
     H --> I["advance fact_state<br/>(last_message_hash, model)"]
     I --> J["store read method"]
     J --> K["MCP tool (SPEC-0006)"]
-    J --> L["UI contact view (SPEC-0005)"]
+    J --> L["TUI contact view (SPEC-0005)"]
 ```
 
 `contact_facts` and `fact_state` key off **stable content hashes**, with
@@ -127,13 +127,13 @@ Extraction is an LLM feature and inherits ADR-0018 in full:
 
 ## Surfacing — one read path
 
-Both the MCP tool (SPEC-0006) and the UI contact view (SPEC-0005) read
+Both the MCP tool (SPEC-0006) and the TUI contact view (SPEC-0005) read
 facts through a **single store method** (e.g. `FactsForContact`). That
 method returns each fact with its `source_message_hash` and a resolvable
-source reference. Because both surfaces share it, the MCP and UI views
+source reference. Because both surfaces share it, the MCP and TUI views
 cannot present different fact sets for the same contact. The MCP tool
 exposes the citation so an agent can answer "where did I get this"; the
-UI renders the fact with a jump-to-source link when the message is
+TUI renders the fact with a jump-to-source link when the message is
 cached, and plainly (no link) when it is not.
 
 ## Rationale
@@ -156,7 +156,7 @@ cached, and plainly (no link) when it is not.
   constraint lets a model upgrade improve the fact set without a
   destructive reset, while still letting old and new facts coexist
   cleanly.
-- **One read method.** Sharing the store read between MCP and UI is the
+- **One read method.** Sharing the store read between MCP and TUI is the
   cheapest possible guarantee that the two surfaces never drift.
 
 ## Edge cases
@@ -195,5 +195,5 @@ cached, and plainly (no link) when it is not.
   mirrors for email correspondents.
 - SPEC-0001 (mailbox model) — contact-level identity reconciliation is
   manual.
-- SPEC-0005 (loopback UI) — contact view surface.
+- SPEC-0005 (local TUI) — contact-facts view surface.
 - SPEC-0006 (MCP tool surface) — facts tool with citations.

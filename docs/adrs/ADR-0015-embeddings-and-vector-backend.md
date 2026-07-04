@@ -51,7 +51,7 @@ in `msgbrowse` (its ADR-0002).
   fast enough and needs zero extra infrastructure.
 - **Optional: `sqlite-vec`.** A future accelerator behind a build/config flag for
   operators with very large corpora. It changes only the store's vector
-  read/write path; the search API, MCP tools (ADR-0017), and UI are unaffected.
+  read/write path; the search API, MCP tools (ADR-0017), and TUI are unaffected.
 - **Keying by stable hash, multi-model.** `PRIMARY KEY (hash, model)` and **no FK
   to messages** — vectors are keyed by content hash so re-sync (ADR-0014) never
   wipes them, and multiple embedding models can coexist for A/B or migration.

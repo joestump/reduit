@@ -44,9 +44,13 @@ type Config struct {
 	// Logger configures the structured logger.
 	Logger LoggerConfig `mapstructure:"logger"`
 
-	// UI configures the optional local browse UI.
+	// UI holds the listen address for the reserved-for-future `serve` stub.
+	// The web UI is retired (ADR-0025); the field survives because ADR-0025
+	// keeps `serve` as a stub for possible MCP-over-HTTP or media-companion
+	// use. The name stays for now to avoid churning the config schema before
+	// serve's real shape is decided.
 	//
-	// Governing: ADR-0005 (loopback HTMX UI).
+	// Governing: ADR-0025 (TUI is the human surface; `serve` is not a UI).
 	UI UIConfig `mapstructure:"ui"`
 }
 
@@ -150,13 +154,17 @@ type LoggerConfig struct {
 	Format string `mapstructure:"format"`
 }
 
-// UIConfig configures the optional local browse UI.
+// UIConfig configures the reserved-for-future `serve` stub. The web UI it
+// originally described was retired by ADR-0025; the field remains so the
+// serve stub has a listen address if it ever ships (MCP-over-HTTP or a
+// loopback media-companion endpoint).
 type UIConfig struct {
-	// ListenAddr is the address the local browse UI listens on.
-	// Defaults to 127.0.0.1:8787. Non-loopback binds are allowed
-	// but log a loud warning (no auth is shipped).
+	// ListenAddr is the address the reserved `serve` stub would listen on
+	// if it ever ships. Defaults to 127.0.0.1:8787. Non-loopback binds are
+	// allowed but log a loud warning (no auth is shipped).
 	//
-	// Governing: ADR-0005, ADR-0012 (no auth, loopback default).
+	// Governing: ADR-0025 (serve is not a UI), ADR-0012 (loopback default,
+	// no auth).
 	ListenAddr string `mapstructure:"listen_addr"`
 }
 

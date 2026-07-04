@@ -16,7 +16,7 @@ single-user local pivot: there is no HTTPS listener, no OIDC, no account record.
 
 Two things need deciding: the transport/SDK, and how the retrieval tools shape
 results so agent answers are citation-faithful. This mirrors `msgbrowse`'s
-ADR-0004.
+stdio-MCP posture.
 
 ## Decision Drivers
 
@@ -25,7 +25,7 @@ ADR-0004.
   stdio — no network listener, no token to manage.
 - **Citation-faithful.** Every retrieved passage must carry exact provenance so
   answers can cite precisely and a human can jump to the source.
-- **No drift between surfaces.** MCP and the loopback UI (ADR-0005) must share the
+- **No drift between surfaces.** MCP and the local TUI (ADR-0025) must share the
   same store methods so keyword/semantic/media behavior cannot diverge.
 - **Multi-mailbox.** Tools operate across (or filter to) the user's N mailboxes
   (ADR-0012).
@@ -37,8 +37,8 @@ ADR-0004.
 1. **stdio MCP via the official `github.com/modelcontextprotocol/go-sdk`.** Typed
    `AddTool[In, Out]` with inferred JSON Schema; stdio transport launched by the
    client; optional loopback streamable-HTTP for special cases.
-2. **Keep HTTP+SSE + OIDC (ADR-0008).** Rejected — depends on the deleted network
-   listener and IdP; wrong trust model for a local tool.
+2. **Keep HTTP+SSE + OIDC** (the ADR-0008 shape). Rejected — depends on the
+   deleted network listener and IdP; wrong trust model for a local tool.
 3. **`mark3labs/mcp-go`.** A viable third-party SDK, but the official SDK is the
    spec-tracking, canonical choice (matching `msgbrowse`).
 
@@ -61,8 +61,8 @@ ADR-0004.
   **degrades to keyword-only** rather than failing. Every result carries
   `message_id`, stable `hash`, `mailbox`, `conversation/sender`, `source`, and
   `timestamp`, so the model cites exactly and the human can open the message in the
-  UI.
-- **Thin adapter over the store.** Tools call the same `store` methods the UI uses
+  TUI.
+- **Thin adapter over the store.** Tools call the same `store` methods the TUI uses
   (search, transcript/context, list attachments/links, fetch attachment text,
   contact facts). Retrieval, attachment, and facts tools surface the work of
   ADR-0014/0015/0016/0019 with provenance.

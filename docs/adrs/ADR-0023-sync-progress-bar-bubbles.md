@@ -1,6 +1,6 @@
 # ADR-0023: Sync progress bar via charmbracelet/bubbles (pinned bar, scrolling logs)
 
-- **Status:** proposed
+- **Status:** accepted (shipped 2026-07-03)
 - **Date:** 2026-07-03
 - **Deciders:** Joe Stump
 

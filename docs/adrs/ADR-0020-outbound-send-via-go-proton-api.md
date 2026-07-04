@@ -8,8 +8,8 @@
 
 Reduit must be able to **send** mail, not only read and search it (a confirmed
 requirement). Dropping the relay (ADR-0012) removed the `emersion/go-smtp`
-submission server (ADR-0007), so the question is how outbound mail leaves Reduit
-now. Reduit is otherwise local-first and reads/syncs from Proton (ADR-0014); send
+submission server the earlier design used, so the question is how outbound mail
+leaves Reduit now. Reduit is otherwise local-first and reads/syncs from Proton (ADR-0014); send
 is the one place it **writes** to Proton, which makes it the sharpest capability
 to get right — it mutates the user's real mailbox and, exposed via MCP (ADR-0017),
 hands an agent a write path.

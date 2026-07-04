@@ -4,20 +4,27 @@ A sovereign, **single-user, local-first** tool for Proton Mail. A
 per-person Go CLI that authenticates to Proton, incrementally **caches**
 mail into a local SQLite store, embeds messages and attachments locally,
 and serves semantic/hybrid **search + RAG over a stdio MCP** (primary), a
-local send path, and an optional loopback browse UI. Nothing is
-network-exposed; secrets live in the OS keychain. The model is
-"msgbrowse for Proton Mail" (see `~/src/msgbrowse`).
+local send path, and a **Bubble Tea TUI** (`reduit tui`) for human
+browsing. Nothing is network-exposed; secrets live in the OS keychain.
+The model is "msgbrowse for Proton Mail" (see `~/src/msgbrowse`).
 
 Reduit is **not** an IMAP/SMTP relay — for a standard mail client, run
 [Proton Bridge](https://proton.me/mail/bridge) alongside it.
 
 ## Status
 
-Pre-alpha, **mid-refactor**. As of 2026-06-29 the project pivoted from a
-multi-user OIDC relay to the single-user local-first design above; see
-[docs/design/refactor-to-local.md](docs/design/refactor-to-local.md) and
-ADR-0012. The ADRs and specs reflect the new design; the code is being
-brought in line. No functional release yet.
+Pre-alpha, **mid-refactor**. Two pivots have landed:
+
+- **2026-06-29** — from a multi-user OIDC relay to the single-user
+  local-first design above (ADR-0012).
+- **2026-07-03** — the human surface pivoted from an HTMX web UI to a
+  Bubble Tea TUI in a mutt-inspired design language (ADR-0025, SPEC-0005).
+
+The 2026-07-04 artifact reset deleted the relay-era ADRs
+(0002/0004/0005/0007/0009/0010/0011) outright rather than keeping them as
+history — nothing in production references them, and pre-alpha grants that
+latitude. ADRs 0022/0023/0025 are `accepted`. Code is being brought in
+line; no functional release yet.
 
 ## Stack
 
@@ -29,8 +36,8 @@ brought in line. No functional release yet.
 - **LLM access:** one OpenAI-compatible client (sole egress), local default via LiteLLM → Ollama; two model roles (text/embedding + multimodal) (ADR-0018)
 - **MCP:** [`github.com/modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk) over **stdio** (ADR-0017)
 - **CLI:** Cobra + Viper
-- **Frontend:** HTMX + Tailwind CSS + DaisyUI + Hero Icons, loopback-only, no auth (ADR-0005); SSE only where a screen needs it
-- **Logging:** `log/slog` (stderr for the MCP server)
+- **TUI:** [`charmbracelet/bubbletea`](https://github.com/charmbracelet/bubbletea) + [`bubbles`](https://github.com/charmbracelet/bubbles) + [`lipgloss`](https://github.com/charmbracelet/lipgloss), full-screen mutt-inspired design language (ADR-0025, SPEC-0005). No HTTP UI, no HTML, no CSP.
+- **Logging:** `log/slog` behind [`charmbracelet/log`](https://github.com/charmbracelet/log) as the handler (ADR-0022); stderr only
 - **Build:** Make + multi-stage Dockerfile (Docker optional; primary distribution is `go install`)
 
 ## Conventions
@@ -52,7 +59,7 @@ brought in line. No functional release yet.
 - Proton Drive
 - Proton Calendar (full surface — basic event read may come later)
 - Bridge-style GUI
-- In-process TLS / ACME — there is no public listener; the optional UI binds to loopback (ADR-0005/0012).
+- **Any HTTP listener.** The human surface is the Bubble Tea TUI (ADR-0025); there is no web UI, no HTTP server for the UI, no CSP, no TLS. `reduit serve` remains a non-UI stub reserved for possible future MCP-over-HTTP or a loopback media companion.
 
 ## Deployment context
 
@@ -63,22 +70,20 @@ brought in line. No functional release yet.
 
 ## Visual Identity
 
-Used by the `gemini-mockup` skill and any future UI work.
+The canonical style reference is [`docs/openspec/specs/local-ui/design.md`](docs/openspec/specs/local-ui/design.md) (the "Bubbletea TUI Design System" section). This section is a short summary; when the two disagree, `design.md` wins.
 
-- **Mode:** Dark mode is the canonical surface. Light mode MAY be supported later via DaisyUI's theme system, but every mockup and design artifact starts dark.
-- **Palette:**
-  - **Primary:** deep indigo. Anchor around `#4F46E5` (Tailwind `indigo-600`); buttons and active states sit here.
-  - **Surfaces:** slate greys. Page background is near-black slate (`#0F172A` / `slate-900`); cards sit on `#1E293B` (`slate-800`); borders / dividers `#334155` (`slate-700`).
-  - **Foreground:** soft off-white (`#E2E8F0` / `slate-200`) for primary text; dim (`#94A3B8` / `slate-400`) for secondary; subtle (`#64748B` / `slate-500`) for tertiary metadata.
-  - **Accent:** single warm tone — a desaturated amber/copper (`#F59E0B` / `amber-500` or a slightly toned-down variant). Reserved for important state callouts (live sync, alerts, the singular call-to-action). Not a second primary.
-  - **Status colors:** muted, dark-mode-friendly: green `#10B981` (success), rose `#F43F5E` (error), sky `#0EA5E9` (info). Never neon.
-- **Typography:** [Inter](https://rsms.me/inter/) at multiple weights (400 regular for body, 500 medium for labels, 600 semibold for headings). Tabular figures for numerics. Fall back to system geometric sans if Inter is unavailable.
-- **Component framework:** DaisyUI 5 on Tailwind 4. Use DaisyUI components (`btn`, `card`, `modal`, `alert`, `table`, `badge`, `tabs`) as the base; project-specific overrides via Tailwind utilities only when DaisyUI's variants don't cover the case.
-- **Iconography:** [Heroicons](https://heroicons.com/) outlined variants at 24×24, 1.5px stroke. Solid variants only for active/selected states. Inlined as SVG via Go template helpers — never icon fonts, never CDN.
-- **Motif:** subtle alpine / Swiss-fortress. The login screen and empty states MAY use a faint mountain-silhouette band at the bottom or as a soft background gradient. Restraint over decoration — no skeumorphic textures, no grain overlays, no animated gradients. The metaphor is fortified clarity, not visual noise.
-- **Whitespace:** generous. Cards have ≥24px internal padding. Sections separated by ≥32px. The default density is "comfortable", not "compact" — Reduit is family-grade software, not a Bloomberg terminal.
-- **Browser-chrome URL pattern (for mockups):** `https://reduit.<host>/<route>` where `<host>` is the operator's chosen domain (e.g., `reduit.family.tld`, `reduit.stump.rocks`). Default in mockups: `reduit.family.tld` so the multi-user-family use case is visible at a glance.
-- **Sample data conventions in mockups:** family-style names (Joe, Hannah, Maya, Sage), realistic email subjects (school logistics, receipts, sports schedules), recent timestamps, mixed read/unread states. Not corporate-feeling sample data.
+- **Surface:** a full-screen Bubble Tea TUI. There is no web UI, no HTML, no browser mockup surface.
+- **Aesthetic:** cutesy-cyberpunk / Tron — kawaii meets anime, imagined as a homage to `mutt` built by a genius 13-year-old Japanese gamer/coder girl. Neon phosphor on a blue-black void, playful lowercase voice, dense keyboard-first interaction that stays *alive* rather than austere.
+- **Palette:** void/surfaces `#08080F → #1E1E38`; brand Charm purple `#7D56F4` + hot pink `#FF5FA2`; Tron accents cyan `#4EE6FF` + mint `#00F0A8`; phosphor text `#F4F4FF` fading to dim indigo-grey; gold/coral for warn/danger. **No CSS glow/drop-shadow simulation** — terminals cannot render halos; emphasis comes from foreground/background color, bold, border style/color, and adaptive light/dark colors via lipgloss.
+- **Typography:** monospace-first. Body/UI **JetBrains Mono**; chunky display/wordmarks **Space Mono** (tracking ~-0.04em); pixel eyebrows/badges **Silkscreen**. Hierarchy comes from weight/size/color, never font family.
+- **Borders & layout:** Lip Gloss rounded border (`╭ ╮ ╰ ╯`) is the signature. Focus shifts the border to cyan; the active index/table row carries a pink inset rail (mutt's `>` cursor analog). Cell-aware spacing on a 4px base.
+- **Motion:** quick and springy (Harmonica-style), 120–340ms; braille/dots/moon spinners; a cyan block cursor blinks `steps(1)` ~1.06s. All motion MUST honor `prefers-reduced-motion` (spinners freeze, progress jumps to end).
+- **Iconography:** base layer is plain Unicode + box-drawing glyphs that render in any terminal font (nav `↑↓←→`, status `✓ ✗ ◆ ● ○ •`, prompt `❯ › $`, spinners `⣾⣽⣻⢿⡿⣟⣯⣷`, progress `█ ▓ ▒ ░`, borders `─ │ ╭ ╮ ╰ ╯`). Optional Nerd-Fonts enhancement layer for richer glyphs, gated behind detection or explicit opt-in, with a plain-Unicode fallback for every Nerd-Font glyph. Never assume a Nerd Font is present.
+- **Voice:** playful, warm, lowercase; address the user as "you"; a dim `key • action` help footer on every view.
+
+Notes for skills that used to generate mockups:
+- `gemini-mockup` (browser-chrome, DaisyUI-driven) is retired for Reduit. Do not use it. If a mockup of a TUI screen is genuinely needed, generate an ANSI/screenshot of a running Bubble Tea program instead.
+- `reduit.family.tld` browser URL patterns and family sample data (Hannah/Maya/Sage subjects) are dead conventions from the web-UI era; ignore them.
 
 ## Architecture Context
 

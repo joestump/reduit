@@ -165,8 +165,6 @@ alternative is rejected for the operational complexity it would add.
 ## References
 
 - ADR-0001 (go-proton-api) — MCP tools call the same client.
-- ADR-0002 (multi-tenant) — MCP tools scoped per-account via auth.
-- ADR-0004 (OIDC) — MCP auth reuses OIDC sessions.
 - SPEC-0006 (MCP tool surface).
 - [Model Context Protocol](https://modelcontextprotocol.io/)
 - [`github.com/modelcontextprotocol/go-sdk`](https://github.com/modelcontextprotocol/go-sdk)

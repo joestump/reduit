@@ -204,5 +204,5 @@ endpoint — or keep everything local. Keys come from the environment
 - SPEC-0006 (MCP tool surface) — `list_attachments`, fetch attachment
   text, citation contract.
 - SPEC-0002 (sync & cache) — idempotent re-sync over stable identity.
-- SPEC-0005 (local UI) — owns serving/rendering attachments (out of
+- SPEC-0005 (local TUI) — owns serving/rendering attachments (out of
   scope here).

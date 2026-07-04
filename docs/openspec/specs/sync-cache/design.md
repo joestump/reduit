@@ -119,7 +119,7 @@ idempotent stable-hash model rather than living in a separate pass:
   pipeline sees is upserted into `contact_identifiers`. An address with
   no existing contact creates a fresh `contacts` row with a UUIDv7
   identity; a known address reuses its contact. This is the contact layer
-  SPEC-0011 (contact facts) and the UI read from — sync owns the
+  SPEC-0011 (contact facts) and the TUI read from — sync owns the
   *materialization* of identifiers and bare contact rows; SPEC-0011 owns
   the *facts* over them and the manual `reduit contacts merge`. Re-sync
   upserts and never cascade-wipes these rows.

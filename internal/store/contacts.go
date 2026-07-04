@@ -3,7 +3,7 @@
 // Every distinct sender/recipient address sync sees is upserted into
 // contact_identifiers; an address with no existing contact mints a fresh
 // contacts row (UUIDv7). This materializes the contact layer SPEC-0011 (contact
-// facts) and the UI read from. Manual merge of contacts is SPEC-0011's
+// facts) and the TUI read from. Manual merge of contacts is SPEC-0011's
 // `reduit contacts merge`, out of scope here.
 //
 // Governing: SPEC-0002 REQ "Contact Materialization", ADR-0006.

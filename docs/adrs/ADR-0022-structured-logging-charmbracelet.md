@@ -1,6 +1,6 @@
 # ADR-0022: Structured logging via charmbracelet/log (as an slog.Handler)
 
-- **Status:** proposed
+- **Status:** accepted (shipped 2026-07-03)
 - **Date:** 2026-07-03
 - **Deciders:** Joe Stump
 

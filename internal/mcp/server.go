@@ -10,12 +10,12 @@
 // the injected slog.Logger) so stdout carries exclusively the JSON-RPC stream.
 //
 // Every tool is a thin adapter over internal/store — the same methods the
-// loopback UI uses (ADR-0005) — so behaviour cannot drift between surfaces.
+// local TUI uses (ADR-0025) — so behaviour cannot drift between surfaces.
 // This package owns no query path of its own.
 //
 // Governing: ADR-0017 (stdio MCP + hybrid RAG), ADR-0012 (single-user
 //
-//	local-first), ADR-0005 (loopback UI / shared store),
+//	local-first), ADR-0025 (local TUI / shared store),
 //	SPEC-0006 (MCP Tool Surface).
 package mcp
 

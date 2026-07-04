@@ -57,8 +57,8 @@ keyed on email correspondents.
   (ADR-0018), obeys the per-conversation/sender **denylist**, and runs locally by
   default. With no endpoint, it fails cleanly and the rest of Reduit is unaffected.
 - **Surfaced everywhere.** Facts are retrievable via an MCP tool with citations
-  (ADR-0017) and shown in the contact view of the UI (ADR-0005); both read the same
-  store method.
+  (ADR-0017) and shown in the contact-facts view of the TUI (ADR-0025); both
+  read the same store method.
 
 ### Consequences
 

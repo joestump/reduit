@@ -306,8 +306,8 @@ extraction SHALL require no configuration to run.
 
 ## Out of Scope
 
-- **Serving or rendering attachments in the UI** — display, galleries,
-  inline media, and transcode-for-display are owned by the local UI
+- **Serving or rendering attachments in the TUI** — display, galleries,
+  inline media, and transcode-for-display are owned by the local TUI
   (SPEC-0005); this spec extracts and indexes text, it does not serve
   bytes to a browser.
 - **Editing or generating attachments** — Reduit reads attachments to

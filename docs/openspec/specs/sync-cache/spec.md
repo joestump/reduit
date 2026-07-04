@@ -5,7 +5,7 @@
 **Sync** is the incremental pull of mail from Proton's event stream into
 the local SQLite cache (ADR-0006). The cache is the source every other
 Reduit surface reads from — keyword search, semantic search, RAG, fact
-extraction, the MCP server, the CLI, and the loopback UI. Proton remains
+extraction, the MCP server, the CLI, and the local TUI. Proton remains
 the source of truth; the cache is derived state that sync keeps
 fresh-enough against it. Sync writes only to the cache; it never writes
 back to Proton.
@@ -122,7 +122,7 @@ During sync, every distinct sender / recipient email address the pipeline
 sees MUST be upserted into `contact_identifiers`; an identifier with no
 existing contact MUST create a fresh `contacts` row keyed by a UUIDv7.
 This materializes the contact layer that SPEC-0011 (contact facts) and
-the UI read from. Manual merge of two contacts is SPEC-0011's
+the TUI read from. Manual merge of two contacts is SPEC-0011's
 `reduit contacts merge` and is out of scope here.
 
 #### Scenario: New address creates a contact

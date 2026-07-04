@@ -16,7 +16,7 @@ The retrieval tools are **citation-faithful**: every result a tool
 returns carries exact provenance (`message_id`, stable `hash`,
 `mailbox`, `conversation`/`sender`, `source`, `timestamp`) so an agent
 cites precisely and a human can open the same message in the loopback
-UI (ADR-0005). `search_messages` is hybrid — FTS5 keyword search fused
+TUI (ADR-0025). `search_messages` is hybrid — FTS5 keyword search fused
 with best-effort vector search (ADR-0015) via reciprocal-rank fusion —
 and degrades to keyword-only when embeddings or the LLM endpoint are
 unavailable. Read tools surface transcripts, surrounding context,
@@ -24,10 +24,10 @@ attachments and their extracted text (SPEC-0009), links, and cited
 contact facts (SPEC-0011). A single mutating tool, `send`, submits
 mail via go-proton-api (SPEC-0010/ADR-0020) and is the only tool that
 writes. Every tool is a thin adapter over the same `store` methods the
-UI uses, so behavior cannot drift between surfaces.
+TUI uses, so behavior cannot drift between surfaces.
 
 Governing: ADR-0017 (stdio MCP + hybrid RAG), ADR-0012 (single-user
-local pivot), ADR-0005 (loopback UI / shared store), ADR-0015
+local pivot), ADR-0025 (local TUI / shared store), ADR-0015
 (embeddings/vector backend), ADR-0016 (attachment extraction),
 ADR-0019 (contact facts), ADR-0020 (outbound send), SPEC-0002 (Sync &
 Local Cache), SPEC-0009 (Attachment Extraction), SPEC-0010 (Outbound
@@ -73,7 +73,7 @@ Every message/search retrieval result the server returns MUST carry
 its coordinates: `message_id`, the stable content `hash`, `mailbox`,
 `conversation`/`sender`, `source`, and `timestamp`. The server MUST
 NOT return a passage, transcript line, attachment snippet, or link
-without the coordinates needed to cite it and open it in the UI — such
+without the coordinates needed to cite it and open it in the TUI — such
 a result is either fully cited or omitted. Contact facts are cited
 differently: each fact MUST carry its `source_message_hash` (SPEC-0011)
 as its citation and is returned even when the source message is not
@@ -151,7 +151,7 @@ conversation transcript, and the surrounding context of a message;
 list a message's attachments and fetch an attachment's extracted text
 (SPEC-0009); list a message's links; and return a contact's cited
 facts (SPEC-0011). All read tools MUST source their data from the
-local cache via the same `store` methods the UI uses and MUST return
+local cache via the same `store` methods the TUI uses and MUST return
 cited results.
 
 #### Scenario: Get message and transcript
@@ -224,17 +224,17 @@ mailbox (ADR-0012).
 
 ### Requirement: Thin Adapter Over the Store
 
-Every tool MUST call the same `store` methods the loopback UI uses
-(ADR-0005) — search, transcript/context, list attachments/links,
+Every tool MUST call the same `store` methods the local TUI uses
+(ADR-0025) — search, transcript/context, list attachments/links,
 fetch attachment text, contact facts, send — so keyword, semantic, and
-media behavior cannot drift between the MCP surface and the UI. A tool
+media behavior cannot drift between the MCP surface and the TUI. A tool
 MUST NOT implement its own query path that bypasses the store.
 
-#### Scenario: Tools and UI share store methods
+#### Scenario: Tools and TUI share store methods
 
 - **WHEN** a tool resolves a search, transcript, attachment-text, or
   facts request
-- **THEN** it SHALL invoke the same `store` method the UI invokes for
+- **THEN** it SHALL invoke the same `store` method the TUI invokes for
   that operation, with no parallel or divergent query path
 
 ### Requirement: In-Memory Round-Trip Testability

@@ -3,21 +3,19 @@
 - **Status:** accepted
 - **Date:** 2026-06-29
 - **Deciders:** Joe Stump
-- **Supersedes:** [ADR-0002](ADR-0002-multi-tenant-data-model.md) (multi-tenant
-  data model), [ADR-0004](ADR-0004-oidc-control-plane-auth.md) (OIDC control
-  plane), [ADR-0007](ADR-0007-imap-and-smtp-protocol-libraries.md) (IMAP/SMTP
-  relay libraries), [ADR-0009](ADR-0009-tls-via-disk-with-hot-reload.md) (TLS
-  listeners), [ADR-0010](ADR-0010-multi-account-per-user.md) (multi-account per
-  OIDC user), [ADR-0011](ADR-0011-http-mode-for-reverse-proxy-fronting.md) (HTTP
-  reverse-proxy mode)
+- **Supersedes:** the multi-tenant relay stack retired 2026-07-04 — the
+  multi-tenant data model, OIDC control plane, emersion IMAP/SMTP libraries,
+  on-disk TLS with hot-reload, multi-account-per-OIDC-user model, and HTTP
+  reverse-proxy mode. Those ADRs were deleted rather than kept as history; this
+  ADR is now the canonical statement of what replaced them.
 
 ## Context and Problem Statement
 
-Reduit was designed (ADR-0002) as a single shared, network-exposed,
-multi-tenant daemon. One host serves IMAPS/SMTPS to several people's mail
-clients, holds every account's Proton refresh token and mailbox passphrase at
-rest (ADR-0003), and gates the control plane behind an external OIDC IdP
-(ADR-0004, ADR-0010).
+Reduit was originally designed as a single shared, network-exposed,
+multi-tenant daemon. One host served IMAPS/SMTPS to several people's mail
+clients, held every account's Proton refresh token and mailbox passphrase at
+rest (ADR-0003 envelope, since superseded by ADR-0013), and gated the control
+plane behind an external OIDC IdP with multi-account-per-user support.
 
 That topology reintroduces the exact thing Proton exists to remove: **a central
 party that must be trusted with the keys to everyone's mail.** Compromise the one
@@ -51,12 +49,12 @@ the architecture around it.
 
 ## Considered Options
 
-1. **Keep the shared multi-tenant relay, harden it further.** Continue ADR-0002's
-   model; invest more in master-key rotation, session invalidation, TLS hardening
-   (the #59–#64 work).
+1. **Keep the shared multi-tenant relay, harden it further.** Continue the
+   original network-relay model; invest more in master-key rotation, session
+   invalidation, TLS hardening (the #59–#64 work).
 2. **Single-user, local-first, per-person binary.** No relay, no OIDC, no shared
    daemon. One binary per person on their own machine, serving only that person's
-   Proton mailboxes; secrets in the OS keychain; loopback UI; stdio MCP.
+   Proton mailboxes; secrets in the OS keychain; local TUI; stdio MCP.
 3. **Single-user but keep a loopback IMAP/SMTP bridge.** Drop multi-tenancy and
    OIDC but retain the emersion-based relay bound to localhost — i.e., become
    Proton Bridge plus search.
@@ -70,20 +68,20 @@ the architecture around it.
   the network attacker and the central-vault attacker entirely (see ADR-0013 for
   secrets, ADR-0018 for the egress boundary).
 - **No relay.** The IMAPS (993), SMTPS (465), and HTTPS control-plane listeners
-  are removed, along with the emersion `go-imap`/`go-smtp` dependencies
-  (ADR-0007) and the on-disk TLS machinery (ADR-0009, ADR-0011). Operators who
-  want IMAP/SMTP for a standard mail client run Proton Bridge alongside Reduit.
+  are removed, along with the emersion `go-imap`/`go-smtp` dependencies and the
+  on-disk TLS machinery. Operators who want IMAP/SMTP for a standard mail client
+  run Proton Bridge alongside Reduit.
 - **Multi-mailbox from v1.** A single install serves **N Proton mailboxes** for
   the one local user. Each mailbox is a local configuration row (`mailboxes`)
   with its own keychain secret reference (ADR-0013) and its own cache namespace
   in the shared SQLite store (ADR-0006). There is **no `users` table and no OIDC
-  `subject`** — the OS user *is* the identity. This preserves ADR-0010's real
-  requirement (one person, many Proton accounts) while deleting its OIDC
-  mechanism.
+  `subject`** — the OS user *is* the identity. This preserves the real
+  many-mailboxes-per-person requirement while deleting the OIDC mechanism the
+  original design used to model it.
 - **Surfaces.** The product faces are (a) a **stdio MCP server** (ADR-0017,
-  primary), (b) a **CLI** for sync/embed/send/admin, and (c) an **optional
-  loopback HTMX UI** (ADR-0005, reframed) for human browsing. All three read the
-  same SQLite store, so behavior cannot drift between them.
+  primary), (b) a **CLI** for sync/embed/send/admin, and (c) a **local TUI**
+  (ADR-0025) for human browsing. All three read the same SQLite store, so
+  behavior cannot drift between them.
 - **Read and write.** Reduit reads/syncs from Proton (ADR-0014) and **sends**
   through it (ADR-0020). Only the local cache is derived state.
 

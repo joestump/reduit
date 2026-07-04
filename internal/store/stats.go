@@ -1,7 +1,7 @@
 // Package store — cache health/statistics methods.
 //
 // These read-only aggregates back the MCP `status` tool (SPEC-0006) and the
-// loopback UI's health surface: both call the SAME store methods so the two
+// TUI's stats view (SPEC-0005): both call the SAME store methods so the two
 // surfaces cannot drift (SPEC-0006 REQ "Thin Adapter Over the Store").
 //
 // Governing: ADR-0006 (SQLite cache), ADR-0012 (single-user local-first),

@@ -1,6 +1,6 @@
 # ADR-0025: Abandon the web UI; the local human surface is a Bubble Tea TUI in a mutt-inspired design language
 
-- **Status:** proposed
+- **Status:** accepted (2026-07-04)
 - **Date:** 2026-07-03
 - **Deciders:** Joe Stump
 
@@ -62,20 +62,23 @@ Concretely:
 - **Design language**: mutt-inspired — index rows, pager, status line,
   single-key bindings, help footer — with the owner's Bubble Tea design
   system as the normative style reference (SPEC-0005 design.md).
-- **Web UI**: abandoned. ADR-0024's insights-web scope is superseded;
-  ADR-0005's HTMX/Tailwind/DaisyUI stack is retired for good (banner
-  update); no `internal/` HTTP UI handlers will exist.
+- **Web UI**: abandoned. ADR-0024's insights-web scope is superseded; the
+  earlier HTMX/Tailwind/DaisyUI frontend-stack decision is retired for good
+  (and its ADR deleted 2026-07-04); no `internal/` HTTP UI handlers will
+  exist.
 - **`serve`**: retained as a stub, explicitly **not a UI** — reserved for
   MCP-over-HTTP and/or a loopback media-companion endpoint (e.g. handing
-  an attachment to a browser). ADR-0011 narrows to that scope. Whether it
-  ever ships is a future decision.
+  an attachment to a browser). Whether it ever ships is a future decision.
 - **Images**: in-terminal image rendering (Kitty graphics protocol,
   iTerm2 inline images, Sixel) is noted as a v2 possibility on supporting
   terminals, with open-in-default-app (and later possibly `serve`) as the
   universal fallback. Not a v1 requirement.
 - **Artifacts**: SPEC-0005 is rewritten again as **Local TUI**; ADR-0024's
   status gains a superseded-by note; the won't-fix closures of #75 and
-  #102–#105 stand (they were web-UI issues).
+  #102–#105 stand (they were web-UI issues). ADRs 0002/0004/0005/0007/
+  0009/0010/0011 — the relay-era stack — were deleted outright in the
+  2026-07-04 reset since Reduit is pre-alpha and none of them had living
+  echoes.
 
 ### Consequences
 
@@ -92,8 +95,8 @@ Concretely:
   for).
 - Bad, because rich media in terminals is protocol-fragmented (Kitty/
   iTerm2/Sixel vs Terminal.app's nothing); v1 punts to open-in-app.
-- Neutral, because `serve` remains a stub either way; ADR-0011 survives
-  in narrowed form rather than retiring.
+- Neutral, because `serve` remains a stub either way; its narrowed non-UI
+  role is inherited from the retired HTTP-mode decision.
 
 ### Confirmation
 
@@ -102,8 +105,8 @@ Concretely:
 - No `internal/` package registers UI HTTP routes; the TUI imports
   bubbletea/bubbles/lipgloss and reads only `store` methods shared with
   the MCP (grep-checkable, ADR-0017).
-- ADR-0024 carries a superseded-by-ADR-0025 status note; ADR-0005's
-  banner records the stack retirement.
+- ADR-0024 carries a superseded-by-ADR-0025 status note; the retired
+  frontend-stack ADR was deleted in the 2026-07-04 reset.
 
 ## Pros and Cons of the Options
 
@@ -147,18 +150,20 @@ flowchart LR
     TUI -->|read-only, FTS search,\ninsights views| ST
     MCP -->|primary agent surface| ST
     SRV -.->|future, not a UI| ST
-    WEB[HTMX web UI]:::dead -.->|abandoned\nADR-0005 / ADR-0024| ST
+    WEB[HTMX web UI]:::dead -.->|abandoned by ADR-0025| ST
     classDef dead fill:#fbeaea,stroke:#c62828,stroke-dasharray: 5 5
 ```
 
 ## More Information
 
 - Supersedes the insights-web scope of **ADR-0024** (which required
-  exactly this: scope changes arrive by superseding ADR). Retires the
-  **ADR-0005** frontend stack. Builds on **ADR-0023** (Bubble Tea already
-  in-tree, TTY gate + teardown discipline), **ADR-0022** (charm log),
-  **ADR-0017** (shared store, MCP primary), **ADR-0012** (single-user
-  local-first). **ADR-0011** narrows to serve's reserved non-UI role.
+  exactly this: scope changes arrive by superseding ADR). The earlier
+  HTMX/Tailwind/DaisyUI frontend-stack ADR and the HTTP-mode ADR were
+  retired outright in the 2026-07-04 reset — this ADR is now the
+  canonical record of the human-surface decision. Builds on **ADR-0023**
+  (Bubble Tea already in-tree, TTY gate + teardown discipline),
+  **ADR-0022** (charm log), **ADR-0017** (shared store, MCP primary),
+  **ADR-0012** (single-user local-first).
 - Normative style reference: the owner's Bubble Tea design system
   ("Bubbletea TUI Design System", Claude Design:
   https://claude.ai/design/p/5c2f3709-9093-45fd-9762-fbe0a39b6c7b) —

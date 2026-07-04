@@ -15,8 +15,8 @@ stream.
 
 Tools are typed: `AddTool[In, Out]` infers and validates each tool's
 JSON Schema from its Go structs. Every handler is a thin wrapper over
-the same `store` methods the loopback UI uses (ADR-0005), so the MCP
-surface and the UI cannot diverge. Only `send` writes; it reaches
+the same `store` methods the local TUI uses (ADR-0025), so the MCP
+surface and the TUI cannot diverge. Only `send` writes; it reaches
 Proton through go-proton-api (ADR-0020). All other tools read the
 local SQLite cache (ADR-0006 / SPEC-0002 (Sync & Local Cache)).
 
@@ -39,7 +39,7 @@ flowchart LR
     Reg -. logs .-> Stderr[(stderr)]
 ```
 
-The same `store` layer backs the UI; the MCP registry adds no query
+The same `store` layer backs the TUI; the MCP registry adds no query
 logic of its own. A future `sqlite-vec` backend (ADR-0015) changes
 only `store` internals — the tools are unaffected.
 
@@ -79,7 +79,7 @@ type Citation struct {
 `hash` is the stable key used across the store (messages, embeddings
 `PK (hash, model)`, attachment extraction, contact facts) so a
 citation survives idempotent re-sync (ADR-0014) and resolves to a
-message a human can open in the UI. The mapping mirrors `msgbrowse`'s
+message a human can open in the TUI. The mapping mirrors `msgbrowse`'s
 ADR-0004 contract.
 
 ## Hybrid search and rank fusion
@@ -182,8 +182,8 @@ explicit tool call. This is the design counterpart to ADR-0020's
 
 ## Thin adapter / no drift
 
-There is exactly one `store` package. The UI handlers (ADR-0005) and
-the MCP handlers both call its methods — `SearchMessages`,
+There is exactly one `store` package. The TUI view models (ADR-0025)
+and the MCP handlers both call its methods — `SearchMessages`,
 `SemanticSearch`, `ConversationTranscript`, `GetContext`,
 `ListAttachments`, `GetAttachmentText`, `ListLinks`, `ContactFacts`,
 and the send routine. No tool issues its own SQL or its own Proton
@@ -228,7 +228,7 @@ send routine asserts no submission occurs).
 
 - ADR-0017 (stdio MCP + citation-faithful hybrid RAG)
 - ADR-0012 (single-user local pivot)
-- ADR-0005 (loopback UI / shared store)
+- ADR-0025 (local TUI / shared store)
 - ADR-0015 (embeddings and vector backend)
 - ADR-0016 (attachment extraction and indexing)
 - ADR-0018 (LLM access and single egress)

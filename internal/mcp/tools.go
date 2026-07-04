@@ -75,7 +75,7 @@ type mailboxStatus struct {
 // Governing: SPEC-0006 REQ "Thin Adapter Over the Store" (sourced via
 //
 //	store.Stats / store.MailboxStats / store.SchemaVersion, the same methods
-//	the UI uses).
+//	the TUI uses).
 type statusOut struct {
 	// SchemaVersion is the current goose migration version (0 = un-migrated).
 	SchemaVersion int64 `json:"schema_version"`

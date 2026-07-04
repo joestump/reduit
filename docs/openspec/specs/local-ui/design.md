@@ -171,7 +171,6 @@ meaningful non-TTY fallback (unlike sync, whose fallback is logs).
 - Command name: `reduit tui` vs taking over bare `reduit`.
 - Whether the message pager offers `v` to view a hit's thread siblings
   (nice mutt touch) in v1 or v2.
-- Design-system link pending from the owner.
 
 ## References
 
@@ -179,4 +178,5 @@ meaningful non-TTY fallback (unlike sync, whose fallback is logs).
   ADR-0022 (charm log), ADR-0017 (shared store), ADR-0012 (single-user),
   ADR-0006 (cache); SPEC-0002 (offline reads), SPEC-0008 (future
   semantic search), SPEC-0011 (facts read-only surface)
-- mutt (design language); owner's Bubble Tea design system (pending link)
+- mutt (design language); owner's Bubble Tea design system — embedded
+  above as the style reference (2026-07-04)

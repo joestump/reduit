@@ -213,7 +213,5 @@ catastrophic — operators MUST back it up out of band.
 ## References
 
 - ADR-0001 (go-proton-api) — refresh tokens come from the auth flow.
-- ADR-0002 (multi-tenant) — per-user isolation requirement drives
-  per-user data keys.
 - SPEC-0001 (Account model) — exact column definitions.
 - [filippo.io/age](https://filippo.io/age) for envelope reference.

@@ -1,9 +1,0 @@
-{
-  "label": "Guides",
-  "position": 0,
-  "link": {
-    "type": "generated-index",
-    "title": "Reduit Guides",
-    "description": "Deploy, configure, and connect to Reduit — from first boot to Apple Mail and Claude Code."
-  }
-}

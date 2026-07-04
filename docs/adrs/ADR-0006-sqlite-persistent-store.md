@@ -12,7 +12,7 @@
 > and no session/MCP-token tables. The store is now a **local RAG cache** of
 > decrypted mail plus its derived indexes — messages, attachments, links,
 > contacts, FTS5, embeddings, and contact facts — namespaced per mailbox. The
-> superseded ADR-0010 refinement (the `users` split) no longer applies. The
+> earlier multi-account `users` split refinement no longer applies. The
 > Considered Options / Pros-and-Cons below are unchanged; the Context, the
 > encryption/path bullets, and the Architecture Diagram are rewritten.
 
@@ -39,7 +39,7 @@ the per-person, multi-mailbox tool described in ADR-0012:
 - **FTS5** — an external-content full-text index kept in sync by triggers.
 
 The store is read and written by the CLI, the sync pipeline, the embed/facts
-passes, the stdio MCP server (ADR-0017), and the optional loopback UI (ADR-0005).
+passes, the stdio MCP server (ADR-0017), and the local TUI (ADR-0025).
 Scale is one person's mail on one machine — large enough to index well, far from
 needing a server database.
 
@@ -93,7 +93,7 @@ needing a server database.
   backup of derived state; the irreplaceable secrets live in the OS keychain, and
   the source of truth is Proton itself.
 - No separate database service, no DB credentials to manage.
-- WAL mode supports concurrent readers (the sync pipeline, MCP server, and UI
+- WAL mode supports concurrent readers (the sync pipeline, MCP server, and TUI
   reading at once).
 - `goose up` is the only migration step on upgrade.
 - `modernc.org/sqlite` keeps the binary statically linkable.

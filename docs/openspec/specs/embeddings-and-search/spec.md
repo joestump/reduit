@@ -3,7 +3,7 @@
 ## Overview
 
 Reduit's retrieval surface is shared verbatim by the stdio MCP server
-(ADR-0017) and the loopback UI (ADR-0005): both call the same `store`
+(ADR-0017) and the local TUI (ADR-0025): both call the same `store`
 methods so keyword, semantic, and hybrid behavior cannot drift between
 the two. The bedrock is **keyword search over FTS5** — a bm25-ranked,
 filterable full-text index that is *always* available, with no LLM, no
@@ -169,7 +169,7 @@ results contract.
 - **WHEN** the optional `sqlite-vec` accelerator is enabled
 - **THEN** the system SHALL produce the same shape of ranked results
   through the same `store` method, with only the internal vector scan
-  swapped, and MCP/UI callers SHALL require no change
+  swapped, and MCP/TUI callers SHALL require no change
 
 ### Requirement: Hybrid Reciprocal-Rank Fusion
 
@@ -177,7 +177,7 @@ results contract.
 result list using reciprocal-rank fusion, scoring each result by
 `Σ 1/(60 + rank)` across the lists it appears in, because bm25 and
 cosine scores are not directly comparable. The fused order SHALL be
-returned to MCP (ADR-0017) and UI callers identically. This spec
+returned to MCP (ADR-0017) and TUI callers identically. This spec
 (SPEC-0008) is the normative owner of the RRF ranking definition
 (the `Σ 1/(60 + rank)` formula and the constant `60`); SPEC-0006's
 `search_messages` tool references this requirement rather than

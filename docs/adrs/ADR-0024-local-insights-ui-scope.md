@@ -22,7 +22,8 @@ Meanwhile the product's actual reading surface shipped elsewhere: the stdio
 MCP (SPEC-0006, ADR-0017) is how the cache is consumed, by agents, with the
 CLI for operations. A full browse/search web UI duplicates the MCP surface
 for a single-user tool whose user reads mail in Proton's own clients — the
-same "the UI is not the product" force that ADR-0005 already named. Should
+same "the UI is not the product" force the earlier frontend-stack ADR
+already named. Should
 reduit carry a full web UI at all, and if not, what human-facing surface is
 worth keeping?
 
@@ -71,9 +72,10 @@ Concretely:
 - The security posture carries over unchanged: optional loopback-only HTTP
   server, no authentication (the OS user is the identity), strict self-only
   CSP, `html/template` escaping of all untrusted strings.
-- ADR-0005's stack decision (HTMX, Tailwind 4, DaisyUI, server-rendered, no
-  runtime build step) **stands** for this smaller surface; only its scope is
-  narrowed. SSE drops from "retained if needed" to out of scope.
+- The HTMX/Tailwind/DaisyUI frontend stack decision **stands** for this
+  smaller surface; only its scope is narrowed. SSE drops from "retained if
+  needed" to out of scope. *(This ADR is superseded — the frontend stack was
+  retired outright by ADR-0025.)*
 - The insights UI is future work, scheduled by the owner; fresh issues get
   cut against the rewritten SPEC-0005 when it is.
 
@@ -124,8 +126,8 @@ Concretely:
 
 - Good, because it keeps the genuinely web-shaped views (attachments,
   facts, stats) and nothing else.
-- Good, because the ADR-0005 stack and SPEC-0005 security posture transfer
-  directly to a smaller page set.
+- Good, because the HTMX/Tailwind/DaisyUI stack and SPEC-0005 security
+  posture transfer directly to a smaller page set.
 - Neutral, because it still requires the loopback server + hardening
   baseline, just over fewer, lower-risk pages.
 - Bad, because scope creep pressure ("just add a message view") will need
@@ -156,8 +158,8 @@ flowchart LR
   [#75](https://gitea.stump.rocks/joestump/reduit/issues/75) and
   [#102](https://gitea.stump.rocks/joestump/reduit/issues/102)–[#105](https://gitea.stump.rocks/joestump/reduit/issues/105)
   won't-fix.
-- Narrows the scope of **ADR-0005** (frontend stack — the stack decision
-  stands); consistent with **ADR-0012** (single-user local-first),
+- Narrows the scope of the earlier frontend-stack decision (later retired
+  by ADR-0025); consistent with **ADR-0012** (single-user local-first),
   **ADR-0017** (stdio MCP primary, shared store, no drift), **ADR-0006**
   (SQLite cache).
 - Governs the rewritten **SPEC-0005** (Local Insights UI).
