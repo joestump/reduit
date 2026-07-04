@@ -167,10 +167,14 @@ func (m Model) sectionSize() (int, int) {
 // the help overlay swallows input; then routing depends on whether a section
 // body is open.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch {
-	case key.Matches(msg, m.keys.Quit): // ctrl+c always quits
+	// ctrl+c always quits, from anywhere.
+	if key.Matches(msg, m.keys.Quit) {
 		return m, tea.Quit
-	case key.Matches(msg, m.keys.Help):
+	}
+	// `?` toggles help EXCEPT while a focused section is capturing raw text
+	// (e.g. the search prompt), where `?` is a legitimate query character and
+	// must reach the input instead of being stolen for the overlay.
+	if key.Matches(msg, m.keys.Help) && !m.sectionCapturesText() {
 		m.showHelp = !m.showHelp
 		return m, nil
 	}
@@ -207,6 +211,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	return m, nil
+}
+
+// sectionCapturesText reports whether the active section currently owns raw
+// text keystrokes (a focused prompt), so the root must not steal keys like `?`
+// for global help. Detected via an optional interface so only views that need
+// it (search) implement it.
+func (m Model) sectionCapturesText() bool {
+	if !m.inSection || m.section == nil {
+		return false
+	}
+	tc, ok := m.section.(interface{ CapturesText() bool })
+	return ok && tc.CapturesText()
 }
 
 // openSection constructs the view for id, sizes it, and returns its Init cmd so

@@ -32,7 +32,7 @@ var sections = []sectionMeta{
 		id:    secSearch,
 		title: "Search",
 		glyph: func(g styles.Glyphs) string { return g.Search },
-		blurb: "keyword search over your cached mail, with a results index and a\nreader pager. Arrives in #169.",
+		blurb: "keyword search over your cached mail, with a results index and a\nreader pager.",
 	},
 	{
 		id:    secAttachments,

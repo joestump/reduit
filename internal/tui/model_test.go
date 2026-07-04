@@ -26,6 +26,9 @@ type fakeReader struct {
 	facts       []tuistore.ContactFactRow
 	syncRun     tuistore.SyncRun
 	syncRunOK   bool
+	hits        []tuistore.SearchHit
+	message     tuistore.MessageDetail
+	messageOK   bool
 }
 
 func (f fakeReader) Stats(context.Context) (tuistore.Stats, error) {
@@ -53,6 +56,12 @@ func (f fakeReader) ListContacts(context.Context, int) ([]tuistore.ContactRow, e
 }
 func (f fakeReader) ContactFacts(context.Context, string) ([]tuistore.ContactFactRow, error) {
 	return f.facts, nil
+}
+func (f fakeReader) SearchMessages(context.Context, string, int) ([]tuistore.SearchHit, error) {
+	return f.hits, nil
+}
+func (f fakeReader) GetMessage(context.Context, string) (tuistore.MessageDetail, bool, error) {
+	return f.message, f.messageOK, nil
 }
 
 func mailbox(addr string) tuistore.Mailbox { return tuistore.Mailbox{Address: addr} }
@@ -208,6 +217,31 @@ func TestModel_SlashJumpsToSearch(t *testing.T) {
 	m = m.Update2(keyPress("/"))
 	if !m.inSection || m.section == nil || m.section.Title() != "search" {
 		t.Errorf("`/` should jump to search: inSection=%v section=%v", m.inSection, m.section)
+	}
+}
+
+func TestModel_QuestionMarkTypedIntoSearchPrompt(t *testing.T) {
+	// Regression: `?` must reach the focused search prompt as a query character,
+	// not toggle the global help overlay.
+	m := sized(fakeReader{})
+	m = m.Update2(keyPress("/")) // open search (prompt focused)
+	m = m.Update2(keyPress("a"))
+	m = m.Update2(keyPress("?"))
+	if m.showHelp {
+		t.Error("? opened the help overlay instead of typing into the search prompt")
+	}
+	sv, ok := m.section.(*searchView)
+	if !ok {
+		t.Fatalf("section is %T, want *searchView", m.section)
+	}
+	if sv.input.Value() != "a?" {
+		t.Errorf("search input = %q, want %q", sv.input.Value(), "a?")
+	}
+	// Outside a text prompt, ? still opens help.
+	m2 := sized(fakeReader{})
+	m2 = m2.Update2(keyPress("?"))
+	if !m2.showHelp {
+		t.Error("? should still open help from the menu")
 	}
 }
 

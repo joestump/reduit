@@ -21,6 +21,8 @@ import (
 // until #169; the four insights destinations are real (#170).
 func newSectionView(ctx context.Context, id sectionID, r tuistore.Reader, st styles.Styles, g styles.Glyphs) sectionView {
 	switch id {
+	case secSearch:
+		return newSearchView(ctx, r, st, g)
 	case secAttachments:
 		return newAttachmentsView(ctx, r, st, g)
 	case secContacts:
@@ -30,7 +32,8 @@ func newSectionView(ctx context.Context, id sectionID, r tuistore.Reader, st sty
 	case secStats:
 		return newStatsView(ctx, r, st, g)
 	default:
-		return newScaffoldView(id, st, g)
+		// All section ids are covered above; search is the safe fallback.
+		return newSearchView(ctx, r, st, g)
 	}
 }
 
@@ -79,36 +82,6 @@ func floorOne(n int) int {
 		return 1
 	}
 	return n
-}
-
-// ---- scaffold (Search, until #169) ---------------------------------------
-
-type scaffoldView struct {
-	meta sectionMeta
-	st   styles.Styles
-	g    styles.Glyphs
-}
-
-func newScaffoldView(id sectionID, st styles.Styles, g styles.Glyphs) *scaffoldView {
-	return &scaffoldView{meta: sectionByID(id), st: st, g: g}
-}
-
-func (v *scaffoldView) Init() tea.Cmd { return nil }
-func (v *scaffoldView) Update(msg tea.Msg) (sectionView, tea.Cmd) {
-	if k, ok := msg.(tea.KeyMsg); ok && (k.String() == "q" || k.String() == "esc" || k.String() == "h") {
-		return v, exitSection
-	}
-	return v, nil
-}
-func (v *scaffoldView) SetSize(_, _ int)     {}
-func (v *scaffoldView) Title() string        { return strings.ToLower(v.meta.title) }
-func (v *scaffoldView) Hints() []key.Binding { return []key.Binding{viewFooterBack(v.g)} }
-func (v *scaffoldView) View() string {
-	var b strings.Builder
-	b.WriteString(v.st.Title.Render(v.meta.glyph(v.g) + "  " + v.meta.title))
-	b.WriteString("\n\n")
-	b.WriteString(v.st.Dim.Render(v.meta.blurb))
-	return v.st.PanelFocused.Render(b.String())
 }
 
 // ---- metadata (per-mailbox coverage) -------------------------------------

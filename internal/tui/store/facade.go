@@ -32,6 +32,8 @@ type (
 	AttachmentRow  = store.AttachmentRow
 	ContactRow     = store.ContactRow
 	ContactFactRow = store.ContactFactRow
+	SearchHit      = store.SearchHit
+	MessageDetail  = store.MessageDetail
 )
 
 // Reader is the read-only surface the TUI views depend on. It is deliberately
@@ -68,6 +70,11 @@ type Reader interface {
 	// ContactFacts returns a contact's extracted facts with citations for the
 	// contact-facts detail pager.
 	ContactFacts(ctx context.Context, contactID string) ([]ContactFactRow, error)
+
+	// SearchMessages runs a bm25-ranked FTS keyword search for the search view.
+	SearchMessages(ctx context.Context, query string, limit int) ([]SearchHit, error)
+	// GetMessage returns one cached message by hash for the search pager.
+	GetMessage(ctx context.Context, hash string) (MessageDetail, bool, error)
 }
 
 // Facade is the concrete Reader backed by a live *store.Store. It embeds no
@@ -127,4 +134,14 @@ func (f *Facade) ListContacts(ctx context.Context, limit int) ([]ContactRow, err
 // ContactFacts forwards to store.ContactFacts (read-only).
 func (f *Facade) ContactFacts(ctx context.Context, contactID string) ([]ContactFactRow, error) {
 	return f.st.ContactFacts(ctx, contactID)
+}
+
+// SearchMessages forwards to store.SearchMessages (read-only).
+func (f *Facade) SearchMessages(ctx context.Context, query string, limit int) ([]SearchHit, error) {
+	return f.st.SearchMessages(ctx, query, limit)
+}
+
+// GetMessage forwards to store.GetMessage (read-only).
+func (f *Facade) GetMessage(ctx context.Context, hash string) (MessageDetail, bool, error) {
+	return f.st.GetMessage(ctx, hash)
 }
