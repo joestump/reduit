@@ -89,7 +89,7 @@ func TestAuthAdd_HumanVerification_ReturnsClearErrorAtomic(t *testing.T) {
 	p := &scriptPrompter{secrets: []string{"hunter2"}}
 
 	var out bytes.Buffer
-	err := authAdd(ctx, st, ks, dialer, p, "hv@proton.test", &out)
+	err := authAdd(ctx, st, ks, dialer, p, nil, "hv@proton.test", &out)
 	if err == nil || !strings.Contains(err.Error(), "human verification") {
 		t.Fatalf("expected a human-verification error from authAdd, got %v", err)
 	}

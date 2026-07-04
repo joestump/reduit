@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -107,7 +108,7 @@ func newAuthAddCmd(cfgPath *string, verbose *bool) *cobra.Command {
 		Long:  "Authenticate a Proton account and store credentials in the OS keychain.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, logger, err := loadConfigUnchecked(cfgPath, verbose)
+			cfg, _, err := loadConfigUnchecked(cfgPath, verbose)
 			if err != nil {
 				return err
 			}
@@ -117,11 +118,17 @@ func newAuthAddCmd(cfgPath *string, verbose *bool) *cobra.Command {
 			}
 			defer st.Close()
 
-			dialer := dialProton(protonConfig(cmd.Context(), cfg, logger))
+			// The dialer's diagnostics flow through a switchWriter (default:
+			// stderr) so the interactive TUI can redirect them into its scrolling
+			// region, and through the benign-scope notice handler so the refresh
+			// 403/9101 reads as a notice (ADR-0026, SPEC-0013).
+			sw := newSwitchWriter(os.Stderr)
+			authLogger := withNoticeHandler(buildLoggerTo(sw, cfg.Logger))
+			dialer := dialProton(protonConfig(cmd.Context(), cfg, authLogger))
 			defer dialer.Close()
 
 			return authAdd(cmd.Context(), st, openKeychain(), dialer, newPrompter(),
-				args[0], cmd.OutOrStdout())
+				sw, args[0], cmd.OutOrStdout())
 		},
 	}
 }
@@ -132,7 +139,7 @@ func newAuthAddCmd(cfgPath *string, verbose *bool) *cobra.Command {
 // any failure after the row is written it cleans up so no half-written mailbox
 // or orphaned secret remains (SPEC-0007 REQ "Multi-Mailbox Add", "Secret Write,
 // Read, and Delete").
-func authAdd(ctx context.Context, st *store.Store, ks keychain.Store, dialer proton.Dialer, p prompter, address string, out io.Writer) error {
+func authAdd(ctx context.Context, st *store.Store, ks keychain.Store, dialer proton.Dialer, p prompter, sw *switchWriter, address string, out io.Writer) error {
 	// Reject a duplicate address before touching the network or prompting.
 	if _, err := st.GetMailboxByAddress(ctx, address); err == nil {
 		return fmt.Errorf("mailbox %q is already configured", address)
@@ -143,7 +150,7 @@ func authAdd(ctx context.Context, st *store.Store, ks keychain.Store, dialer pro
 	client := dialer.NewClient()
 	defer client.Close()
 
-	passphrase, err := interactiveAuth(ctx, client, p, address, out)
+	passphrase, err := runInteractiveAuthGated(ctx, client, p, sw, address, "sign in", out)
 	if err != nil {
 		return err
 	}
@@ -206,14 +213,59 @@ func authAdd(ctx context.Context, st *store.Store, ks keychain.Store, dialer pro
 	return nil
 }
 
+// errUnsupported2FA is the rejection for an account whose second factor is not a
+// TOTP (the only kind reduit supports). Shared by the plain and TUI paths so
+// both reject identically (SPEC-0013 "Network Steps Shared With Plain Path").
+var errUnsupported2FA = errors.New("this account requires a second factor reduit does not support (only TOTP is supported)")
+
+// loginStep runs the SRP password exchange and classifies its errors. It is one
+// of the three prompt-free network steps shared by the plain prompter path
+// (interactiveAuth) and the interactive TUI model (authui.go), so the two front
+// ends cannot diverge on error handling (SPEC-0013 "Network Steps Shared With
+// Plain Path", ADR-0026).
+//
+// A human-verification wall (Proton code 9001) means a non-Bridge app-version is
+// configured: reduit identifies as a Proton Bridge client by default
+// (proton.DefaultAppVersion) precisely to be waved through without a challenge,
+// and there is no in-app CAPTCHA solver (ADR-0021). Map it to a clear,
+// actionable app-version error rather than rendering the challenge (SPEC-0007
+// "Human verification / CAPTCHA is requested"). Any other failure is a wrapped
+// "login failed".
+func loginStep(ctx context.Context, client proton.Client, address string, password []byte) (proton.AuthStatus, error) {
+	status, err := client.Login(ctx, address, password)
+	if err != nil {
+		if hv, ok := proton.AsHVRequired(err); ok {
+			return proton.AuthStatus{}, humanVerificationError(hv)
+		}
+		return proton.AuthStatus{}, fmt.Errorf("login failed: %w", err)
+	}
+	return status, nil
+}
+
+// submitTOTPStep submits a TOTP code to complete a 2FA login, wrapping failures.
+func submitTOTPStep(ctx context.Context, client proton.Client, code string) error {
+	if err := client.SubmitTOTP(ctx, code); err != nil {
+		return fmt.Errorf("2FA failed: %w", err)
+	}
+	return nil
+}
+
+// unlockStep unlocks the mailbox OpenPGP keys with the passphrase, wrapping
+// failures. The caller owns the passphrase buffer (and its zeroing).
+func unlockStep(ctx context.Context, client proton.Client, passphrase []byte) error {
+	if err := client.Unlock(ctx, passphrase); err != nil {
+		return fmt.Errorf("unlock failed: %w", err)
+	}
+	return nil
+}
+
 // interactiveAuth drives the SPEC-0007 interactive sequence on a fresh,
 // unauthenticated client: password → Login → optional TOTP → passphrase →
 // Unlock. It returns the mailbox passphrase so the caller can persist it (and
-// must zero it). Secrets are read without echo and never logged. The default
-// Bridge app-version avoids Proton's human-verification wall; if a non-Bridge
-// app-version is configured and Proton returns a 9001, Login surfaces a clear
-// app-version error (humanVerificationError) rather than attempting an in-app
-// solve (ADR-0021). Shared by the add flow and the refresh fallback re-login.
+// must zero it). Secrets are read without echo and never logged. This is the
+// PLAIN (non-TTY) path; the interactive TUI (authui.go) drives the same
+// loginStep/submitTOTPStep/unlockStep from a Bubble Tea model. Shared by the add
+// flow and the refresh fallback re-login.
 func interactiveAuth(ctx context.Context, client proton.Client, p prompter, address string, out io.Writer) ([]byte, error) {
 	password, err := p.secret(fmt.Sprintf("Proton password for %s: ", address))
 	if err != nil {
@@ -221,21 +273,9 @@ func interactiveAuth(ctx context.Context, client proton.Client, p prompter, addr
 	}
 	defer zero(password)
 
-	status, err := client.Login(ctx, address, password)
+	status, err := loginStep(ctx, client, address, password)
 	if err != nil {
-		// Proton's anti-abuse wall (code 9001) demands human verification before
-		// it will run the 2FA/password exchange. reduit AVOIDS this by identifying
-		// as a Proton Bridge client by default (proton.DefaultAppVersion), which
-		// Proton waves through with no challenge; reaching an HV here means a
-		// non-Bridge app-version is configured. There is no in-app CAPTCHA solver
-		// (all solve paths were falsified live — ADR-0021); return a clear,
-		// actionable error pointing back at the app-version knob rather than
-		// rendering/embedding/capturing the challenge (SPEC-0007 "Human
-		// verification / CAPTCHA is requested").
-		if hv, ok := proton.AsHVRequired(err); ok {
-			return nil, humanVerificationError(hv)
-		}
-		return nil, fmt.Errorf("login failed: %w", err)
+		return nil, err
 	}
 	zero(password) // no longer needed once the SRP exchange is done.
 
@@ -245,20 +285,20 @@ func interactiveAuth(ctx context.Context, client proton.Client, p prompter, addr
 		if err != nil {
 			return nil, err
 		}
-		if err := client.SubmitTOTP(ctx, code); err != nil {
-			return nil, fmt.Errorf("2FA failed: %w", err)
+		if err := submitTOTPStep(ctx, client, code); err != nil {
+			return nil, err
 		}
 	case proton.TwoFAUnsupported:
-		return nil, errors.New("this account requires a second factor reduit does not support (only TOTP is supported)")
+		return nil, errUnsupported2FA
 	}
 
 	passphrase, err := p.secret("Mailbox passphrase: ")
 	if err != nil {
 		return nil, err
 	}
-	if err := client.Unlock(ctx, passphrase); err != nil {
+	if err := unlockStep(ctx, client, passphrase); err != nil {
 		zero(passphrase)
-		return nil, fmt.Errorf("unlock failed: %w", err)
+		return nil, err
 	}
 	return passphrase, nil
 }
@@ -415,7 +455,7 @@ func newAuthRefreshCmd(cfgPath *string, verbose *bool) *cobra.Command {
 		Long:  "Refresh the session tokens for a previously-added Proton mailbox.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg, logger, err := loadConfigUnchecked(cfgPath, verbose)
+			cfg, _, err := loadConfigUnchecked(cfgPath, verbose)
 			if err != nil {
 				return err
 			}
@@ -425,10 +465,15 @@ func newAuthRefreshCmd(cfgPath *string, verbose *bool) *cobra.Command {
 			}
 			defer st.Close()
 
-			dialer := dialProton(protonConfig(cmd.Context(), cfg, logger))
+			// Route the dialer's diagnostics through a switchWriter (so the TUI can
+			// redirect them) and the benign-scope notice handler (so the cheap-resume
+			// 403/9101 reads as a notice) — ADR-0026, SPEC-0013.
+			sw := newSwitchWriter(os.Stderr)
+			authLogger := withNoticeHandler(buildLoggerTo(sw, cfg.Logger))
+			dialer := dialProton(protonConfig(cmd.Context(), cfg, authLogger))
 			defer dialer.Close()
 
-			return authRefresh(cmd.Context(), st, openKeychain(), dialer, newPrompter(), args[0], cmd.OutOrStdout())
+			return authRefresh(cmd.Context(), st, openKeychain(), dialer, newPrompter(), sw, args[0], cmd.OutOrStdout())
 		},
 	}
 }
@@ -443,7 +488,7 @@ func newAuthRefreshCmd(cfgPath *string, verbose *bool) *cobra.Command {
 // proton_user_id) before rewriting both secrets and reactivating. This is the
 // only path back to active for a dead-token mailbox, since `auth add` rejects
 // existing addresses.
-func authRefresh(ctx context.Context, st *store.Store, ks keychain.Store, dialer proton.Dialer, p prompter, address string, out io.Writer) error {
+func authRefresh(ctx context.Context, st *store.Store, ks keychain.Store, dialer proton.Dialer, p prompter, sw *switchWriter, address string, out io.Writer) error {
 	m, err := st.GetMailboxByAddress(ctx, address)
 	if errors.Is(err, store.ErrMailboxNotFound) {
 		return fmt.Errorf("no mailbox configured for %q", address)
@@ -464,37 +509,44 @@ func authRefresh(ctx context.Context, st *store.Store, ks keychain.Store, dialer
 	if m.SessionUID != nil {
 		storedUID = *m.SessionUID
 	}
-	switch {
-	case errors.Is(err, keychain.ErrNotFound):
-		// No token to resume from — go straight to interactive re-login.
-	case err != nil:
-		return actionableKeyringErr(err)
-	case storedUID == "":
-		// No stored session UID (pre-migration row) — go straight to re-login.
-	default:
-		done, cerr := tryCheapResume(ctx, st, ks, dialer, m, storedUID, refreshToken, address, out)
-		if cerr != nil {
-			return cerr
-		}
-		if done {
-			return nil
-		}
-		// Resume unavailable or the stored session is dead. Fall through to
-		// re-login, which re-persists every secret (including the access token)
-		// and self-heals a pre-fix row.
-	}
 
-	// Recovery path: the token is dead or absent. The mailbox cannot serve until
-	// it is re-authenticated; reflect that while we prompt.
-	_ = st.SetMailboxState(ctx, m.ID, store.MailboxStateNeedsReauth)
+	// The cheap-resume probe is a preflight the gate runs first: inside the TUI
+	// it is a spinner phase whose benign 403/9101 streams as a notice; in the
+	// plain path it runs sequentially. It is built only when a resume is even
+	// possible (both token and UID present).
+	var preflight func(context.Context) (bool, error)
+	switch {
+	case err != nil && !errors.Is(err, keychain.ErrNotFound):
+		return actionableKeyringErr(err)
+	case errors.Is(err, keychain.ErrNotFound), storedUID == "":
+		// No token / no UID — no cheap resume; preflight stays nil.
+	default:
+		tok, uid := refreshToken, storedUID
+		preflight = func(pctx context.Context) (bool, error) {
+			// io.Discard: the "Refreshed" line is printed by authRefresh after
+			// teardown (below), never mid-flow where the TUI would render it.
+			return tryCheapResume(pctx, st, ks, dialer, m, uid, tok, address, io.Discard)
+		}
+	}
 
 	client := dialer.NewClient()
 	defer client.Close()
 
-	passphrase, err := interactiveAuth(ctx, client, p, address, out)
+	outcome, err := runRefreshRecoveryGated(ctx, client, p, sw, address, preflight, out)
 	if err != nil {
 		return err
 	}
+	if outcome.resumeDone {
+		fmt.Fprintf(out, "Refreshed mailbox %s\n", address)
+		return nil
+	}
+
+	// Fall-through: the cheap path was unavailable or the session dead, so an
+	// interactive re-login ran (SPEC-0007 "Re-Auth Flow"). The mailbox could not
+	// serve during it; reflect that before verifying and persisting.
+	_ = st.SetMailboxState(ctx, m.ID, store.MailboxStateNeedsReauth)
+
+	passphrase := outcome.passphrase
 	defer zero(passphrase)
 
 	// proton_user_id is immutable (SPEC-0001): the re-login must resolve the same
