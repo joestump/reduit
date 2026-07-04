@@ -16,24 +16,44 @@ import (
 // failing read, and — because Reader has no write methods — a test literally
 // cannot make the model mutate anything.
 type fakeReader struct {
-	stats     tuistore.Stats
-	mailboxes []tuistore.Mailbox
-	schema    int64
-	statsErr  error
+	stats       tuistore.Stats
+	mailboxes   []tuistore.Mailbox
+	schema      int64
+	statsErr    error
+	mailboxStat []tuistore.MailboxStat
+	attachments []tuistore.AttachmentRow
+	contacts    []tuistore.ContactRow
+	facts       []tuistore.ContactFactRow
+	syncRun     tuistore.SyncRun
+	syncRunOK   bool
 }
 
 func (f fakeReader) Stats(context.Context) (tuistore.Stats, error) {
 	return f.stats, f.statsErr
 }
-func (f fakeReader) MailboxStats(context.Context) ([]tuistore.MailboxStat, error) { return nil, nil }
+func (f fakeReader) MailboxStats(context.Context) ([]tuistore.MailboxStat, error) {
+	return f.mailboxStat, nil
+}
 func (f fakeReader) ListMailboxes(context.Context) ([]tuistore.Mailbox, error) {
 	return f.mailboxes, nil
 }
 func (f fakeReader) LatestSyncRun(context.Context, string) (tuistore.SyncRun, bool, error) {
-	return tuistore.SyncRun{}, false, nil
+	return f.syncRun, f.syncRunOK, nil
 }
 func (f fakeReader) SchemaVersion(context.Context) (int64, error) { return f.schema, nil }
 func (f fakeReader) DBPath() string                               { return "/tmp/reduit-test.db" }
+func (f fakeReader) ListAttachments(context.Context, int) ([]tuistore.AttachmentRow, error) {
+	return f.attachments, nil
+}
+func (f fakeReader) AttachmentText(context.Context, string) (string, bool, error) {
+	return "", false, nil
+}
+func (f fakeReader) ListContacts(context.Context, int) ([]tuistore.ContactRow, error) {
+	return f.contacts, nil
+}
+func (f fakeReader) ContactFacts(context.Context, string) ([]tuistore.ContactFactRow, error) {
+	return f.facts, nil
+}
 
 func mailbox(addr string) tuistore.Mailbox { return tuistore.Mailbox{Address: addr} }
 
@@ -151,16 +171,21 @@ func TestModel_NavigateDownAndOpenSection(t *testing.T) {
 		t.Fatalf("cursor after two downs = %d, want 2", m.cursor)
 	}
 	m = m.Update2(keyPress("enter"))
-	if !m.inSection || m.active != secContacts {
-		t.Fatalf("after enter: inSection=%v active=%v, want section secContacts", m.inSection, m.active)
+	if !m.inSection || m.section == nil || m.section.Title() != "contact facts" {
+		t.Fatalf("after enter: inSection=%v section=%v, want the contact facts view", m.inSection, m.section)
 	}
-	if !strings.Contains(m.View(), "Contact Facts") {
-		t.Error("section body should show the Contact Facts title")
+	// The status bar reflects the open section's context.
+	if !strings.Contains(m.View(), "contact facts") {
+		t.Error("status bar should show the contact facts context")
 	}
-	// q returns to the menu.
-	m = m.Update2(keyPress("q"))
+	// q returns to the menu (the view emits exitSection, which the root applies).
+	_, cmd := m.Update(keyPress("q"))
+	if cmd == nil {
+		t.Fatal("q in a section should emit a command (exitSection)")
+	}
+	m = m.Update2(cmd())
 	if m.inSection {
-		t.Error("q in a section should return to the menu")
+		t.Error("exitSection should return to the menu")
 	}
 }
 
@@ -181,8 +206,8 @@ func TestModel_CursorClampsAtBounds(t *testing.T) {
 func TestModel_SlashJumpsToSearch(t *testing.T) {
 	m := sized(fakeReader{})
 	m = m.Update2(keyPress("/"))
-	if !m.inSection || m.active != secSearch {
-		t.Errorf("`/` should jump to search: inSection=%v active=%v", m.inSection, m.active)
+	if !m.inSection || m.section == nil || m.section.Title() != "search" {
+		t.Errorf("`/` should jump to search: inSection=%v section=%v", m.inSection, m.section)
 	}
 }
 

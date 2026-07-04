@@ -131,15 +131,22 @@ and pager read the cached plaintext.
 **Rationale**: owner decision; semantic/hybrid joins when SPEC-0008
 lands, as a new search mode behind the same prompt.
 
-### Attachments hand off to the OS
+### Attachments: extracted text now, OS hand-off deferred
 
-**Choice**: opening an attachment writes/locates the cached file and
-hands it to the platform opener; no in-terminal preview in v1.
-**Rationale**: terminal image protocols (Kitty/iTerm2/Sixel) are
-fragmented (Terminal.app: none). v2 MAY render images inline on
-supporting terminals (ADR-0025); a future `serve` media companion is
-another path. Executable-ish MIME types are never auto-opened without
-confirmation.
+**Choice**: the attachments view shows metadata + extracted text. The
+open-in-default-app hand-off is deferred: the store caches attachment
+metadata + extracted text, not raw bytes (ADR-0016), and the TUI is
+read-only and offline, so there is no cached file to hand to the
+platform opener and fetching bytes on demand would break the read-only
+boundary. **Rationale**: extracted text is the RAG-relevant content and
+is what the cache holds today; the hand-off returns once an
+attachment-blob capability exists (tracked in #174), at which point the
+opener would write/locate the cached file and shell to the platform
+opener — and executable-ish MIME types are never auto-opened without
+confirmation. In-terminal preview stays out of v1: terminal image
+protocols (Kitty/iTerm2/Sixel) are fragmented (Terminal.app: none); v2
+MAY render images inline on supporting terminals (ADR-0025), and a
+future `serve` media companion is another path.
 
 ### Hostile-string sanitation at the render boundary
 

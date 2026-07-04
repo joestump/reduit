@@ -25,10 +25,13 @@ import (
 
 // Read DTOs — aliases so callers depend on one package but reuse store's types.
 type (
-	Stats       = store.Stats
-	MailboxStat = store.MailboxStat
-	Mailbox     = store.Mailbox
-	SyncRun     = store.SyncRun
+	Stats          = store.Stats
+	MailboxStat    = store.MailboxStat
+	Mailbox        = store.Mailbox
+	SyncRun        = store.SyncRun
+	AttachmentRow  = store.AttachmentRow
+	ContactRow     = store.ContactRow
+	ContactFactRow = store.ContactFactRow
 )
 
 // Reader is the read-only surface the TUI views depend on. It is deliberately
@@ -52,6 +55,19 @@ type Reader interface {
 	// DBPath returns the absolute path of the open database, for the stats view's
 	// on-disk-size readout.
 	DBPath() string
+
+	// ListAttachments returns the attachment index (metadata + owning-message
+	// subject) for the attachments view.
+	ListAttachments(ctx context.Context, limit int) ([]AttachmentRow, error)
+	// AttachmentText returns an attachment's extracted text (found=false if the
+	// id is unknown) for the attachments detail pager.
+	AttachmentText(ctx context.Context, id string) (string, bool, error)
+	// ListContacts returns the contacts index (name, address, fact count) for
+	// the contact-facts view.
+	ListContacts(ctx context.Context, limit int) ([]ContactRow, error)
+	// ContactFacts returns a contact's extracted facts with citations for the
+	// contact-facts detail pager.
+	ContactFacts(ctx context.Context, contactID string) ([]ContactFactRow, error)
 }
 
 // Facade is the concrete Reader backed by a live *store.Store. It embeds no
@@ -92,3 +108,23 @@ func (f *Facade) SchemaVersion(ctx context.Context) (int64, error) {
 
 // DBPath forwards to store.Path (read-only).
 func (f *Facade) DBPath() string { return f.st.Path() }
+
+// ListAttachments forwards to store.ListAttachments (read-only).
+func (f *Facade) ListAttachments(ctx context.Context, limit int) ([]AttachmentRow, error) {
+	return f.st.ListAttachments(ctx, limit)
+}
+
+// AttachmentText forwards to store.AttachmentText (read-only).
+func (f *Facade) AttachmentText(ctx context.Context, id string) (string, bool, error) {
+	return f.st.AttachmentText(ctx, id)
+}
+
+// ListContacts forwards to store.ListContacts (read-only).
+func (f *Facade) ListContacts(ctx context.Context, limit int) ([]ContactRow, error) {
+	return f.st.ListContacts(ctx, limit)
+}
+
+// ContactFacts forwards to store.ContactFacts (read-only).
+func (f *Facade) ContactFacts(ctx context.Context, contactID string) ([]ContactFactRow, error) {
+	return f.st.ContactFacts(ctx, contactID)
+}

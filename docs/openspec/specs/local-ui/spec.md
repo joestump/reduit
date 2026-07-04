@@ -71,18 +71,28 @@ SPEC-0008 ships).
 ### Requirement: Insights Views
 
 The TUI SHALL provide the derived-data views: attachments (filename,
-MIME type, size, owning message; open-in-default-app hand-off),
-per-contact facts with citations (read-only; mutations stay CLI/MCP per
-SPEC-0011), metadata coverage (per-mailbox counts, date ranges,
-folders), and stats (sync run history from `sync_runs`,
-extraction/embedding coverage, store size).
+MIME type, size, owning message, and extracted text), per-contact facts
+with citations (read-only; mutations stay CLI/MCP per SPEC-0011),
+metadata coverage (per-mailbox counts, date ranges, folders), and stats
+(sync run history from `sync_runs`, extraction/embedding coverage, store
+size).
 
-#### Scenario: Attachment hand-off
+> **Attachment open-in-app is deferred.** The store caches attachment
+> metadata + extracted text, not raw bytes (ADR-0016), and the TUI is
+> read-only and offline (REQ "Read-Only Shared-Store Access"), so it
+> cannot fetch bytes to hand to the OS opener. The open-in-default-app
+> hand-off returns when an attachment-blob capability exists — tracked
+> in #174. Until then the attachments view surfaces the extracted text
+> (the RAG-relevant content), which is what the cache holds.
+
+#### Scenario: Attachment view shows metadata and extracted text
 
 - **WHEN** the operator opens an attachment from the attachments index
-- **THEN** the TUI SHALL hand the file to the OS default handler
-  (in-terminal image rendering is a v2 possibility per ADR-0025, not
-  required here)
+- **THEN** the TUI SHALL show its metadata and extracted text (or an
+  empty state when no text has been extracted). Open-in-default-app
+  hand-off is out of scope until the store caches raw attachment bytes
+  (#174); in-terminal image rendering remains a v2 possibility per
+  ADR-0025.
 
 #### Scenario: Facts are read-only
 

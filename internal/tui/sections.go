@@ -38,7 +38,7 @@ var sections = []sectionMeta{
 		id:    secAttachments,
 		title: "Attachments",
 		glyph: func(g styles.Glyphs) string { return g.Attach },
-		blurb: "extracted attachments — filename, type, size, owning message — with\nopen-in-default-app hand-off. Arrives in #170.",
+		blurb: "extracted attachments — filename, type, size, owning message — with\ntheir extracted text. Arrives in #170.",
 	},
 	{
 		id:    secContacts,

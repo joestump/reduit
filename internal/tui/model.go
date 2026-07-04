@@ -45,10 +45,10 @@ type Model struct {
 	width, height int
 	ready         bool
 
-	cursor    int  // active menu row
-	inSection bool // false: menu; true: a section body is open
-	active    sectionID
-	showHelp  bool // `?` overlay visible
+	cursor    int         // active menu row
+	inSection bool        // false: menu; true: a section body is open
+	section   sectionView // the active section view when inSection
+	showHelp  bool        // `?` overlay visible
 
 	summary summary
 	loaded  bool
@@ -118,6 +118,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.ready = true
+		if m.section != nil {
+			bw, bh := m.sectionSize()
+			m.section.SetSize(bw, bh)
+		}
 		return m, nil
 
 	case summaryMsg:
@@ -126,10 +130,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.summary = msg.s
 		return m, nil
 
+	case exitSectionMsg:
+		m.inSection = false
+		m.section = nil
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
+
+	// Non-key, non-lifecycle messages (async loads, viewport ticks) flow to the
+	// active section view so its data loads and pager scrolling work.
+	if m.inSection && m.section != nil {
+		var cmd tea.Cmd
+		m.section, cmd = m.section.Update(msg)
+		return m, cmd
+	}
 	return m, nil
+}
+
+// sectionSize returns the inner width/height a section view renders within,
+// accounting for the status line, footer, and the body's padding.
+func (m Model) sectionSize() (int, int) {
+	bw := m.width - 4
+	bh := m.height - 4
+	if bw < 1 {
+		bw = 1
+	}
+	if bh < 1 {
+		bh = 1
+	}
+	return bw, bh
 }
 
 // handleKey applies the mutt keymap. Global keys (quit, help) win first; then
@@ -150,11 +181,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if m.inSection {
-		if key.Matches(msg, m.keys.Back) { // q/esc/h: back to the menu
-			m.inSection = false
-		}
-		return m, nil
+	// A section owns all its keys (including its own back/quit semantics); the
+	// root only forwards. The view emits exitSectionMsg to pop back to the menu.
+	if m.inSection && m.section != nil {
+		var cmd tea.Cmd
+		m.section, cmd = m.section.Update(msg)
+		return m, cmd
 	}
 
 	// Menu context.
@@ -168,15 +200,23 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor++
 		}
 	case key.Matches(msg, m.keys.Open):
-		m.inSection = true
-		m.active = sections[m.cursor].id
+		return m.openSection(sections[m.cursor].id)
 	case key.Matches(msg, m.keys.Search): // mutt `/` jumps straight to search
-		m.inSection = true
-		m.active = secSearch
+		return m.openSection(secSearch)
 	case key.Matches(msg, m.keys.Back): // q at the top level quits
 		return m, tea.Quit
 	}
 	return m, nil
+}
+
+// openSection constructs the view for id, sizes it, and returns its Init cmd so
+// its data loads immediately.
+func (m Model) openSection(id sectionID) (tea.Model, tea.Cmd) {
+	m.inSection = true
+	m.section = newSectionView(m.ctx, id, m.reader, m.styles, m.glyphs)
+	bw, bh := m.sectionSize()
+	m.section.SetSize(bw, bh)
+	return m, m.section.Init()
 }
 
 // View composes the persistent status line, the body, and the help footer into
@@ -200,8 +240,8 @@ func (m Model) View() string {
 	switch {
 	case m.showHelp:
 		body = m.helpOverlay()
-	case m.inSection:
-		body = m.sectionBody()
+	case m.inSection && m.section != nil:
+		body = lipgloss.NewStyle().Padding(1, 2).Render(m.section.View())
 	default:
 		body = m.menuBody()
 	}
@@ -219,8 +259,8 @@ func (m Model) View() string {
 // and a right-aligned cache read-out.
 func (m Model) statusBar() string {
 	context := "menu"
-	if m.inSection {
-		context = strings.ToLower(sectionByID(m.active).title)
+	if m.inSection && m.section != nil {
+		context = m.section.Title()
 	}
 	left := m.styles.Title.Render("reduit") + " " +
 		m.styles.StatusKey.Render(m.glyphs.Prompt) + " " +
@@ -324,23 +364,6 @@ func (m Model) menuRow(i int, s sectionMeta) string {
 	return "  " + m.styles.RowNormal.Render(glyph+"  "+label)
 }
 
-// sectionBody renders a placeholder for a destination that lands in a later
-// story. The focused (cyan) border shows this region has focus; the blurb tells
-// the tester what will live here and where.
-func (m Model) sectionBody() string {
-	s := sectionByID(m.active)
-	var b strings.Builder
-	b.WriteString(m.styles.Title.Render(s.glyph(m.glyphs) + "  " + s.title))
-	b.WriteString("\n\n")
-	b.WriteString(m.styles.Dim.Render(s.blurb))
-	b.WriteString("\n\n")
-	b.WriteString(m.styles.Faint.Render("this destination is scaffolded; press "))
-	b.WriteString(m.styles.HelpKey.Render("q"))
-	b.WriteString(m.styles.Faint.Render(" to go back."))
-	panel := m.styles.PanelFocused.Render(b.String())
-	return lipgloss.NewStyle().Padding(1, 2).Render(panel)
-}
-
 // helpOverlay renders the `?` overlay: the full keymap in a focused panel.
 func (m Model) helpOverlay() string {
 	var b strings.Builder
@@ -359,10 +382,16 @@ func (m Model) helpOverlay() string {
 	return lipgloss.NewStyle().Padding(1, 2).Render(panel)
 }
 
-// helpFooter renders the dim `key • action` footer present on every view.
+// helpFooter renders the dim `key • action` footer present on every view. When
+// a section is open, its own hints replace the menu-navigation hints (the
+// global `?` help and quit stay reachable via the `?` overlay).
 func (m Model) helpFooter() string {
-	parts := make([]string, 0, len(m.keys.shortHelp()))
-	for _, bnd := range m.keys.shortHelp() {
+	binds := m.keys.shortHelp()
+	if m.inSection && m.section != nil {
+		binds = append(m.section.Hints(), m.keys.Help)
+	}
+	parts := make([]string, 0, len(binds))
+	for _, bnd := range binds {
 		h := bnd.Help()
 		parts = append(parts, m.styles.HelpKey.Render(h.Key)+" "+m.styles.Help.Render(h.Desc))
 	}
