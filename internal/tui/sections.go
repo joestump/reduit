@@ -59,13 +59,3 @@ var sections = []sectionMeta{
 		blurb: "sync run history, embedding/extraction coverage, and cache size on\ndisk. Arrives in #170.",
 	},
 }
-
-// sectionByID returns the meta for an id (used by the section placeholder body).
-func sectionByID(id sectionID) sectionMeta {
-	for _, s := range sections {
-		if s.id == id {
-			return s
-		}
-	}
-	return sections[0]
-}

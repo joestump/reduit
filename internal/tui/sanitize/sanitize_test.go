@@ -81,10 +81,10 @@ func TestLine_StripsOSCTitleSequences(t *testing.T) {
 func TestLine_StripsC1CSIAndOSCIntroducers(t *testing.T) {
 	// C1 forms of CSI (U+009B) and OSC (U+009D) — a terminal in an 8-bit mode
 	// would act on these; the params after the introducer must not leak as text.
-	if got := Line("a31mREDb"); got != "aREDb" {
+	if got := Line("a\u009b31mREDb"); got != "aREDb" {
 		t.Errorf("Line C1 CSI: got %q, want %q", got, "aREDb")
 	}
-	if got := Line("a0;title\x07b"); got != "ab" {
+	if got := Line("a\u009d0;title\x07b"); got != "ab" {
 		t.Errorf("Line C1 OSC: got %q, want %q", got, "ab")
 	}
 }
